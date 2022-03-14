@@ -1,0 +1,336 @@
+
+
+
+
+Internet Engineering Task Force                                Geng, Ed.
+Internet-Draft                                              Shanxi Univ.
+Intended status: Informational                                     Zhang
+Expires: November 13, 2020                                 Beihang Univ.
+                                                                     Shi
+                                                                    Wang
+                                                                     Yin
+                                                          Tsinghua Univ.
+                                                            May 12, 2020
+
+
+        Efficient Implementation Method for Loop-free Criterion
+                         draft-geng-iac-caba-00
+
+Abstract
+
+   [RFC5286] introduces Loop-Free Criterion (LFC) in detail, which is a
+   technology for local fast rerouting when network failures occur.
+   With LFC, alternate next hops are stored alongside with the default
+   next hops in a routers forwarding table, and can be immediately
+   activated to invoke a loop free repair path in face of link failure.
+   As long as not introducing routing loops, these alternative next hops
+   can also be used for multipath transmission if there are stringent
+   demands on bandwidth or load balancing.  However, in such link state
+   networks, computing loop free alternates typically requires one or
+   more rounds of full shortest path tree computation on a graph, and
+   poses a heavy burden to both the processor load and the memory
+   consumption of a network equipment.  In this document, we describe an
+   efficient Loop-free Criterion (LFC) implementation method which is
+   based on incremental shortest path first (i-SPF), which is suitable
+   for practical deployment in large scale networks.  The computational
+   complexity of the method is independent of the average node degree of
+   the network.
+
+Status of This Memo
+
+   This Internet-Draft is submitted in full conformance with the
+   provisions of BCP 78 and BCP 79.
+
+   Internet-Drafts are working documents of the Internet Engineering
+   Task Force (IETF).  Note that other groups may also distribute
+   working documents as Internet-Drafts.  The list of current Internet-
+   Drafts is at https://datatracker.ietf.org/drafts/current/.
+
+   Internet-Drafts are draft documents valid for a maximum of six months
+   and may be updated, replaced, or obsoleted by other documents at any
+   time.  It is inappropriate to use Internet-Drafts as reference
+   material or to cite them other than as "work in progress."
+
+
+
+Geng, et al.            Expires November 13, 2020               [Page 1]
+
+Internet-Draft                     IAC                          May 2020
+
+
+   This Internet-Draft will expire on November 13, 2020.
+
+Copyright Notice
+
+   Copyright (c) 2020 IETF Trust and the persons identified as the
+   document authors.  All rights reserved.
+
+   This document is subject to BCP 78 and the IETF Trust's Legal
+   Provisions Relating to IETF Documents
+   (https://trustee.ietf.org/license-info) in effect on the date of
+   publication of this document.  Please review these documents
+   carefully, as they describe your rights and restrictions with respect
+   to this document.  Code Components extracted from this document must
+   include Simplified BSD License text as described in Section 4.e of
+   the Trust Legal Provisions and are provided without warranty as
+   described in the Simplified BSD License.
+
+Table of Contents
+
+   1.  Introduction  . . . . . . . . . . . . . . . . . . . . . . . .   2
+   2.  Terminology . . . . . . . . . . . . . . . . . . . . . . . . .   2
+   3.  Overview of Solution  . . . . . . . . . . . . . . . . . . . .   3
+   4.  Security Considerations . . . . . . . . . . . . . . . . . . .   5
+   5.  Conclusions . . . . . . . . . . . . . . . . . . . . . . . . .   5
+   6.  Normative References  . . . . . . . . . . . . . . . . . . . .   5
+   Authors' Addresses  . . . . . . . . . . . . . . . . . . . . . . .   6
+
+1.  Introduction
+
+   Existing algorithms for computing LFC rely on one or more rounds of
+   full shortest path tree computation on a graph, and cannot achieve
+   both good coverage of alternates and low computational complexity at
+   the same time.  Based on graph properties we newly find, this
+   document propose Incremental Alternates Computation IAC, which can
+   compute the full set of alternates for a given network topology in a
+   highly efficient way.  IAC performs incremental shortest path
+   computation on specific link cost update, where the sign of some cost
+   is simply reversed.
+
+2.  Terminology
+
+   In this document, we employ OSPF as an example to explain our method.
+   Each router in a single routing area maintains an identical network
+   map which allows them to compute the shortest path to every other
+   router in a routing area.  Then each router construct its FIB table
+   employing the above information.  When a packet arrives at a router,
+   a destination address based method is using to determine how to
+   forward the packets to its corresponding interface.  When the network
+
+
+
+Geng, et al.            Expires November 13, 2020               [Page 2]
+
+Internet-Draft                     IAC                          May 2020
+
+
+   topology changes, the routers adjacent to the changed component
+   detects the change and then propagates the information to its
+   neighboring router through the LSA (link state advertisement)
+   information.  After a period of time, all routers in this routing
+   area are aware of the change information and update their routing
+   tables accordingly, then the network is at a stable state.
+
+   LFC: x can be chosen when C(x,d) is lower than C(x,c)+C(c,d), which
+   means when packets are routed from x to d, they will not be routed
+   back to c, since C(x,c) + C(c,d) is the lowest cost of any path from
+   x to d that passes c.  So the protection route will bypass c, thus
+   bypass link (c,b) too.
+
+   In order to implement LFC rule, each node needs to obtain costs for
+   its neighbors as well as itself.  With a linkstate protocol, it
+   requires multiple shortest-path computations.  In this document, the
+   notation C(x,d) refers to the shortest path cost from node x to node
+   d, x refers to the neighboring node of node c.  w(c,x) refers to the
+   weight of link (c,x), Tc refers to the shortest path tree rooted at
+   node c, Tc(c,x) refers to the shortest path tree rooted at node c
+   when the weight of the link (c,x) is changed to -w(c,x), D(Tc,x)
+   refers to the descendants of node x (x is included) in the Tc,
+   D(Tc(c,x),x) refers to the descendants of node x (x is included) in
+   the Tc(c,x).
+
+3.  Overview of Solution
+
+   In general, in order to compute the LFCs set for a spcific
+   destination d, a router needs to know the following information:
+
+   (1) the shortest path cost from the calculating router, for example
+   router c, to the destination d (C(c,d)).
+
+   (2) the shortest path cost from the neighboring node x of c to the
+   destination d (C(x,d)).
+
+   (3) the shortest path cost from the neighboring node x of c to itself
+   (C(x,c)).
+
+   C(c,d) can be obtained from the shortest path tree Tc, C(x,c) is
+   equal to w(x,c) which can be obtained from OSPF protocol, C(x,c) can
+   be obtained by performing additional SPF calculations.  Therefore,
+   the induced cost will be particularly high for high degree nodes.
+
+   This document describes how to efficiently implement LFC rule on
+   backbone networks.  In order to implement LFC efficiently, the next
+   hop computation rule is proposed.
+
+
+
+
+Geng, et al.            Expires November 13, 2020               [Page 3]
+
+Internet-Draft                     IAC                          May 2020
+
+
+   Next hop computation rule:
+
+   For a node d, if d is not in the set of D(Tc,x), while d is in the
+   set of D(Tc(c,x),x), we can get the node x is a valid next hop from c
+   to d.
+
+                                       c
+                                      /\
+                                    3/  \5
+                                    /    \
+                                   a      b
+                                   |      |
+                                 3 |      |3
+                                   |      |
+                                   d------e
+                                       3
+
+                        Figure 1: Network Topology
+
+                                       c
+                                      /\
+                                    3/  \5
+                                    /    \
+                                   a      b
+                                   |      |
+                                  3|      |3
+                                   |      |
+                                   d      e
+
+              Figure 2: Shortest path first rooted at node c
+
+                                       c
+                                      /\
+                                   -3/  \5
+                                    /    \
+                                   a      b
+                                   |
+                                  3|
+                                   |
+                                   d
+                                   |
+                                  3|
+                                   |
+                                   e
+
+     Figure 3: Shortest path first rooted at node c when the weight of
+                        link (c,a) is changed to -3
+
+
+
+
+Geng, et al.            Expires November 13, 2020               [Page 4]
+
+Internet-Draft                     IAC                          May 2020
+
+
+                                       c
+                                      /\
+                                    3/  \-5
+                                    /    \
+                                   a      b
+                                          |
+                                         3|
+                                          |
+                                          e
+                                          |
+                                         3|
+                                          |
+                                          d
+
+     Figure 4: Shortest path first rooted at node c when the weight of
+                        link (c,b) is changed to -5
+
+   IAC cleverly uses Next hop computation rule, so it can realize LFC
+   efficiently.  IAC is suitable for incremental deployment within a
+   network, including a network that is already deploying iSPF.  We will
+   use the following example to explain how ICA works.  Fig. 1 depicts a
+   network topology consisting of 5 nodes and 6 edges, while the
+   corresponding SPT Tc is depicted in Fig. 2(b), with c being the root.
+   Fig. 3 shows the shortest path tree constructed using i-SPF when the
+   weight of link (c,a) is changed to -3.  Fig. 4 is the shortest path
+   tree constructed using i-SPF when the weight of link (c,b) is changed
+   to -5.  We can see that node a can be a viable backup next-hop from c
+   to e according to the next hop computation rule.  We can get that
+   node b can be a viable backup next-hop from c to d in the same way.
+
+4.  Security Considerations
+
+   The security considerations of [RFC5286] also apply.
+
+5.  Conclusions
+
+   The purpose of this document is to describe an efficient way to
+   implement LFC, which can compute the full set of alternates with
+   incremental shortest path first computation on specific link cost
+   update.  Therefore, IAC is suitable for deploying in the larger scale
+   networks.
+
+6.  Normative References
+
+   [RFC5286]  Atlas, A., Ed. and A. Zinin, Ed., "Basic Specification for
+              IP Fast Reroute: Loop-Free Alternates", RFC 5286,
+              DOI 10.17487/RFC5286, September 2008,
+              <https://www.rfc-editor.org/info/rfc5286>.
+
+
+
+Geng, et al.            Expires November 13, 2020               [Page 5]
+
+Internet-Draft                     IAC                          May 2020
+
+
+Authors' Addresses
+
+   Haijun Geng (editor)
+   Shanxi Univ.
+   Taiyuan
+   CN
+
+   Email: genghaijun@sxu.edu.cn
+
+
+   Han Zhang
+   Beihang Univ.
+   Beijing
+   CN
+
+   Email: zhhan@buaa.edu.cn
+
+
+   Xingang Shi
+   Tsinghua Univ.
+   Beijing
+   CN
+
+   Email: shixg@cernet.edu.cn
+
+
+   Zhiliang Wang
+   Tsinghua Univ.
+   Beijing
+   CN
+
+   Email: wzl@cernet.edu.cn
+
+
+   Xia Yin
+   Tsinghua Univ.
+   Beijing
+   CN
+
+   Email: yxia@tsinghua.edu.cn
+
+
+
+
+
+
+
+
+
+
+
+Geng, et al.            Expires November 13, 2020               [Page 6]
