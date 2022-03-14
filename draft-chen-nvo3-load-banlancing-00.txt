@@ -1,0 +1,616 @@
+
+
+
+
+Network Working Group                                            H. Chen
+Internet-Draft                                                  W,. Song
+Intended status: Standards Track                     Huawei Technologies
+Expires: April 30, 2015                                 October 27, 2014
+
+
+            Load balancing without packet reordering in NVO3
+                   draft-chen-nvo3-load-banlancing-00
+
+Abstract
+
+   Traditional ECMP can not balance loads well in the data center
+   network because it splits loads at the granularity of flow.  Packets
+   belong to a single flow have to be delivered along the same path.
+   Though it is able to avoid packet reordering, it may degrade the
+   bandwidth utilization.
+
+   This document describes method of splitting a single flow to across
+   multiple parallel paths without causing packet reordering, which is
+   more effective when large flows exist.  The specific path selection
+   algorithm is NOT discussed in this document.
+
+Requirements Language
+
+   The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT",
+   "SHOULD", "SHOULD NOT", "RECOMMENDED", "MAY", and "OPTIONAL" in this
+   document are to be interpreted as described in [RFC2119].
+
+Status of This Memo
+
+   This Internet-Draft is submitted in full conformance with the
+   provisions of BCP 78 and BCP 79.
+
+   Internet-Drafts are working documents of the Internet Engineering
+   Task Force (IETF).  Note that other groups may also distribute
+   working documents as Internet-Drafts.  The list of current Internet-
+   Drafts is at http://datatracker.ietf.org/drafts/current/.
+
+   Internet-Drafts are draft documents valid for a maximum of six months
+   and may be updated, replaced, or obsoleted by other documents at any
+   time.  It is inappropriate to use Internet-Drafts as reference
+   material or to cite them other than as "work in progress."
+
+   This Internet-Draft will expire on April 30, 2015.
+
+
+
+
+
+
+
+Chen & Song              Expires April 30, 2015                 [Page 1]
+
+Internet-Draft               Load Balancing                 October 2014
+
+
+Copyright Notice
+
+   Copyright (c) 2014 IETF Trust and the persons identified as the
+   document authors.  All rights reserved.
+
+   This document is subject to BCP 78 and the IETF Trust's Legal
+   Provisions Relating to IETF Documents
+   (http://trustee.ietf.org/license-info) in effect on the date of
+   publication of this document.  Please review these documents
+   carefully, as they describe your rights and restrictions with respect
+   to this document.  Code Components extracted from this document must
+   include Simplified BSD License text as described in Section 4.e of
+   the Trust Legal Provisions and are provided without warranty as
+   described in the Simplified BSD License.
+
+Table of Contents
+
+   1.  Introduction  . . . . . . . . . . . . . . . . . . . . . . . .   2
+   2.  Terminology . . . . . . . . . . . . . . . . . . . . . . . . .   3
+   3.  Rational for flowlet-based splitting  . . . . . . . . . . . .   3
+   4.  Flowlet-based load balancing  . . . . . . . . . . . . . . . .   5
+     4.1.  Unicast . . . . . . . . . . . . . . . . . . . . . . . . .   5
+     4.2.  Multicast . . . . . . . . . . . . . . . . . . . . . . . .   6
+   5.  The state machine . . . . . . . . . . . . . . . . . . . . . .   6
+   6.  Header extension examples . . . . . . . . . . . . . . . . . .   7
+     6.1.  VXLAN header extension  . . . . . . . . . . . . . . . . .   7
+     6.2.  NVGRE header extension  . . . . . . . . . . . . . . . . .   8
+   7.  Acknowledge frame format  . . . . . . . . . . . . . . . . . .   9
+   8.  Security Considerations . . . . . . . . . . . . . . . . . . .   9
+   9.  IANA Considerations . . . . . . . . . . . . . . . . . . . . .   9
+   10. References  . . . . . . . . . . . . . . . . . . . . . . . . .   9
+     10.1.  Normative References . . . . . . . . . . . . . . . . . .   9
+     10.2.  Informative References . . . . . . . . . . . . . . . . .   9
+   Authors' Addresses  . . . . . . . . . . . . . . . . . . . . . . .  10
+
+1.  Introduction
+
+   Large flows are not rare in current data center network.  Typical
+   examples include: 1) large amount data copying during the process of
+   virtual machine migration, 2) storage traffic when employing the
+   iSCSI technique.  In order to increase bandwidth utilization, ECMP
+   routing is introduced to balance the loads.  However, existing ECMP
+   technique is splitting loads at the granularity of flow, which means
+   all packets from to a single flow have to be delivered along the same
+   path.  Though ECMP is able to avoid packet reordering, it may degrade
+   the bandwidth utilization.
+
+
+
+
+
+Chen & Song              Expires April 30, 2015                 [Page 2]
+
+Internet-Draft               Load Balancing                 October 2014
+
+
+   One basic idea to increase bandwidth utilization is splitting a
+   single flow into several bursts of packets, and delivering them along
+   parallel paths.  The requirement for the splitting method is that
+   reordering can be avoided.  Flowlet-based splitting [FLARE]can meet
+   above requirement.  Flowet is defined as bursts of packets from a
+   single flow that are separated by large enough gaps.
+
+   Utilizing the time gap between conseutive burst of packets from a
+   single flow, flowlet-based ECMP is splitting large flow into flowlets
+   provided that the time gap is larger than the path delay.  These
+   flowets will be delivered along multiple parallel paths and reoriding
+   will not happen due to the in-sequence arrival.
+
+2.  Terminology
+
+   This document makes use of the following terms, additional terms are
+   defined in [RFC7348]:
+
+   ECMP Equal-Cost Multipath
+
+   iSCSI internet Small Computer Storage Interface
+
+   NVGRE Network Virtualization using Generic Routing Encapsulation
+
+   NVO3 Network Virtualization over layer 3
+
+   VM Virtual Machine
+
+   VXLAN Virtual eXtensible Local Area Network
+
+3.  Rational for flowlet-based splitting
+
+   In data center network more than 90% loads are delivered over TCP.
+   For the TCP flow, packet reordering takes place when three or more
+   packets are received before a "late" packet, and in this case TCP
+   enters fast-retransmit mode which consumes extra bandwidth (which
+   could potentially cause more loss, decreasing throughput) as it
+   attempts to unnecessarily retransmit the delayed packet(s)[RFC2991].
+   So per-packet ECMP which randomly hashes packets to paths is rarely
+   used in modern data center network.
+
+   MPTCP[RFC6182]is one feasible method to increase bandwidth without
+   causing packet reorderding.  But it adds more complexity to an
+   already complex transport layer burdened by new requirements such as
+   low latency and burst tolerance in datacenters[CONGA].
+
+
+
+
+
+
+Chen & Song              Expires April 30, 2015                 [Page 3]
+
+Internet-Draft               Load Balancing                 October 2014
+
+
+   Besides, load balancing is best done in the network.  The transport
+   layer should NOT be complicated.  Specifically, the existing TCP
+   protocol should be utilized without modification.
+
+   Flowlet-based switching can meet above requirement especially for the
+   leaf-spine topoligies in data center network.  Flowlets are bursts of
+   packets from a single flow that are separated by large enough idle
+   interval or we say the gaps.  Splitted into several flowlets, large
+   flow can be delivered across multiple parallel paths, rather than be
+   delivered along a single path all the while.  In this case, potential
+   congestion can be avoided and bandwidth utilization get increased.
+
+   The idle intervals between conseutive packets are inherent for the
+   tcp flow due to TCP's burstiness.  As shown in Figure 1, given two
+   consecutive packets in a TCP flow, if the first packet leaves the
+   ingress NVE before the second packet reaches the egress NVE, the
+   ingress NVE can route the second packet-and subsequent packets from
+   this flow-on to other available path with no threat of reordering.
+
+                                .................
+                                .               .
+                                .  -----------  .
+                  +-------+     . /           \ .     +-------+
+         TCP      |Ingress|     ./ L3 overlay  \.Pkt1 | Egress|
+       --flow --->|  NVE  |-----.    Network    .->---|  NVE  |---->
+                  |       |     .\             /.     |       |
+                  +-------+     . \Pkt2       / .     +-------+
+                                .  ->---------  .
+                                .               .
+                                .................
+
+          Figure 1: Rational of splitting TCP flow into flowlets
+
+   If during the time interval the previous packet reach the egress NVE,
+   no packets of this TCP flow were sent out from the Ingress NVE, then
+   this time interval could be considered as large enough to be used to
+   split the TCP flow.  In order to find the 'gap', the Egress NVE may
+   reply with an acknowledge packet for each received packet, with some
+   information to idenitify which packet it replies to.
+
+   The Ingress NVE may decide whether this time interval is large enough
+   according to comparaing the indentification of latest sent packet and
+   the received Acknowledge packet.  If this time interval is large
+   enough, the result of comparation should be equal, which means no
+   packets of this flow are sent out during this time interval.
+   Otherwise, there must be some packets sent out during the time
+   interval, so it can not be considered as the large enough gap to be
+
+
+
+
+Chen & Song              Expires April 30, 2015                 [Page 4]
+
+Internet-Draft               Load Balancing                 October 2014
+
+
+   used to split the TCP flow.  The identification metioned here shoud
+   include the flow ID and the its sequence ID in the flow.
+
+4.  Flowlet-based load balancing
+
+4.1.  Unicast
+
+   For the unicast traffic, the NVE will process the outgoing/incoming
+   packets as description below:
+
+   1.   The Ingress NVE computes the identifier for the incoming flow.
+        TPackets from this flow will be populated with the same flow ID.
+
+   2.   Packets from a single flow will be indexed by a sequence ID
+        field in an increamental manner.  For example, the first packet
+        with sequence ID equals to 0 and the next packet with sequence
+        ID increased to 1 and so on.
+
+   3.   For these packets originated from the Ingress NVE, the sender
+        flag in the outer header will be set to 1 and the receiver flag
+        will be set to 0 to indicate that it is a acknowledge packet.
+
+   4.   The Ingress NVE has to maintain a flow state table for the
+        active flows with each entry recording the flow ID and sequence
+        ID.  Notice that the comunication is full-deplex, each NVE could
+        act as Ingress NVE for one outgoing flow and as a receiver NVE
+        for the another incoming flow at the same time.  So each NVE may
+        has a flow state table for all of the outgoing TCP flows.
+
+   5.   There is also aging time associate with the flow state table,
+        The aging time can be configured through NVE's management
+        interface.  One option to caculate this value is refer to the
+        way [TCP] does.  In this way the flow state table size can be
+        limited in a small size and won't take too much system resource.
+
+   6.   The Egress NVE will reply to the Ingress with an acknowledge
+        packet after successfully reciveing each packet.  The
+        acknowledage packet is a encapsulated ipv4 packet with a vacant
+        payload.  Its source ipv4 address field will be populated with
+        the Egress NVE's ip address and its destination ipv4 address
+        will be populated with the Ingress NVE's ip address.
+
+   7.   The sender flag in the outer header will be set to 0 and the
+        receiver flag will be set to 1 to indicate that it is a
+        acknowledge packet.  The flow ID field and sequence ID field of
+        the acknowledge packet will be copied from the corresponding
+        incoming packet directly.
+
+
+
+
+Chen & Song              Expires April 30, 2015                 [Page 5]
+
+Internet-Draft               Load Balancing                 October 2014
+
+
+   8.   On receiving the acknowledge packet, the Ingress NVE will look
+        up its state map to find if there is any entry has the same flow
+        ID as the acknowledge packet own.  If there is no matching
+        entry, the Ingress NVE will drop the acknowledge packet.
+
+   9.   If the Ingress NVE finds that there is a matching entry, it will
+        compare the sequence ID field of this entry with the sequence ID
+        field in the outer header of the acknowledge packet.
+
+   10.  If the comaring results is equal, it indicates that no
+        subsequent packets from this flow are sent from the Ingress NVE
+        before receiving this acknowledge packet.  So it can be assumed
+        that the time interval between this sent packet and its
+        subsequent packet is large enough.  In this case, the Ingress
+        NVE will distribute this flow to other path according to
+        routinng selection algorithm without causing packet reordering.
+
+   11.  Otherwise, there must be subsequent packets of this flow are
+        sent before receiving the acknowledge packet.  It indicates that
+        the time interval is not large enough and packet reording may
+        happen if switching this flow to other path.  So the Ingress NVE
+        will maintain current path for this flow until the large gap
+        appears.
+
+          flow ID                      sequence ID
+      +-------------+---------------+---------------+---------------+
+      |  flow ID A  |  sequence A1  |  sequence A2  |      ...      |
+      +-------------+---------------+---------------+---------------+
+      |  flow ID B  |  sequence B1  |  sequence B2  |      ...      |
+      +-------------+---------------+---------------+---------------+
+      |     ...     |      ...      |      ...      |      ...      |
+      +-------------+---------------+---------------+---------------+
+      |  flow ID X  |  sequence X1  |  sequence X2  |      ...      |
+      +-------------+---------------+---------------+---------------+
+
+                 Figure 2: flow state table resides in NVE
+
+4.2.  Multicast
+
+   For the multicast traffic, the load balancing mechanism will not be
+   employed.  The multicast packets will be routed according to the
+   exsting routing techniques.
+
+5.  The state machine
+
+
+
+
+
+
+
+Chen & Song              Expires April 30, 2015                 [Page 6]
+
+Internet-Draft               Load Balancing                 October 2014
+
+
+                                      +---------+
+                                      |  init   | Reset Aging Timer
+                                      +---------+
+                                           |
+                                           v
+                                    +------------+
+                                    |  Recv(pkt) |
+                                    +------------+
+                         from NVE          |     from host
+                     +---------------------v-------------+
+                     |                                   |
+                     v                                   v
+             +-----------------+               +-------------------+
+             |pkt.hdr.Tflag==1?|               |GenerateflowID(pkt)|
+             +-----------------+               +-------------------+
+                 Yes   |   No                            |
+           +-----------v--------+                        v
+           |                    |              +-------------------+
+           v                    v              |any match entry in |
+ +------------------+  +-----------------+     |flow state table ? |
+ |  pkt.hdr.seqID   |  | foward to upper |     +-------------------+
+ |        ==        |  | layer for futher|      No       |    Yes
+ | this.entry.seqID?|  | processing      |     +-------- v---------+
+ +------------------+  +-----------------+     |                   |
+    Yes    |     No                            |                   |
+        +--v---------------+                   v                   v
+        |                  |         +-------------------+     +--------------------+
+        v                  v         | new flow, create  |     | existing flow,     |
++-------------+     +------------+   | an entry for it.  |     | this.entry.seqID ++|
+|  MATCH      |     |Do NOT MATCH|   +-------------------+     +--------------------+
+| swith path  |     | maintain   |            |                           |
++-------------+     +------------+            v                           v
+                                     +-------------------+     +--------------------+
+                                     |this.entry.flowID =|     | foward pkt to path |
+                                     |    pkt.hdr.flowID |---->|  selection module  |
+                                     |this.entry.seqID =0|     |                    |
+                                     +-------------------+     +--------------------+
+
+                        Figure 3: The state machine
+
+6.  Header extension examples
+
+6.1.  VXLAN header extension
+
+   The extension format of VXLAN header is shown as below.  In order to
+   distinguish different flow and index the flowlets belong to the same
+   flow, four fields have to be added in vxlan header: sender flag,
+   receiver flag, flow ID and sequence ID.
+
+
+
+Chen & Song              Expires April 30, 2015                 [Page 7]
+
+Internet-Draft               Load Balancing                 October 2014
+
+
+   VXLAN header: 8 bytes field, as shown in Figure 4, reuse the higher
+   24 bits of the reserved fields in VXLAN header.
+
+      - S (1 bit) : sender flag, default set to 0, set to 1 to indicate
+      it is the Ingress NVE.
+
+      - T (1 bit) : receiver flag, default set to 0, set to 1 to
+      indicate it is the egress NVE.
+
+      - flow ID (12 bits) : employed to ideantify different flows, reuse
+      the higher 8 bits of the reserved fields in VXLAN header.
+
+      - sequence ID (12 bits): employed to index the flowlet within the
+      same flow, reuse 8 bits following the Flow ID.
+
+   The lower 8 bits of the reserved fields in VXLAN head are set to zero
+   on transmission and ignored on receipt.
+
+   Outer UDP Header: as suggested in section 5 of [RFC7348], the source
+   port field is use to realize the load balancing of the VM-to-VM
+   traffic across the VXLAN overlay.  It will be set as the hash value
+   of the inner ethernet frame's header.The UDP source port number will
+   be calculated in the dynamic/private port range 49152-65535.
+
+     0                   1                   2                   3
+     0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2
+     Outer UDP Header:
+     +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+     |  Source Port(load balancing)  |       Dest Port = VXLAN Port  |
+     +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+     |           UDP Length          |        UDP Checksum           |
+     +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+
+     VXLAN Header:
+     +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+     |R|R|R|R|I|S|T|R|       flow ID         |      Sequence ID      |
+     +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+     |        VXLAN Network Identifier (VNI)         |   Reserved    |
+     +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+
+                  Figure 4: VXLAN Frame Format extension
+
+6.2.  NVGRE header extension
+
+   The extension format of NVGRE header is shown as below.  In order to
+   distinguish different flow and index the flowlets from the same flow,
+   the sequence field have to be enabled in NVGRE header.  The sequence
+   flag shoud be set to 1.  Lowest two bits of sequence field are used
+
+
+
+Chen & Song              Expires April 30, 2015                 [Page 8]
+
+Internet-Draft               Load Balancing                 October 2014
+
+
+   to indicate sender flag and receiver flag respectively, and the
+   residual 30 bit can be used to indicate the sequence ID.  The
+   combination of VSID field and flowID field (32 bit) can be used to
+   identify the outgoing packet.
+
+   0                   1                   2                   3
+   0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2
+   NVGRE Header:
+   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+   |0| |1|1|   Reserved0     | Ver |   Protocol Type 0x6558        |
+   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+   |               Virtual Subnet ID (VSID)        |    FlowID     |
+   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+   |S|T|                  Sequence ID                              |
+   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+
+7.  Acknowledge frame format
+
+   The acknowledge packet is a general encapsulated IPv4 packet with
+   vacant payload.  The encapsulation format could be VXLAN or NVGRE or
+   other format.  According to the ethernet frame format defined in
+   [IEEE802.3], the minimum size of acknowledge packet has to be set to
+   42 bytes.
+
+8.  Security Considerations
+
+   Security considerations are not addressed in this document.
+
+9.  IANA Considerations
+
+   No IANA action is needed for this document.
+
+10.  References
+
+10.1.  Normative References
+
+   [RFC2119]  Bradner, S., "Key words for use in RFCs to Indicate
+              Requirement Levels", BCP 14, RFC 2119, March 1997.
+
+10.2.  Informative References
+
+   [CONGA]    Alizadeh, M., Edsall, T., Dharmapurikar, S., Vaidyanathan,
+              R., Chu, K., Fingerhut, A., and V. Lam, "CONGA:
+              Distributed Congestion-aware Load Balancing for
+              Datacenters", 2014.
+
+   [FLARE]    Kandula, S., Katabi, D., Sinha, S., and A. Berger,
+              "Dynamic Load Balancing Without Packet Reordering", 2007.
+
+
+
+Chen & Song              Expires April 30, 2015                 [Page 9]
+
+Internet-Draft               Load Balancing                 October 2014
+
+
+   [IEEE802.1Q]
+              "IEEE Standard for Local and metropolitan area networks--
+              Media Access Control (MAC) Bridges and Virtual Bridged
+              Local Area Networks IEEE Std 802.1Q-2011 (Revision of IEEE
+              Std 802.1Q-2005)", 2011.
+
+   [IEEE802.3]
+              "IEEE Standard for Information Technology--
+              Telecommunications and Information Exchange Between
+              Systems--Local and Metropolitan Area Networks--Specific
+              Requirements Part 3: Carrier Sense Multiple Access With
+              Collision Detection (CSMA/CD) Access Method and Physical
+              Layer Specifications", April 2014.
+
+   [RFC2991]  Thaler, D. and C. Hopps, "Multipath Issues in Unicast and
+              Multicast Next-Hop Selection", November 2000.
+
+   [RFC6182]  Ford, A., Raiciu, C., Handley, M., Barre, S., and J.
+              Iyengar, "Architectural Guidelines for Multipath TCP
+              Development", 2011.
+
+   [RFC7348]  Mahalingam, M., Dutt, D., Duda, K., Agarwal, P., Kreeger,
+              L., Sridhar, T., Bursell, M., and C. Wright, "Virtual
+              eXtensible Local Area Network (VXLAN): A Framework for
+              Overlaying Virtualized Layer 2 Networks over Layer 3
+              Networks", August 2014.
+
+   [TCP]      ISI, USC., "Transmission Control Protocol", 1981.
+
+Authors' Addresses
+
+   Hao Chen
+   Huawei Technologies
+   101 Software Ave., Yuhuatai Dist.
+   Nanjing, Jiangsu  210012
+   China
+
+   Phone: +86 025-5662-4440
+   Email: philips.chenhao@huawei.com
+
+
+
+
+
+
+
+
+
+
+
+
+Chen & Song              Expires April 30, 2015                [Page 10]
+
+Internet-Draft               Load Balancing                 October 2014
+
+
+   Wei Song
+   Huawei Technologies
+   101 Software Ave., Yuhuatai Dist.
+   Nanjing, Jiangsu  210012
+   China
+
+   Phone: +86 025-5662-6297
+   Email: songwei80@huawei.com
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Chen & Song              Expires April 30, 2015                [Page 11]

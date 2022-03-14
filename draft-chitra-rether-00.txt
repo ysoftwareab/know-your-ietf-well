@@ -1,0 +1,1098 @@
+
+INTERNET DRAFT 	  	                    Chitra Venkatramani
+Expires October 1997	         IBM T.J.Watson Research Center
+draft-chitra-rether-00.txt                      Tzi-cker Chiueh
+		                            SUNY at Stony Brook
+                                                     April 1997
+
+
+RETHER : A Protocol for Real-Time Traffic Support on Ethernet
+-------------------------------------------------------------
+
+Status of this memo
+
+This document is an Internet Draft. Internet Drafts are working
+documents of the Internet Engineering Task Force (IETF), its 
+Areas, and its Working Groups. Note that other groups may also 
+distribute working documents as Internet Drafts.
+
+Internet Drafts are draft documents valid for a maximum of 
+six months. Internet Drafts may be updated, replaced, or 
+obsoleted by other documents at any time, It is not appropriate
+to use Internet Drafts as reference material or to cite them 
+other than as a "working draft" or "work in progress".
+
+Please check the I-D abstract listing contained in each 
+Internet Draft directory to learn the current status of this 
+or any other Internet Draft.
+
+
+Abstract
+--------
+Distributed multimedia applications require performance
+guarantees from the underlying network subsystem. Ethernet has
+been the dominant local area network architecture in the last
+decade, and we believe that it will remain popular because of its
+
+cost-effectiveness and the availability of higher-bandwidth
+Ethernets. We present the design of a software-based timed-token
+protocol called RETHER that provides real-time performance guarantees
+to multimedia applications without requiring any modifications to
+existing Ethernet hardware. RETHER features a hybrid mode of operation
+to reduce the performance impact on non-real-time network traffic, a
+race-condition-free distributed admission control mechanism, and an
+efficient token-passing scheme that protects the network against token
+loss due to node failures or otherwise. Performance measurements from
+a prototype running on 10-Mbps Ethernet and 100-Mbps Fast-Ethernet
+indicate that up to 60 of the raw bandwidth can be reserved without
+deteriorating the performance of non-real-time traffic significantly.
+This scheme is consistent with the ISSLL over LANs framework described
+in [7].
+
+Venkatramani, Chiueh      Expires Oct. 1997            [Page 1]        
+
+INTERNET DRAFT                 RETHER                April 1997
+
+
+1. Introduction
+---------------
+Distributed multimedia applications demand time-constrained data
+delivery, which requires resource guarantees from underlying
+networking and I/O systems. Although Ethernet performs well for
+non-real-time traffic, providing bandwidth guarantees on an Ethernet
+is problematic for two reasons. The first reason is that the Ethernet
+uses the CSMA/CD protocol [1]. The CSMA/CD protocol uses an 
+exponential backoff algorithm to handle collision on the channel while 
+attempting to transmit a packet. Due to the probabilistic nature of 
+the exponential backoff algorithm, channel access becomes 
+nondeterministic, which is not suitable for real-time 
+applications. The second reason is that the native Ethernet does 
+not prioritize packets. This is undesirable for real-time systems 
+in which important packets should not be held up waiting for unimportant 
+packets. This problem is addressed by the IEEE Standards Committee
+which has been working on the 802.1p [10], a standard for multiple 
+traffic classes to be handled by bridges and switches.  
+RETHER [4,5] has been designed to address the above problems and to 
+provide deterministic and periodic access to the network for multimedia
+applications. Because of the enormous popularity of Ethernet, it is
+essential to be able to support real-time services using existing
+Ethernet infrastructure, requiring minimal if any hardware
+changes. Hence, the RETHER protocol has been built into the network
+device driver in the operating system, thereby operating seamlessly
+with any off-the-shelf Ethernet hardware. RETHER does not require any
+hardware changes in the hosts or wiring for real-time communication
+on a single shared segment. It only requires special RETHER-enabled
+switches to extend the guarantees across multiple segments.
+RETHER is designed for applications requiring periodic access to the
+network medium. By using a deadline-driven token passing protocol that
+prioritizes real-time over non-real-time data, RETHER guarantees
+deterministic channel access to real-time data. RETHER also features a
+distributed admission control policy to allow dynamic addition and
+removal of real-time connections. The fault tolerance mechanism of
+RETHER protects the network against token loss due to node failures or
+bit corruptions. RETHER has been implemented and tested independently,
+as well as  in the context of the Stony Brook Video Server which is an
+end-to-end digital video server [8]. 
+
+It is important to distinguish the protocol layer at which RETHER
+works with respect to RSVP [6]. Figure 1 illustrates where RETHER fits
+in an end-to-end bandwidth reservation framework. In Figure 1, an
+
+Venkatramani, Chiueh      Expires Oct. 1997            [Page 2]        
+
+INTERNET DRAFT                 RETHER                April 1997
+
+end-to-end real-time connection is to be established between a sender
+node and a receiver node across the internet. This connection can be
+set up using a real-time connection setup protocol such as RSVP [6],
+which in turn relies on link-layer reservation mechanisms to actually
+set up the underlying connection. One of the subnetworks that
+participates in the real-time connection in Figure 1 is a switched
+multi-segment Ethernet while the others are ATM, FDDI, etc. The
+abstraction that RETHER exposes to RSVP is thus a
+real-time capable Ethernet-based subnetwork that can provide bandwidth
+guarantees. Hence, RETHER plays a complementary role to higher level
+reservation protocols in that it functions exclusively as a link-layer
+building block.   
+
+
+ Sender                                           Receiver 
+  O---------------------------------------------------O
+
+
+Connection Layer (RSVP)           Saved Connection State
+                                   |                  |
+                                   V                  V
+  O---------------O----------------O------------------O
+
+Link Layer
+  
+    FDDI             ATM            Switched Ethernet
+  O---------------O----------------O------------------O
+                                  /                    \
+                                 /   ------------------ \
+                                /    | RETHER enabled |  \
+                               /     | Ethernet Switch|   \
+                              /      ------------------    \
+                             /         /      |   \   \     \
+                            /         /\    O-|-O  \   \     \
+                           /         O  O     O     O   O<------- Hosts
+                          /       Segmented Ethernet running   \
+                         /                RETHER                \
+
+
+        
+
+       Figure 1. Internet bandwidth reservation with RETHER.
+
+In this document, we first present the design of RETHER as applicable
+to a shared single Ethernet segment and then the extension of RETHER
+to a switched environment. Our current implementation runs on a
+network of 10Mbps and 100Mbps Ethernets, on a combination of Pentium 
+and 486-based PC's running the FreeBSD v2.0 kernel. 
+
+Venkatramani, Chiueh      Expires Oct. 1997            [Page 3]        
+
+INTERNET DRAFT                 RETHER                April 1997
+
+
+2. The RETHER Protocol Overview
+-------------------------------
+
+The  RETHER protocol has the following features -
+
+* It allows applications to reserve bandwidth and guarantees the
+  reservation throughout the lifetime of the application by 
+  implementing two traffic classes -- real-time and non-real-time.   
+
+* It is implemented in software over off-the-shelf network hardware. 
+
+* It adopts a hybrid scheme whereby the network operates using a timed
+  token-bus protocol when there are real-time sessions, and using the
+  original Ethernet protocol at all other times. This scheme reduces
+  the performance degradation of non-real-time traffic, and presents
+  minimal disruption to existing network applications.  
+
+The network operates using the original Ethernet protocol (CSMA/CD)
+until a real-time request is made. When this happens, the network
+switches to a token-bus mode. In this mode, real-time data (like audio
+and video) is assumed to be periodic and time is divided into cycles
+of one period. The token rotation time (TRT) is a system initialization
+parameter and is fixed for all aplications in the network. 
+
+In each cycle, channel access for *all* traffic - real-time(RT) and
+non-real-time(NRT) -- is regulated by a token. RT traffic is scheduled
+to be sent out first in each cycle and NRT traffic is allowed to use
+the channel in the remaining time. Hence, in each cycle, all admitted
+RT nodes get to send data. But, all nodes may or may not get to send
+NRT data, depending on the time left in the cycle or the available
+residual bandwidth. When all the time in the cycle is exhausted, the
+token returns to the first RT node and begins a new cycle. The details
+of how this time is maintained and how the token is circulated are
+explained in the following sections. When the last RT session
+terminates, the network switches back to the CSMA mode.  
+
+2.1 Protocol Description
+------------------------
+                                                     |--------
+         |---------|    1st RT request    |----------|--|    | New RT
+         |CSMA     |--------------------->| RETHER      |<---| requests
+         |   Mode  |                      |    Mode     |
+         |         |<---------------------|             |
+         |---------|  Last RT session     |-------------|
+                        termination
+
+	   Figure 2 : Different Modes and Transitions in RETHER.
+
+The network is a single shared Ethernet segment and consists of N 
+nodes, all of which run RETHER. It is assumed that the value of N 
+is known to all the nodes in the network. 
+
+Venkatramani, Chiueh      Expires Oct. 1997            [Page 4]        
+
+INTERNET DRAFT                 RETHER                April 1997
+
+
+2.1.1 The CSMA Mode
+-------------------
+     Nodes compete for the channel using the generic Ethernet
+     protocol. This protocol performs well under light loads and
+     deteriorates only when the network is heavily loaded. Nodes
+     operate in this mode until the arrival of the first RT request
+     which initiates a switch to the RETHER-mode.
+
+2.1.2 Switch to the RETHER Mode
+-------------------------------
+     When an application on a node generates an RT request and the
+     node is in the CSMA-mode, it becomes an Initiator by broadcasting
+     a Switch-to-RETHER message on the Ethernet. Every node that
+     receives this message responds by setting its protocol mode to
+     RETHER mode. It holds off sending any more data and awaits
+     completion of transmission of the packet already in the
+     transmission buffer of its network interface. Then it sends an
+     acknowledgment back to the initiator. As soon as the initiator
+     receives all the acknowledgments, it creates a token and begins
+     circulating it. This completes a successful switch to RETHER-mode.
+
+     Acknowledgements are crucial to the success of the protocol for
+     two reasons. Firstly, acknowledgments signify the willingness of
+     the nodes to switch to RETHER-mode. Secondly, the fact that
+     acknowledgments are successfully sent out indicates that the
+     nodes do not have any pending  packet in the backoff phase of the
+     CSMA/CD protocol. The latter is particularly important because in
+     typical Ethernet cards, software has no control over the data
+     once it has been transferred to the network interface buffer.
+
+     The protocol can robustly handle the following scenarios that may
+     affect the process of switching to RETHER-mode -
+
+  1) Multiple Initiators
+
+     This condition occurs when applications running on two or more
+     different nodes generate an RT request simultaneously, and the
+     corresponding nodes initiate a transition to RETHER mode. The
+     race condition occurs when all of these nodes have placed their
+     Switch-to-RETHER broadcast message in the network interface
+     buffer and hence have no way of withdrawing it. We resolve this
+     condition by giving the node with the smaller ID, a higher
+     priority. 
+
+
+
+Venkatramani, Chiueh      Expires Oct. 1997            [Page 5]        
+
+INTERNET DRAFT                 RETHER                April 1997
+
+  2) Node failures
+
+     Ideally, the initiator that gains control of the transition
+     will receive (N-1) acknowledgments, where N is the maximum
+     number of nodes on the network. However, in the following
+     cases, some nodes do not respond and the initiator does not
+     receive (N-1) acknowledgments -
+     i) Although N is the maximum number of nodes on the network,
+        there could be fewer nodes actually in the network or some of
+        the nodes could be powered off.
+     ii) some of the acknowledgments could be dropped by the network
+        card at the Initiator node. 
+     iii) some of the nodes do not receive the Switch-to-RETHER
+        message due to transient phenomena such as receiver buffer
+        overflow. 
+
+     To take care of the above, the initiator sets a timer while
+     awaiting (N-1) acknowledgments. In all of the above cases, the
+     initiator times out because it receives less than (N-1)
+     acknowledgments. It then confirms that the nodes that did not
+     respond are really dead by trying to elicit acknowledgments from
+     them again. It does so by broadcasting the Switch-to-RETHER
+     message again. The Initiator attempts this a few more times
+     (twice in our prototype) and the Initiator with the lowest ID
+     completes the transition.  
+
+   The time to switch to RETHER-mode is non-deterministic since the 
+nodes have to transmit packets in their network buffers as well as the
+acknowledgments using the CSMA/CD protocol. The maximum time interval
+to complete the switch, used in our implementation, is based on an
+empirical distribution.
+
+2.1.3 The RETHER Mode
+---------------------
+     In this mode, a token circulates among two sets of nodes - the
+     RT-set and the NRT-set. Only nodes that have successfully made a
+     bandwidth reservation belong to the RT-set, while *all* the
+     network nodes belong to the NRT-set.
+
+     Real-time data is assumed to be periodic and the interval
+     between successive visits of the token to each node in the
+     RT-set is one period. This period is also known as the Token
+     Rotation Time (TRT). The token visits the nodes in either RT or
+     NRT modes, when the node can hold the token for an interval of
+     time called the Token Holding Time (THT). During this time, it
+
+Venkatramani, Chiueh      Expires Oct. 1997            [Page 6]        
+
+INTERNET DRAFT                 RETHER                April 1997
+
+     can send the corresponding type of message. Each RT process
+     specifies its required transmission bandwidth as the amount of
+     data it needs to send during each TRT. This is translated into
+     its THT using Equation [1], where `Software Overhead'
+     refers to overheads such as processing of packets in the device
+     driver and T_token refers to the token processing overhead.
+     Since the RT reservations are made in terms of the size of the
+     data unit to be sent in each cycle, policing and enforcement of
+     the reservation is done automatically. RT nodes are allowed to
+     change their bandwidth reservation dynamically and will be 
+     granted requests for more bandwidth only if resources are 
+     available.
+     
+     THT_RT = (Data per TRT/(Ethernet bandwidth) + 
+                Software Overhead + T_token             [Eqn 1]
+
+     THT_NRT = (Message Size)/(Ethernet bandwidth) + 
+                Software Overhead + T_token             [Eqn 2]
+
+     Equation [Eqn 2] is used to determine the THT for NRT
+     nodes. While THT_RT is predetermined based on the reservation
+     request, THT_NRT is computed each time the token visits
+     an NRT node, based on the size of the message that is actually
+     sent. By controlling the 'Message Size' parameter, it is possible
+     to tune THT_NRT to get better performance. Each NRT message
+     could consist of one or more packets, each of which can have
+     a maximum size of an Ethernet Maximum Transmission Unit
+     (MTU). The number of packets that a node is permitted to 
+     send per NRT-token visit is limited by a parameter called 
+     'NRT Burst Size'. The 'NRT Burst Size' can be set to -
+
+     i) one packet, 
+     ii) as many packets as possible, or
+     iii) at most a fixed number of packets.
+
+     The first policy is fair and allows each node a share
+     of the residual bandwidth. However, since Ethernet traffic
+     is usually bursty in nature, the second policy might be a
+     better choice since the response time will be shorter, if as
+     many of the queued packets as possible could be transmitted.
+     The third policy only permits at most a fixed number of     
+     packets to be sent. Depending on the characteristics of the
+     traffic on the network, the 'NRT Burst Size' parameter can
+     be set appropriately.
+
+
+Venkatramani, Chiueh      Expires Oct. 1997            [Page 7]        
+
+INTERNET DRAFT                 RETHER                April 1997
+
+     In order to maintain the real-time guarantees, the interval
+     between two consecutive visits of the token to an RT node
+     must be one TRT. This time is maintained in the token as a
+     counter that holds the value of the residual time in the
+     current cycle. In each cycle, the token starts out with 
+     its 'ResidualTime' field set to one TRT. It visits RT nodes
+     once for each stream in the order in which they were admitted. 
+     If a node made multiple bandwidth reservations, then the token
+     visits the node once, when all streams are serviced. This order
+     is determined using 'RT Stream Information' stored in the token,
+     which is an up-to-date list of 
+     all the currently active RT sessions and their bandwidth
+     reservations. This information is required by the admission
+     control algorithm. Each entry in this list holds a 
+     <Node ID, Port ID> pair which uniquely identifies an RT
+     session. Each of the RT nodes sends one unit of RT data for the
+     corresponding stream and decrements the ResidualTime by its
+     THT_RT. Then, in the remaining time, the token visits the NRT
+     nodes in a round-robin fashion, starting with the last unvisited
+     NRT node in the previous cycle.
+
+     Each NRT node determines if there is sufficient time to transmit
+     the data packet. It does so by examining the messages in the NRT
+     message queue and computing the time it would take to transmit
+     one or more of those packets, using Equation [Eqn 2].
+     If there is sufficient time, it sends out data constrained by the
+     'NRT Burst Size' parameter, decrements the 'ResidualTime'
+     field on the token by its THT_NRT and passes the token to its
+     neighbor. If not, it sends the token back to the RT-set, flagging
+     itself as the NRT node to be the first to receive the token in
+     the next cycle. The first RT node then resets the 'ResidualTime'
+     to be equal to one TRT, thereby beginning a new 
+     cycle. Hence, the token need not necessarily visit all the nodes
+     in the NRT-set in each cycle. It may visit nodes in the RT-set
+     multiple times before visiting a node in the NRT-set. In this 
+     way, the  nodes in the RT-set are given priority over those
+     in the NRT-set.
+
+
+
+Venkatramani, Chiueh      Expires Oct. 1997            [Page 8]        
+
+INTERNET DRAFT                 RETHER                April 1997
+
+                             Ethernet Segment
+       ================================================================
+          |       |    |      |      |     |      |      |     |    |
+         +-+      |   +-+     |      |    +-+     |      |     |    |
+         |1|      2   |3|     4      5    |6|     7      8     9    10
+         +-+          +-+                 +-+
+
+
+     Figure 3 : Sample Configuration of a network where nodes 1, 3 and
+     6 are real-time nodes.
+
+     Figure 3 shows a sample configuration of a network. Here, the
+     nodes 1, 3 and 6 belong to the RT-set and need a  bandwidth
+     reservation for an MPEG-1 stream of 1.5 Mbps each . 1.5Mbps
+     translates to 6.25 KB per frame at the rate of 
+     30 frames per second. Hence, using Equation [Eqn 1], the
+     nodes make a reservation of 6ms each, on a 10Mbps
+     Ethernet. During each TRT, the token visits the nodes 1, 3 and 6
+     when each of them holds the token for 6 msec while transmitting
+     data and releases it. In the remaining time of 15 msec, the token
+     visits nodes so that they can transmit NRT data. A possible
+     sequence in two successive token rotation cycles is - 
+
+          [1]-[3]-[6]-1-2-3-4-5-6-7-[1]-[3]-[6]-7-8-9-10-11-1-2-...
+
+     As is evident, the protocol is completely decentralized. This is
+     possible because much of the protocol state is maintained in the
+     token. In a nutshell, the design requires the following
+     information to reside in the token - 
+
+     * Residual Time in the token cycle
+     * Network State Information about all the nodes in RETHER-mode
+     * RT Stream Information about all active RT streams and their
+       reservations 
+     * First NRT node in next token cycle
+
+2.1.4 Switch to CSMA Mode
+-------------------------
+     The last node to terminate its RT session destroys the token and
+     sends out a Switch-to-CSMA broadcast message. All the
+     nodes switch back to the CSMA-mode in response to this
+     message. No  acknowledgments are collected in this case. One
+     potential problem with this approach is that nodes that fail to
+     receive the Switch-to-CSMA message may not be able to
+     revert to the CSMA mode. This problem is solved by having all the
+     nodes maintain a timer that is set larger than the longest time
+     between token visits. Once this timer goes off, the node
+     automatically switches to the CSMA/CD mode. 
+
+Venkatramani, Chiueh      Expires Oct. 1997            [Page 9]        
+
+INTERNET DRAFT                 RETHER                April 1997
+
+
+3. Support Modules
+------------------
+
+This section describes the admission control and fault tolerance
+modules of RETHER. The admission control module corresponds to 
+the Bandwidth Allocator (BA) described in [7]. The implementation in
+RETHER is a distributed BA where each host is responsible for making
+admission decisions locally.
+
+3.1 Admission Control
+---------------------
+As new real-time requests are made, they must go through an admission
+control module that determines if there is sufficient network
+bandwidth available to satisfy the request of the node. We adopt a
+simple decentralized admission control policy to admit new RT
+sessions. Each node determines whether or not to admit its own
+application's reservation request. A new session with a reservation
+THT_RTnew can be admitted if and only if - 
+
+ sum{i in RTset} THT_RTi + THT_RTnew + T_NRT <= TRT [Eqn 3]
+
+where T_NRT is the time in each cycle set aside for NRT traffic. It
+basically sets an upper bound on the time between consecutive visits
+of the token to a node and hence determines the starvation
+characteristics of NRT traffic. The minimum value for T_NRT should be
+such that the worst case NRT network access latency is less than the
+timeout values of higher layer protocols.  
+
+If a request is admitted, it is added to the RT-set information on the
+token and hence, it can start sending RT data in the next cycle, when
+the token visits in the RT mode. If not, the request system call
+returns to the user process with a failure code. The user may keep
+trying until the request is admitted. 
+
+In our design, admission decision at a node is postponed until that
+node receives an NRT token. In other words, a process' request to
+initiate an RT connection does not return until the associated node
+receives the token. This is because the token contains the most 
+up-to-date information about the RT-set and the bandwidth
+reservations. This decision was made because the only other
+alternative is to  maintain this information at each node. However,
+this may lead to incorrect admission decisions when two or more nodes
+receive RT requests simultaneously and each node admits its request
+without the knowledge of admission decisions made at other nodes.  
+
+
+Venkatramani, Chiueh      Expires Oct. 1997            [Page 10]        
+
+INTERNET DRAFT                 RETHER                April 1997
+
+When an RT session terminates, the sender merely removes itself from
+the RT-set information on the token, when it receives the token. It
+also sends a message to the receiver end of the connection to
+terminate the session. 
+
+3.2 Fault Tolerance
+-------------------
+Since nodes in a network of workstations environment are likely to
+crash or get rebooted without any warning to other nodes, it is
+essential to have a mechanism that can detect node failures,
+reconfigure the token bus and regenerate the token if it is lost. The
+RETHER protocol is designed to be sufficiently robust to handle these
+events transparently.  
+
+The issue of fault tolerance focuses on two different scenarios in the
+protocol. The first is ring maintenance and the second is token
+loss. Ring maintenance involves dynamic failure and addition of nodes 
+into the token bus. Token loss covers the scenarios when a node
+holding the token fails or when a node drops the token as a corrupted
+packet. 
+
+Our approach to fault tolerance is a decentralized scheme that is far
+simpler that the one in 802.4 [2] and 802.5 [3]. This is partly owing
+to the fact that in a failure where a token is lost and it cannot be
+detected by our scheme, the network nodes timeout and switch back to 
+transmitting data using the CSMA/CD protocol which the hardware
+implements. 
+
+The fault tolerance feature remedies the following situations -
+  i) node failure, 
+ ii) node reboot, 
+iii) token corruption, 
+ iv) token loss.
+
+When the network operates in the RETHER-mode, each node monitors the
+state of its logical successor. Each node, after sending the token to
+its successor, sets an `Acknowledgment Timer'. If the successor is
+alive, it holds the token for the duration of its THT and then sends
+the token to its successor and also an acknowledgment to its 
+predecessor. On receiving this, the monitoring predecessor cancels its
+timer. If, on the other hand, the successor is dead, the monitoring
+node times out and assumes that its successor is dead. It then updates
+the `Network State Information' on the token to indicate the status of
+the successor, modifies the `RT Stream Information', if the failed
+node had made any reservations. It then sends the token to the next
+successor that is alive.
+
+
+Venkatramani, Chiueh      Expires Oct. 1997            [Page 11]        
+
+INTERNET DRAFT                 RETHER                April 1997
+
+In case the successor node is alive, but drops the token for reasons
+like hardware checksum failure or the monitoring node does not receive
+the acknowledgment for similar reasons, this scheme would not detect
+it and jump to the conclusion that the neighbor is dead. In order to
+avoid this, the predecessor polls the successor to ensure that it has
+really crashed, before regenerating the token. In response to the
+polling message, the neighbor specifies if it has forwarded the token
+or did not receive the token at all. In the first case, the monitoring
+node does not generate a token while in the second case, it does. 
+
+The scheme described above would result in a tokenless network if both
+a node and its monitoring predecessor crash. This is detected by each
+node using an `Inactivity Timer' set to the maximum token rotation
+time seen by any node (NRT or RT), described in Section 3.1. We
+consider this a catastrophic failure, terminate all the RT
+reservations, and make all the nodes revert back to the CSMA/CD
+protocol.   
+
+Our original design used the scheme whereby the token was broadcast
+and this served as the acknowledgment to the monitoring node. However,
+since the protocol was implemented in software, the interrupt overhead
+due to the broadcasting was very heavy and we had to choose to send
+the acknowledgments explicitly. The order in which the token and
+acknowledgment are sent is important. If the order is such that a
+node sends the acknowledgment first and then the token, and if the 
+node fails between these events, then the network becomes tokenless. 
+In this scenario, we use the `Inactivity Timer' mechanism described 
+above to regenerate the token. If the order of the two messages is 
+reversed and the node fails after forwarding the token,
+then the network would end up with two tokens. We avoid the this 
+situation and chose to implement the former scheme, where the 
+acknowledgment is sent before the token is forwarded
+
+When a node boots up, it broadcasts a message identifying itself. If
+the network is in RETHER-mode, the node with the token  adds the new
+node to the 'Network State Information' in the token. The new node
+then waits for the token to arrive. Once this  
+node is added to the list in the token, the token would arrive at the
+node within the 'Worst Case Net Access Latency' bound described in
+Section 3.1. If the token does not arrive within this interval, the
+new node assumes that the network is in the CSMA mode. The broadcast
+message may, however, introduce a slip in the protocol timings because
+it may collide with the node attempting to access the network. But,
+this effect is not cumulative and the protocol recovers from this in
+the next cycle. 
+
+Venkatramani, Chiueh      Expires Oct. 1997            [Page 12]        
+
+INTERNET DRAFT                 RETHER                April 1997
+
+
+3.3 Overflow Buffer Management
+------------------------------
+The fault recovery time described above takes more than one token
+cycle. During this time, the network is tokenless, and the sender node
+continues to receive data from the application, for instance, a camera
+in a video-conferencing application. Therefore, the sender node has to
+reserve enough buffer space for each stream, to hold the data
+generated during the token recovery period. However, each additional
+buffer increases the end-to-end latency for the connection. Hence, we
+limit the number of buffers to be (T_end_to_end/TRT), where T_end_to_end
+is the end-to-end latency that each connection can specify. We also adopt
+a policy whereby we empty all the overflow buffers as soon as possible
+using the available NRT bandwidth. This is because our goal is to try
+to preserve the bandwidth reservation even when there is loss
+of bandwidth due to fault recovery.   
+
+4. RETHER in Switched Ethernet Environment
+------------------------------------------
+To provide end-to-end network bandwidth guarantees between any pair of
+nodes in a multi-segment Ethernet, RETHER has been extended to operate
+across switches. Conceptually, the system applies the single-segment
+RETHER protocol (described in Section 3) on each of the segments on 
+the path from the source to the destination of a real-time connection. 
+The per-segment reservations are all part of one logical connection used 
+for resource allocation. Consider the network configuration in Figure 4. 
+Suppose a real-time connection runs from A1 to C1. This connection can be 
+broken down into three sub-connections namely A1-Sw1 on Segment 1, 
+Sw1-Sw2 on Segment 2, and Sw2-C1 on Segment 3, where the nodes on the 
+left are senders and those on the right are receivers.For a multi-segment
+real-time connection, each intermediate switch acts as a sender on one
+segment and a receiver on the other. All of the Ethernet segments run
+the single-segment RETHER protocol, with the token cycles on
+different  segments being independent of each other. That is, there is
+no synchronization requirement on the token cycles associated with
+adjoining segments. The following sections describe the functionality
+of each of the major modules of the multi-segment RETHER protocol in 
+detail.  
+ 
+        /------[A2]-----\  /------------------\  /-------[C1]-----|
+       /                 \/                    \/                 |
+     [A3]  Segment1     [Sw1]  Segment2      [Sw2]    Segment3    |
+       \                 /\                    /\                [C2]
+        \-------[A1]----/  \-------[B1--------/  \----------------|
+
+          Figure 4 : A multi-segment Ethernet configuration. Nodes on 
+          different segments can have RT sessions going across
+          switches. 
+
+Venkatramani, Chiueh      Expires Oct. 1997            [Page 13]        
+
+INTERNET DRAFT                 RETHER                April 1997
+
+
+4.1 Connection Setup and Admission Control
+------------------------------------------
+Multi-segment RETHER includes a link layer connection setup protocol
+to manage connections across switches. The RETHER connection message
+is routed using the static routing tables in the switches and an
+end-to-end real-time connection is established in the Ethernet
+subnetwork. This is independent of the network layer real-time
+connection establishment across the subnetwork. 
+
+Connection establishment is initiated by the receiver. The connection
+message is sent as a special message that is intercepted by RETHER
+modules along the path from the receiver to the sender. This is
+because, the connection set up module is responsible for
+making resource reservations, namely buffers and network bandwidth,
+along the path from the receiver to the sender. At
+each intermediate switch, the next hop network and the Ethernet
+address of the next hop destination are saved as part of the
+connection state. This fixes the route that the data has to take once
+the end-to-end connection has been admitted. If there is a change in 
+the route due to failures during the lifetime of the connection, the
+connection is terminated and an attempt is made to re-establish it. 
+This is dealt with in Section 3.2. Once the connection is
+established, each sub-connection is only aware of its other end-point
+in its segment. The information about the final source and destination
+of the stream is not stored anywhere in the network. If the connection
+setup should fail for reasons such as insufficient buffer memory,
+failure to admit the connection, or no route to the destination, then
+a non-real-time message is sent back to the original receiver along
+the same path on which the connection request message traveled
+forward, and all previously allocated resources are released and the
+application is informed of the failure. 
+
+The admission control test is performed in each segment that the
+connection crosses and is the same as that described in Section
+3.1. Once the connection is admitted in the last Ethernet segment, it
+is complete and data transfer begins immediately. There is no explicit
+'connection accept' message when the connection is admitted. Instead,
+the fact that the receiver receives the first frame of data acts 
+as an implicit acknowledgment.    
+
+
+Venkatramani, Chiueh      Expires Oct. 1997            [Page 14]        
+
+INTERNET DRAFT                 RETHER                April 1997
+
+4.2 Fault Tolerance
+-------------------
+When the token on an Ethernet segment is lost or corrupted, the
+single-segment RETHER protocol's fault tolerance mechanism recovers
+from the fault by reintroducing the token in that segment. All the
+real-time connections that pass through the segment continue to work
+after token recovery. Therefore, multi-segment RETHER poses no new
+problems compared to single-segment RETHER in this case. However, when
+a network node crashes, new mechanisms need to be devised to handle
+multi-segment connections in which the failed node is involved.
+
+For a multi-segment connection, if the crashed node is one of the 
+intermediate switches or an end-point of a real-time connection, the
+state associated with the connection needs to be cleaned up. 
+Because a RETHER switch participates in the token passing on all
+segments that are connected to it, the switch failure is detected
+independently on each of the segments via the fault tolerance scheme
+described in Section 3.2. The nodes that detect the failure then
+broadcast a message to that effect on their respective segments. The
+other end-points of the sub-connection to which the crashed node was
+connected, upon receiving such a message, frees up associated
+resources, and sends an abort message to the next sub-connection.  The
+message eventually reaches the actual end-points of the connection in
+either direction and all the reserved resources for the connection are
+released. For an intermediate switch crash, a termination message
+travels along the path of the connection on both sides of the failed
+node. For the crash of an end-point, the message travels only in one
+direction. 
+
+ 
+        /------[A2]-----\  /------------------\  /-------[C1]-----|
+       /                 \/                    \/                 |
+     [A3]  Segment1     [Sw1]  Segment2      [Sw2]    Segment3    |
+       \                 /\                    /\                [C2]
+        \-------[A1]----/  \-------[B1--------/  \----------------|
+
+   Figure 5. Switch SW connects Segment1 and Segment2. If SW crashes,
+   hosts A2 and B2 detect the failure independently in the two segments
+   that SW is connected to.
+
+For instance, in Figure 5, suppose Sw1 has crashed and Node A2 detects
+the failure on Segment 1 and Node B2 detects it on Segment 2. A2 and
+B2 inform all the node on their respective segments by broadcasting a
+message. On receiving the message, A1 terminates its Send
+sub-connection and frees up the connection's associated resources. Sw2
+similarly terminates the Receive sub-connection whose other end-point
+
+Venkatramani, Chiueh      Expires Oct. 1997            [Page 15]        
+
+INTERNET DRAFT                 RETHER                April 1997
+
+was Sw1, on Segment 2. Since this is a multi-segment connection, Sw2
+also sends a message to C1 to terminate the entire connection and to
+free the reserved resources. Thus, all the state associated with the
+connection through Sw1 are cleared.  
+
+If, on the other hand, the failed node is not involved in the
+real-time connection, a token recovery takes place locally in the
+segment on which the failed node is and the RT connection continues as
+before. The only effect on any real-time session crossing this segment
+is that it would not be able to send/receive data during the fault
+recovery period. The impact of fault recovery on buffering
+requirements at the switch is discussed in Section 4.3.1.
+
+4.3 Buffer Management
+---------------------
+The token cycles on adjoining network segments are not synchronized
+and this could lead to longer latency because of temporal skew of
+token arrival times on the two segments of the connection. Since the
+token rotation times (TRT) in both segments are the same, the maximum
+skew between them could be one TRT long. To accommodate this, we use a
+double buffering scheme in which there are two buffers for each
+real-time stream going across the switch. While one buffer is being
+filled by the Receive sub-connection on one segment, the other is
+emptied out by the  Send sub-connection on the other, when the token
+on the outgoing segment arrives. At the end of each token cycle, the
+roles of the two buffers are swapped.  
+
+The size of the buffer has a direct effect on the end-to-end latency
+seen by the users. For interactive applications such as
+teleconferencing, the limit on the end-to-end latency is around
+300msec. This implies that the buffering delays at each hop must be
+small and that the number of hops that a real-time connection can
+cross, is bounded. In theory, the token cycle times on all network
+segments are supposed to be the same, and in each cycle the switch
+receives exactly one frame of data from the incoming segment and sends
+out exactly one frame of data on the outgoing segment. Therefore, the
+real-time connection suffers a maximum of one token cycle latency at
+each hop along the path, and the maximum end-to-end latency is (Number
+of hops * Token cycle time). The minimum latency would be the time to
+transmit the data from the sender to the receiver as though they were
+on the same segment plus the time to copy the data to memory and out
+at each intermediate switch. However, in practice, neither the network
+segments have identical token cycle times, nor does the switch forward
+the data it receives immediately. The delay impact of the
+discrepancies in token cycle times and the possible approaches to
+solve the problem are described in Section 4.4.  
+
+Venkatramani, Chiueh      Expires Oct. 1997            [Page 16]        
+
+INTERNET DRAFT                 RETHER                April 1997
+
+
+As explained in Section 3.3, each switch must have additional buffers
+besides the two buffers for the double buffering scheme to take care
+of fault recovery. In multi-segment RETHER again, the buffers for each 
+connection across a switch is limited by the maximum end-to-end latency 
+specification for the connection. We keep track of the end-to-end 
+latency suffered by each data frame and drop the ones that exceed the 
+limit, in the network.  
+
+4.4 Implementation Experiences
+-----------------------------
+After implementing the multi-segment RETHER protocol as described in
+the previous section, some unexpected problems surfaced, which
+forced us to go back to devise additional mechanisms to supplement the
+original design. This section describes these modifications and
+additions. 
+
+The main problem that we encountered in our first implementation was a
+significant deviation of the token cycle times from the ideal values,
+on adjoining segments. This led to serious problems of buffer
+overflow/underflow at the switches, and a breakdown of bandwidth
+guarantees for connections. We traced the deviation and found that it
+was due to the inaccuracy in determining the token processing time at
+the switch. There was contention for the CPU due to packets arriving
+on multiple segments more or less simultaneously. Because of the
+contention, the processing of tokens/messages on one segment is
+delayed by the switch's processing of the token or message on another
+segment. Since these events cannot be predicted, this led to
+nondeterminism in computing the time to process a token at the switch
+and also the token cycle times. This led to differences between the
+average token rotation times (TRT) of the adjoining segments. For a
+connection that crosses these segments, this phenomenon allows the
+segment with the smaller average TRT to send data at a faster rate
+than the segment with the larger TRT can consume, leading to buffer
+overrun problems at the switch. Because of this problem, data is
+delivered only at the rate of the slowest link in the path of the
+connection, which results in the violation of end-to-end bandwidth
+guarantees. To address this problem, we devised a cycle time 
+compensation algorithm that dynamically measures the nondeterminism 
+and accounts for it. 
+
+
+Venkatramani, Chiueh      Expires Oct. 1997            [Page 17]        
+
+INTERNET DRAFT                 RETHER                April 1997
+
+4.4.1 Compensation Algorithm
+----------------------------
+We developed a history-based prediction mechanism to estimate the
+discrepancy between the ideal token cycle time and the actual token
+cycle time in the next cycle. One of the nodes in each segment is
+designated the 'synchronizer' node and is supposed to receive the
+token at the beginning of each token cycle. The 'synchronizer' node
+takes a time stamp at each token visit and if the token cycle time is
+not the ideal token cycle time, then it adjusts the effective token
+cycle time in the next cycle to take care of the detected
+discrepancy. For example, if the discrepancy estimate that the
+'synchronizer' makes is (+5 msec), meaning that the token arrived late
+by 5 msec, it assumes that the same is likely to occur in 
+the next cycle. Hence, the 'synchronizer'  simply subtracts 5 msec
+from the TRT for the next cycle expecting the token to come back to
+it, exactly one TRT later. If, on the other hand, the discrepancy that
+the 'synchronizer' detects is (-5 msec), meaning that the token
+arrived 5 msec early, then it holds the token for 5 msec, thereby
+correcting the current cycle. The 'synchronizer' node also keeps track
+of the correction that it applied in the previous 'n' cycles (the
+value of 'n' determines the amount of history used in prediction and
+is a configurable parameter), and computes the correction term for the
+next cycle based on this history.  
+
+In the current design, all the RT nodes independently compute the
+correction term. However, only the first real-time node in the token
+cycle serves the 'synchronizer' role and actually applies the
+correction. Because the list of real-time nodes is stored in the
+token, it is straightforward for each node to decide whether it is the
+'synchronizer' node. In other words, there is no need to re-elect a
+new synchronizer node when the previous synchronizer dies or all RT
+streams from that previous synchronizer terminate. The cycle-time
+prediction and adjustment algorithm executed by all RT nodes is shown
+in the Algorithm below. 
+
+--------------------------------------------------------------------
+1     Current_TimeStamp = gettime();   
+2     if (NodeID == Synchronizer)  {   
+3       Difference =  Current_TimeStamp + Token_Residual_Time    
+                       - Prev_TimeStamp - Ideal_Token_Cycle;   
+4       if (Difference < 0)  {   
+5               Delay a time period of duration abs(Difference);   
+6       }
+7       /* accumulate errors from previous runs */  
+8       Compensation += Difference;   
+9       if (Compensation < 0)   
+10             Compensation = 0;   
+11      Token_Residual_Time = Ideal_Token_Cycle - K * Compensation;    
+12      Current_TimeStamp = gettime();   
+13    }
+14    Prev_TimeStamp = Current_TimeStamp;   
+--------------------------------------------------------------------
+
+Venkatramani, Chiueh      Expires Oct. 1997            [Page 18]        
+
+INTERNET DRAFT                 RETHER                April 1997
+
+
+'Token_Residual_Time' is the residual time counter on the token that
+      indicates the time remaining in the current token cycle. 
+'Difference' is the token cycle discrepancy calculated from the
+      previous cycle. 
+'Compensation' is the cumulative errors observed so far. The initial
+      'Token_Residual_Time' for the next cycle is computed 
+      by subtracting (K * Compensation) from 'Ideal_Token_Cycle', where 
+K is the damping factor to avoid over-compensation. A larger value of K
+      implies that any deviation observed in the cycle is compensated
+      for quicker. A smaller value for 'K' indicates that the
+      compensation is done slower. 
+
+The gettime() in line 1 of the algorithm determines the actual time
+when the token arrives at this node and is used to compute 
+the duration of the previous cycle. Intuitively, this time stamp
+should also mark the beginning of the next token cycle. However, if
+the token happens to come early and a 'Delay' is done to compensate
+for the early arrival, the actual start of the next cycle is after the
+'Delay'. Hence, we take another time stamp at the end of the
+processing, on line 12. This algorithm has been implemented in our
+prototype and as a result the cycle times across various segments
+remain stable with very small jitter. This in turn ensures smooth
+delivery of data for multi-segment real-time connections. 
+
+5. User Interface
+-----------------
+The user application has a set of library functions to request 
+and manage bandwidth reservations for connections. The library
+functions access the RETHER Bandwidth Allocator through system 
+calls to the kernel. The connections and the network are managed 
+transparently by RETHER. The library functions and the RETHER
+system call API correspond to the Requester Module described in [7].
+
+6. Conclusion
+-------------
+In this document we presented RETHER, a protocol to support real-time
+connections in a switched Ethernet environment. The protocol is
+designed to operate entirely in the link layer and exposes a real-time
+capable Ethernet subnetwork to protocols such as RSVP. RETHER provides
+distinct traffic priority classes namely real-time and non-real-time
+and allows the user to specify the kind of flow required. RETHER also
+incorporates an admission control module that can be employed by RSVP
+to make reservations. The implementation for the end-stations is
+entirely in software without requiring any infrastructure/hardware
+changes while special switches are necessary to carry the RETHER
+guarantees across multiple Ethernet segments. 
+
+Venkatramani, Chiueh      Expires Oct. 1997            [Page 19]        
+
+INTERNET DRAFT                 RETHER                April 1997
+
+
+A detailed performance evaluation of the protocol can be found in
+[9]. Through the evaluation of the prototype, we show that
+the implementation is reasonably efficient in a testbed that consists
+of 10-Mbps and 100-Mbps links, and the target performance guarantees
+are indeed met in all cases. 
+
+There are several directions that the RETHER group is currently
+pursuing actively. First, we would like to experiment the switch
+implementation on a high-end Pentium machine that has more efficient
+I/O hardware to evaluate the performance scalability of the switch, in
+terms of larger numbers of attached links as well as higher link
+bandwidth. In addition, the software architecture will use polling
+instead of being interrupt driven, to minimize the CPU overhead.
+Second, because wireless LAN has a physical network architecture
+similar to Ethernet, we are planning to extend the multi-segment
+RETHER technology to a heterogeneous network of wired and wireless
+links.  Finally, we are looking at the feasibility of implementing
+part of the RETHER protocol in hardware, to demonstrate  
+the feasibility of incorporating RETHER into switches, to Ethernet
+switch vendors. 
+
+
+
+Venkatramani, Chiueh      Expires Oct. 1997            [Page 20]        
+
+INTERNET DRAFT                 RETHER                April 1997
+
+References
+----------
+[1] "Carrier Sense Multiple Access with Collision Detection (CSMA/CD)
+     access method and physical layer specifications" 
+     ANSI/IEEE Standard 802.3-1985.
+
+[2] IEEE/ANSI Standard 802.4 - 1985, "Token passing bus access method
+    and physical layer specifications". 
+    IEEE Inc., New York, 1985. 
+
+[3] IEEE/ANSI Standard 802.5, "Token Ring access method and physical
+     layer specifications".
+     IEEE Inc., New York, 1985.
+
+[4]  "Design, Implementation and Evaluation of a software-based real-time 
+     {Ethernet} protocol",
+     Chitra Venkatramani and Tzi-cker Chiueh
+     Proceedings of the ACM SIGCOMM'95.
+
+[5]  "Supporting Real-time Traffic on Ethernet", 
+     Tzi-cker Chiueh and Chitra Venkatramani
+     Proceedings of IEEE Real-time Systems Symposium,
+     Peurto Rico, Dec. 1994.
+
+[6] "Resource Reservation Protocol (RSVP) - Version 1 Functional
+     Specification" 
+     Internet Draft, November 1996
+     <draft-ietf-rsvp-spec-14.ps>
+
+[7] "A Framework for Providing Integrated Services Over Shared and
+     Switched LAN Technologies", Internet Draft, April 1997,
+     <draft-ietf-issll-is802-framework-01.txt>
+
+[8] "Design of the Stony Brook Video Server" Michael Vernick, Chitra
+     Venkatramani, Tzi-cker Chiueh. 
+     SPIE First International Symposium on Technologies and Systems
+     for Voice, Video and Data Communications.", Oct. 1995,
+     Pliladelphia, MA. 
+
+[9] "The Design, Implementation and Evaluation of RETHER : A Real-Time
+     Ethernet Protocol", Chitra Venkatramani 
+     PhD Thesis, SUNY at Stony Brook, Stony Brook, NY.
+
+[10] "IEEE Standards for Local and Metropolitan Area Networks:
+     Draft Standard for Traffic Class and Dynamic Multicast Filtering
+     Services in Bridged Local Area Networks" (Draft Supplement to
+     802.1D), P802.1p/D5, February, 1997.
+
+
+
+Venkatramani, Chiueh      Expires Oct. 1997            [Page 21]        
+
+INTERNET DRAFT                 RETHER                April 1997
+
+Authors' Addresses
+
+Chitra Venkatramani
+IBM T.J.Watson Research Center
+30, Saw Mill River Road
+Hawthorne, NY 10532.
+USA
+(914) 784-7369
+chitra@watson.ibm.com
+
+Tzi-cker Chiueh
+Department of Computer Science
+SUNY at Stony Brook
+Stony Brook, NY 11594
+USA
+(516) 632-8449
+chiueh@cs.sunysb.edu
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Venkatramani, Chiueh      Expires Oct. 1997            [Page 22]        

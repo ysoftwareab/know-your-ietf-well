@@ -1,0 +1,395 @@
+
+
+
+
+
+
+Internet-Draft                                 Brent Callaghan
+Expires: November 2003                   Sun Microsystems, Inc.
+                                                    Tom Talpey
+                                        Network Appliance, Inc.
+
+Document: draft-callaghan-nfsdirect-00.txt           May, 2003
+
+
+
+
+
+                       NFS Direct Data Placement
+
+
+Status of this Memo
+
+   This document is an Internet-Draft and is subject to all provisions
+   of Section 10 of RFC2026.
+
+   Internet-Drafts are working documents of the Internet Engineering
+   Task Force (IETF), its areas, and its working groups.  Note that
+   other groups may also distribute working documents as Internet-
+   Drafts.
+
+   Internet-Drafts are draft documents valid for a maximum of six months
+   and may be updated, replaced, or obsoleted by other documents at any
+   time.  It is inappropriate to use Internet- Drafts as reference
+   material or to cite them other than as "work in progress."
+
+   The list of current Internet-Drafts can be accessed at
+   http://www.ietf.org/1id-abstracts.html
+
+   The list of Internet-Draft Shadow Directories can be accessed at
+   http://www.ietf.org/shadow.html
+
+   This memo provides information for the Internet community.  This memo
+   does not specify an Internet standard of any kind.  Distribution of
+   this memo is unlimited.
+
+
+Copyright Notice
+
+   Copyright (C) The Internet Society (2003).  All Rights Reserved.
+
+
+
+
+
+
+
+
+Expires: November 2003    Callaghan and Talpey                  [Page 1]
+
+Internet-Draft         NFS Direct Data Placement                May 2003
+
+
+Abstract
+
+   The RDMA transport for ONC RPC supports direct data placement for NFS
+   data.  Direct data placement not only reduces the amount of data that
+   needs to be copied in an NFS call, but allows much of the data
+   movement over the network to be implemented in RDMA hardware. This
+   draft describes the use of direct data placement by means of server-
+   initiated RDMA Writes into client-supplied buffers in a Write list
+   for implementations of NFS versions 2, 3, and 4 over an RDMA
+   transport.
+
+
+1.  Introduction
+
+   The RDMA Transport for ONC RPC [RPCRDMA] allows an RPC client
+   application to post buffers in a Write list that accept specific
+   results from an RPC call.  The RDMA transport header conveys this
+   list of client buffer addresses to the server where the application
+   can associate them with result data and use RDMA Write to transfer
+   the results directly into the posted buffers on the client.  The
+   client and server must agree on a consistent mapping of posted reply
+   buffers to RPC results.  This document details the mapping for each
+   version of the NFS protocol.
+
+
+2.  RDMA Write List
+
+   The RDMA Write list, in the RDMA transport header, allows the client
+   to post one or more buffers into which the server will RDMA Write
+   designated result chunks directly.  If the client sends a null write
+   list, then results from the RPC call will be returned as either an
+   in-line reply, as chunks in an RDMA Read list of server-posted
+   buffers, or in a client-posted reply buffer.
+
+   Each posted buffer in a Write list is represented as an array of
+   memory segments. This allows the client some flexibility in
+   submitting discontiguous memory segments into which the server will
+   scatter the result.  Each segment is described by a triplet
+   consisting of the segment handle or steering tag (STag), segment
+   length, and memory address or offset.
+
+      struct xdr_rdma_segment {
+         uint32 handle;    /* Registered memory handle */
+         uint32 length;    /* Length of the chunk in bytes */
+         uint64 offset;    /* Chunk virtual address or offset */
+      };
+
+
+
+
+
+Expires: November 2003    Callaghan and Talpey                  [Page 2]
+
+Internet-Draft         NFS Direct Data Placement                May 2003
+
+
+      struct xdr_write_chunk {
+         struct xdr_rdma_segment target<>;
+      };
+
+      struct xdr_write_list {
+         struct xdr_write_chunk entry;
+         struct xdr_write_list  *next;
+      };
+
+   The sum of the segment lengths yields the total size of the buffer,
+   which must be large enough to accept the result.  If the buffer is
+   too small the server must return an XDR encode error.  The server
+   must return the result data for a posted buffer by progressively
+   filling its segments, perhaps leaving some trailing segments unfilled
+   or partially full if the size of the result is less than the total
+   size of the buffer segments.
+
+   The server returns the RDMA Write list to the client with the segment
+   length fields overwritten to indicate the amount of data RDMA Written
+   to each segment. Results returned by direct placement must not be
+   returned by other methods, e.g.  by read chunk list or in-line.
+
+   The RDMA Write list allows the client to provide multiple result
+   buffers - each buffer must map to a specific result in the reply. The
+   NFS client and server implementations must agree on the mapping of
+   results to buffers for each RPC procedure. The following sections
+   describe this mapping for versions of the NFS protocol.
+
+
+3.  NFS Versions 2 and 3 Mapping
+
+   A single RDMA write list entry may be posted by the client to receive
+   either the opaque file data from a READ request or the pathname from
+   a READLINK request.  The server will ignore a Write list for any
+   other NFS procedure, as well as any Write list entries beyond the
+   first in the list.
+
+
+4.  NFS Version 4 Mapping
+
+   This specification applies to the first minor version of NFS version
+   4 (NFSv4.0) and any subsequent minor versions that do not override
+   this mapping.
+
+   The Write list will be considered only for the COMPOUND procedure.
+   This procedure returns results from a sequence of operations.
+   Designated operations consume entries from the Write chunk list.  The
+   first entry in the Write chunk list must be used by the first
+
+
+
+Expires: November 2003    Callaghan and Talpey                  [Page 3]
+
+Internet-Draft         NFS Direct Data Placement                May 2003
+
+
+   designated operation in the compound procedure.  If the Write chunk
+   list is consumed before all designated operations are evaluated,
+   remaining results will be returned in-line or by Read chunk list as
+   appropriate.  If a Write chunk list entry is presented, then a
+   designated operation must use it to return its result data.  However,
+   Write list chunk with a zero length buffer indicates that the
+   corresponding designated operation is to return its result in-line or
+   by Read chunk list.
+
+   The designated operations and their results are the opaque file data
+   from the READ operation, and the pathname from the READLINK
+   operation.
+
+   The following example shows an RDMA Write list with three posted
+   buffers A, B, and C.  The designated operations in the compound
+   request, READ and READLINK, consume the posted buffers by writing
+   their results back to each buffer.
+
+      RDMA Write list:
+
+         A --> B --> C
+
+      Compound request:
+
+         PUTFH LOOKUP READ PUTFH LOOKUP READLINK PUTFH LOOKUP READ
+                       |                   |                   |
+                       v                   v                   v
+                       A                   B                   C
+
+   If the client does not want to have the READLINK result returned
+   directly, then it sets the values in the segment triplet for buffer B
+   to zeros so that the READLINK result will be returned in-line.
+
+
+5.  Security
+
+   The RDMA transport for ONC RPC supports RPCSEC_GSS security as well
+   as link-level security.  The use of RDMA Write to return RPC results
+   does not affect ONC RPC security.
+
+
+6.  IANA Considerations
+
+   NFS use of direct data placement introduces no new IANA
+   considerations.
+
+
+
+
+
+
+Expires: November 2003    Callaghan and Talpey                  [Page 4]
+
+Internet-Draft         NFS Direct Data Placement                May 2003
+
+
+7.  Acknowledgements
+
+   The authors would like to thank Dave Noveck and Chet Juszczak for
+   their contributions to this document.
+
+
+8.  References
+
+   [RPCRDMA]
+     B. Callaghan, T. Talpey, "RDMA Transport for ONC RPC"
+     http://www.ietf.org/internet-drafts/
+        draft-callaghan-rpc-rdma-00.txt
+
+   [NFSRDMA]
+      T. Talpey, S. Shepler, "NFSv4 RDMA and Session Extensions"
+      http://www.ietf.org/internet-drafts/
+         draft-talpey-nfsv4-rdma-sess-00.txt
+
+   [RFC1831]
+      R. Srinivasan, "RPC: Remote Procedure Call Protocol Specification
+      Version 2",
+      Standards Track RFC,
+      http://www.ietf.org/rfc/rfc1831.txt
+
+   [RFC1832]
+      R. Srinivasan, "XDR: External Data Representation Standard",
+      Standards Track RFC,
+      http://www.ietf.org/rfc/rfc1832.txt
+
+   [RFC1094]
+      "NFS: Network File System Protocol Specification",
+      (NFS version 2) Informational RFC,
+      http://www.ietf.org/rfc/rfc1094.txt
+
+   [RFC1813]
+      B. Callaghan, B. Pawlowski, P. Staubach, "NFS Version 3 Protocol
+      Specification",
+      Informational RFC,
+      http://www.ietf.org/rfc/rfc1813.txt
+
+   [RFC3530]
+      S. Shepler, B. Callaghan, D. Robinson, R. Thurlow, C. Beame, M.
+      Eisler, D. Noveck, "NFS version 4 Protocol",
+      Standards Track RFC,
+      http://www.ietf.org/rfc/rfc3530.txt
+
+
+
+
+
+
+Expires: November 2003    Callaghan and Talpey                  [Page 5]
+
+Internet-Draft         NFS Direct Data Placement                May 2003
+
+
+9.  Authors' Addresses
+
+
+
+           Brent Callaghan
+           Sun Microsystems, Inc.
+           17 Network Circle
+           Menlo Park, California 94025 USA
+
+           Phone: +1 650 786 5067
+           EMail: brent.callaghan@sun.com
+
+
+           Tom Talpey
+           Network Appliance, Inc.
+           375 Totten Pond Road
+           Waltham, MA 02451 USA
+
+           Phone: +1 781 768 5329
+           EMail: thomas.talpey@netapp.com
+
+
+
+10.  Full Copyright Statement
+
+
+   Copyright (C) The Internet Society (2003).  All Rights Reserved.
+
+   This document and translations of it may be copied and furnished to
+   others, and derivative works that comment on or otherwise explain it
+   or assist in its implementation may be prepared, copied, published
+   and distributed, in whole or in part, without restriction of any
+   kind, provided that the above copyright notice and this paragraph are
+   included on all such copies and derivative works.  However, this
+   document itself may not be modified in any way, such as by removing
+   the copyright notice or references to the Internet Society or other
+   Internet organizations, except as needed for the purpose of
+   developing Internet standards in which case the procedures for
+   copyrights defined in the Internet Standards process must be
+   followed, or as required to translate it into languages other than
+   English.
+
+   The limited permissions granted above are perpetual and will not be
+   revoked by the Internet Society or its successors or assigns.
+
+   This document and the information contained herein is provided on an
+   "AS IS" basis and THE INTERNET SOCIETY AND THE INTERNET ENGINEERING
+   TASK FORCE DISCLAIMS ALL WARRANTIES, EXPRESS OR IMPLIED, INCLUDING
+
+
+
+Expires: November 2003    Callaghan and Talpey                  [Page 6]
+
+Internet-Draft         NFS Direct Data Placement                May 2003
+
+
+   BUT NOT LIMITED TO ANY WARRANTY THAT THE USE OF THE INFORMATION
+   HEREIN WILL NOT INFRINGE ANY RIGHTS OR ANY IMPLIED WARRANTIES OF
+   MERCHANTABILITY OR FITNESS FOR A PARTICULAR PURPOSE.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Expires: November 2003    Callaghan and Talpey                  [Page 7]
+

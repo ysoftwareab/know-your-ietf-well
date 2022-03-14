@@ -1,0 +1,774 @@
+INTERNET-DRAFT                                          C. Sapuntzakis
+                                                         Cisco Systems
+                                                            A. Romanow
+                                                         Cisco Systems
+
+                                                              J. Chase
+                                                       Duke University
+
+draft-csapuntz-caserdma-00.txt                            December 2000
+
+
+                            The Case for RDMA 
+
+
+Status of this Memo
+
+This document is an Internet-Draft and is in full conformance with all
+provisions of Section 10 of RFC2026.
+
+Internet-Drafts are working documents of the Internet Engineering
+Task Force (IETF), its areas, and its working groups.  Note that
+other groups may also distribute working documents as Internet-
+Drafts.
+
+Internet-Drafts are draft documents valid for a maximum of six months
+and may be updated, replaced, or obsoleted by other documents at any
+time.  It is inappropriate to use Internet-Drafts as reference
+material or to cite them other than as "work in progress."
+
+The list of current Internet-Drafts can be accessed at
+http://www.ietf.org/ietf/1id-abstracts.txt
+
+The list of Internet-Draft Shadow Directories can be accessed at
+http://www.ietf.org/shadow.html.
+
+Copyright Notice
+Copyright (C) Cisco Systems (2000). All Rights Reserved.
+
+
+Abstract
+
+The end-to-end performance of IP networks for bulk data transfer is
+often limited by data copying overhead in the end systems.  Even when
+end systems can sustain the bandwidth of high-speed networks, copying
+overheads often limit their ability to carry out other processing
+tasks.
+
+Remote Direct Memory Access (RDMA) is a facility for avoiding copying
+for network communication in a general and comprehensive way.  RDMA is
+particularly useful for protocols that transmit bulk data mixed with
+control information, such as NFS, CIFS, HTTP, or enscapsulated device
+protocols such as iSCSI.  While networking architectures such as the
+Virtual Interface (VI) architecture support RDMA, there is no standard
+for RDMA over IP networks.  Such a standard would allow vendors of
+IP-aware network hardware (such as TCP-capable network adapters) to
+incorporate support for RDMA into their products.
+
+This document reviews the I/O performance issues addressed by RDMA,
+and considers issues for supporting the key elements of RDMA in an IP
+networking context.
+
+Glossary
+
+header/payload splitting - any technique that enables a NIC to deposit
+    incoming protocol headers and payloads into separate host buffers
+
+headers - control information used by the protocol
+
+HBA - host bus adapter, a network adapter (see NIC)
+
+I/O operation - a request to a device, then a transfer to/from that device,
+    and a status response
+
+MTU - maximum transmission unit, the largest packet size that a given
+    network device or path can carry
+
+NIC - network interface card/controller (see HBA)
+
+payload - in general, uninterpreted data transported by a protocol
+
+payload steering - any technique that enables a NIC to deposit an
+    incoming protocol payload into a buffer designated for that
+    specific payload
+
+protocol stack - the layers of software, firmware, or hardware
+   that implement communication between applications across a network
+
+region and region identifier (RID) - a memory buffer region reserved and
+   registered for use with RDMA requests, and its unique identifier
+
+solicited data - data that was sent in response to some control
+   message
+
+unsolicited data - data that was sent without being requested
+
+upper-layer protocol (ULP) - an application-layer protocol like
+  NFS, CIFS, HTTP, or iSCSI
+
+1. Introduction
+
+The principal use of the Internet and IP networks today is for
+buffer-to-buffer transfers, often in the form of file or block
+transfers. Today, this is done using a variety of protocols: HTTP,
+FTP, NFS, and CIFS. Soon, iSCSI will be added to this list.
+
+These upper-layer protocols (ULPs) all have one thing in common: the
+majority of the bytes they send on the network are data "payloads"
+that are uninterpreted by the protocol or the network. 
+
+Each ULP has different ways of requesting and initiating data
+transfers. They differ in the kinds of control information or
+meta-data (e.g. cache coherence info) they specify and send across the
+wire. However, all these protocols eventually come down to
+transporting large blocks of uninterpreted data from a local buffer to
+a remote buffer.  Transferring a payload from one host to another is
+similar to a buffer-to-buffer data transfer (like the C memcpy
+function) over the network. For example, one use of HTTP is to
+transfer JPEG format graphic images from a web server to a web
+browser's address space.
+
+Today, gigabit speed buffer-to-buffer network transfers are chewing up
+significant memory bandwidth and CPU time on the receivers.  With the
+advent of IP checksum hardware, the end-system overhead for network
+transfers is dominated by costs of copying in order to place incoming
+data correctly in the receiver's memory buffer.  Although CPUs are
+rapidly becoming more powerful, advances in network bandwidths have
+also kept pace with and even exceeded Moore's Law in recent years.
+Moreover, copying is limited by memory system performance, which is
+not improving as fast CPU speeds.
+
+One solution to this problem is to place the data in the correct
+memory buffer directly as it arrives from the network, avoiding the
+need to copy it into the correct buffer after it has arrived. If the
+network interface (NIC) could place data correctly in memory, this
+would free up the memory bandwidth and CPU cycles consumed by copying.
+
+A number of mechanisms already exist to reduce copying overhead in the
+IP stack.  Some of these mechanisms depend on fragile assumptions about
+the hardware and application buffers, others involve ad hoc support
+for specific protocols and communication scenarios, and all of them
+impose other costs that may be prohibitive in some scenarios.
+
+However, a mechanism called Remote Direct Memory Access (RDMA) offers
+a solution that is simple, general, complete, and robust.  RDMA
+introduces new control information into the communication stream that
+directs data movement for buffer-to-buffer transfers.  Incorporating
+support for RDMA into network protocols can significantly reduce the
+cost of network buffer-to-buffer transfers.
+
+RDMA accomplishes exact data placement via a generalized abstraction
+at the boundary between the ULP and its transport (e.g., TCP),
+allowing an RDMA-capable NIC to recognize and steer payloads
+independently of the specific ULP.  Using RDMA, ULPs
+gain efficient data placement without the need to program ULP-specific
+details into the NIC.  Thus RDMA speeds deployment of new protocols by
+not requiring the firmware or hardware on the NIC to be rewritten to
+accelerate each new protocol.
+
+To be effective, the receiving NIC must recognize the RDMA control
+information, and ULP implementations or applications most be modified
+to generate the RDMA control information.  In addition, support for
+framing in the transport protocols would allow an RDMA-capable NIC to
+locate RDMA control information in the stream in the case where
+packets arrive out of order.
+ 
+Historically, network protocols and implementations have addressed the
+issue of demultiplexing multiple streams arriving at an interface.
+However, there are still no accepted solutions to demultiplex control
+and data arriving on a single stream.  Much current network traffic is
+characterized by a small amount of control with a large amount of
+data.  RDMA enables efficient data payload steering for this common
+case, which is especially important as data rates increase.
+
+This document is somewhat tutorial in seeking to set out clearly the
+I/O performance issues addressed by RDMA, and the design alternatives
+for an RDMA facility. It considers proposed approaches for solving the
+problems, clarifying the benefits and costs of deploying and using an
+RDMA approach.
+
+The document is organized as follows.  Section 2 describes the copy
+overhead problem in detail. Section 3 discusses various alternatives
+to a general RDMA facility. Section 4 describes the RDMA approach in
+detail.  RDMA implementation issues are considered in Section 5, and
+unsolicited data in Section 6.
+
+
+2. The I/O Performance Problem
+
+Figure 1 shows a block diagram illustrating the layers involved in
+transferring data in and out of a host system. We will call these
+layers the network I/O stack. Each boundary in the diagram corresponds
+to an I/O interface.  In general, we assume that all the modules
+represented in Figure 1 (except for the NIC) run on the host CPU,
+although RDMA is equally useful if portions of the I/O stack run on
+the NIC.
+
+
+	|-----------------------|
+
+	  Application
+
+	|-----------+-----------| 
+          File      |
+          System    | Block 
+          Interface | Interface
+	|-----------+-----------|
+	Upper-Layer Protocol Stack                  
+         (NFS, CIFS, SCSI/iSCSI, 
+		HTTP)
+	|-----------------------|  
+
+	  Network Stack (IP, TCP)
+
+	|-----------------------|
+
+	  NIC
+
+	|-----------------------|
+
+
+In IP networks, end system CPUs may incur substantial overhead from
+copying data in memory as part of I/O operations. Copying is
+necessary in order to align data, place data contiguously in memory, or
+place data in specific buffers supplied by the application or ULP module.
+These may be important to applications for several reasons.
+
+Alignment is important because most CPU architectures impose alignment
+constraints on data accessed in units larger than a byte, e.g., for
+incoming data interpreted as integers.
+
+Contiguity of data in memory simplifies the book-keeping data
+structures that describe the data and improves memory utilization by
+reducing fragmentation of free space. Data contiguity may simplify
+algorithms that traverse the data, reducing execution time. For
+example, data contiguity enables sequential memory access.
+
+Common network APIs such as sockets [Stevens] allow applications to
+designate specific buffers for incoming data, requiring a copy to
+place the incoming data correctly.  It may be possible to avoid the
+copy by page remapping (see Section 3.2), but only if the data is
+contiguous to occupy complete memory pages and is page-aligned
+relative to the application's buffer.  Similarly, storage protocols
+such as NFS and iSCSI may require contiguous, page-aligned data for
+buffering in the system I/O cache.
+
+This document concentrates on how to eliminate unnecessary data copies
+used to assure correct placement of incoming data.
+
+Some have argued that the expense of these data copies can be partly
+masked if some other data scanning operation, such as checksumming or
+decryption, runs over the data simultaneously (see [ALF]). However,
+such optimizations are highly processor-dependent and may not yield
+the expected benefits [Chase]. Moreover, this approach is not useful
+unless other data scanning operations are handled in software;
+hardware support for checksumming and decryption is increasingly
+common.
+
+In recent years, valuable progress has been made in minimizing
+other sources of networking overhead.  Examples include checksum
+offloading, extended ethernet frames, and interrupt suppression.  For a
+review and evaluation of various solutions see [Chase]. These issues
+are not discussed in this document.
+
+2.1 Copy on receive
+
+The primary issue addressed here is how application data is received
+from the network.  In many I/O interfaces, when an application reads
+data, the application specifies the buffer into which it will receive
+data.  But, today's generic NICs are incapable of placing data
+directly into the supplied buffer. This limitation is largely because
+such direct placement of data requires more complexity and intelligence
+than provided in generic NICs.  For example to accomplish this task,
+NICs would need to separate payloads from ULP and transport headers, parse
+headers, and demultiplex multiple incoming packet streams.
+
+Most NICs today are not this sophisticated in their handling of
+incoming data streams.  Instead, they deposit incoming packets into
+generic host buffers supplied by the network stack software.  Both the
+network and ULP stacks sift through the packets, looking successively
+at headers from the link layer (e.g., Ethernet), IP, transport, and
+ULP. Eventually, the data payload is recognized and copied from the
+network buffers to the correct application buffer.
+
+
+2.2 Copy on transmit
+
+For the most part, sending data from applications to the network
+should not require copies in the I/O stack. Today's network adapters
+can gather data from anywhere in memory to form a packet, so no copy
+is necessary to align outgoing packet data for the NIC.
+
+Copying can be used as a technique to ensure that the data is not
+modified between the time it is passed from the application to the I/O
+interface, and the time that the data transfer completes. Other
+well-known solutions exist that do not involve copying [Brustoloni].
+
+Copy on transmit will not be discussed further.
+
+
+3. Non-RDMA solutions
+ 
+There are a range of ad-hoc solutions to avoid copying of incoming
+data that do not require RDMA. These include:
+
+	- scatter-gather buffers
+	- header/payload separation
+	- parsing the ULP on the NIC
+
+3.1 Scatter-gather buffers
+
+Once the NIC has written the application data to memory, a copy can be
+avoided if we tell the application where to find its data in memory.
+The application data may be scattered in memory as it may have arrived
+in multiple packets.  A data structure called a scatter-gather buffer
+is used to tell the application the location of the data.
+Scatter-gather buffering is the only known copy avoidance technique
+that does not require direct support on the NIC.
+
+This solution is not compatible with existing I/O interfaces, such as
+the sockets interface.  Also, in this approach, data is not necessarily
+contiguous in memory or page-aligned.  For example, it cannot in
+general be delivered securely to a user-level process without copying
+it, since mapping the pages containing the received data into a user
+process address space exposes the containing pages in their entirety,
+not just the portions occupied by the received data.
+
+However, scatter-gather buffering is a viable copy avoidance technique
+for kernel-based applications where few data transformations are
+needed.  For file system protocols, effective use of scatter-gather
+buffering may require a redesign of the the file buffer cache and/or
+virtual memory page cache.
+
+3.2. Ad Hoc header/payload separation
+
+A more sophisticated NIC might recognize transport and/or ULP headers
+in order to separate the headers from the payloads. Then each payload
+is "split" from its header and place the payload in a separate buffer.
+Header/payload splitting is useful for copy avoidance because a
+virtual memory system may then map the payload to an application
+buffer by manipulating virtual memory translations to point to the
+payload.  This approach, called "page flipping" or "page remapping",
+is an alternative to copying for delivering the data into the
+application buffers.  A prerequisite for page flipping is that the
+application buffer must be page-aligned and contiguous in virtual
+memory.
+
+Header/payload splitting adds significant complexity to the NIC.  If
+the network MTU is smaller than the hardware page size, then the
+transfer of a page of data is spread across multiple packets. These
+packets can arrive at the receiver out-of-order and/or interspersed
+with packets from other flows. In order to pack the data contiguously
+into pages, the NIC must do intelligent processing of the transport
+and ULP.  This approach is "ad hoc" because the NIC must include
+support for each transport and ULP that benefits from page flipping.
+The NIC processing may be unnecessarily complex for ULPs such as NFS
+that use variable-length headers or that require ULP-level state to
+decode the incoming headers.
+
+A key disadvantage is that page flipping requires TLB invalidations,
+which can be prohibitively expensive on shared memory multiprocessors.
+
+
+3.3. Explicit header/payload separation 
+
+The previous section discussed header/payload separation implemented
+in an ad hoc fashion. It is also possible to implement a more
+generalized method of header/payload splitting that does not require
+the NIC to decode ULP headers.  A generic framing mechanism
+implemented at the transport layer or just above it could include
+frame header fields that distinguish the ULP payload from the ULP
+header.  This would enable a receiving NIC to separate received data
+payloads from control information and deposit the received payload
+data in contiguous page-aligned target buffer locations. Under most
+conditions this is sufficient to allow low-copy implementations of
+ULPs such as NFS.
+
+The RDMA approach explored in this document is a more general
+extension of this approach. 
+
+3.4. Terminate the ULP in the NIC
+
+If the NIC terminates the ULP, the memory copy is eliminated because
+the application communicates I/O requests directly to the NIC.  The
+NIC uses the information in the ULP headers to steer ULP payloads to
+the correct application buffers.  This is commonly done in the
+FibreChannel arena, where FibreChannel NICs (or Host Bus Adapters)
+implements an I/O block (e.g., SCSI) transport on the NIC. This
+approach effectively migrates all modules of the network stack from
+Figure 1 onto the NIC.  FibreChannel implementations use this technique
+to deliver high performance with low host overhead.
+
+In such a scheme, the NIC needs to be informed of specific application
+buffers. The NIC also needs to be capable of header/payload splitting.
+
+While this approach may be useful for single-function devices, it is
+inappropriate for general-purpose NICs.  The NIC must be reprogrammed
+or extended to accelerate each ULP.  RDMA offers a general mechanism
+that allows RDMA-capable NICs to avoid copies for any ULP that uses
+RDMA.
+
+4. Remote Direct Memory Access (RDMA)
+
+This section outlines how RDMA works.
+
+Direct memory access (DMA) is a fundamental technique that is widely
+used in high-performance I/O systems.  DMA allows a device to directly
+read or write host memory across an I/O interconnect (such as PCI) by
+sending DMA commands to the memory controller. No CPU intervention or
+copying is required.  For example, when a host requests an I/O read
+operation from a DMA-capable storage device, the device uses a DMA
+write to place the incoming data directly to memory buffers that the
+host provides for that specific operation.  Similarly, when the host
+requests an I/O write operation, the device uses a DMA read to fetch
+outgoing data from host memory buffers specified by the host for that
+operation.
+
+Remote DMA can provide similar functionality in IP networks.  It is
+particularly useful when an IP network is used as an I/O interconnect
+for IP-capable devices, such as storage devices and their servers.
+Conceptually, RDMA allows a network-attached device to read or write
+remote memory, e.g., by adding control information that specifies the
+buffers to receive transmitted payloads.  The remote NIC decodes this
+control information and uses DMA to read/write memory, effectively
+translating between the RDMA protocol and the local memory access
+protocol.  In an IP network, the RDMA protocol appears at the
+transport layer (e.g., as a "shim" above an existing transport
+protocol such as TCP) so that a wide variety of upper-layer protocols
+can make use of it with minimal changes.
+
+The idea of RDMA has been around by various names for many years.
+RDMA is an important component of the VI architecture for user-level
+networking, and is also a key element of the Infiniband effort.  VI
+illustrates one alternative for a networking API that accommodates
+RDMA (see Section 5.1).  However, RDMA generalizes to other network
+architectures.  This document addresses issues for incorporating RDMA
+into conventional IP protocol stacks.  Note that VI can run over an IP
+transport such as TCP, but only if the NIC implements the full
+transport.
+
+Since TCP is the most widely used transport for upper-layer protocols,
+using RDMA with TCP is the first case to consider. However, RDMA can
+be used with other transport protocols, specifically SCTP.
+
+4.1 How RDMA works
+
+An RDMA facility embeds new RDMA control commands into the byte stream
+or packet stream.  A full RDMA protocol includes two key commands:
+RDMA READ and RDMA WRITE.  The receiving NIC translates these commands
+into local memory reads and writes.
+
+For security reasons, it is undesirable to allow transmitters to read
+or write arbitrary memory on the receiver.  Any RDMA scheme must
+prevent any unauthorized memory accesses.  Most RDMA schemes protect
+memory by allowing RDMA reads/writes only to buffers that the receiver
+has explicitly identified to the NIC as valid RDMA targets.  The
+process of informing the NIC about a buffer is called "registration".
+
+The following steps illustrate the common case of a data transfer
+using RDMA WRITE in the context of a request/response storage protocol
+such as NFS or iSCSI:
+
+	1. Client application calls an I/O interface, requesting that
+	the result of the I/O be put into a buffer B.
+
+	2. Client implementation registers buffer B with the NIC. 
+
+	3. Client sends the I/O READ request to server.
+
+	4. Server issues one or more RDMA WRITE(s) to write I/O data
+	into client's buffer B.
+
+	5. Server sends the file system READ response for the I/O.
+
+Of course, on each I/O operation the server must know to which client
+addresses to write.  One alternative is for the client to pass a
+token identifying the target buffer in the request; the server
+returns the token in its response.  This is the approach used in
+VI implementations.  An alternative is for both the client and server
+to each synthesize the token from other unique identifiers present in
+the request [TCPRDMA]. 
+
+Most RDMA schemes use a region identifier (RID) and an offset to
+identify the target buffer in a token. The (RID, offset) pair amounts
+to a form of virtual address; the receiving NIC translates the virtual
+addresses to physical addresses using table lookup.  As such, if a
+mapping to a physical page does not appear in the table, there is no
+way a transmitter can refer to it.
+
+Once an entry is in the table, the NIC can potentially access the
+physical memory of a buffer at any time. As such, the buffer must not
+be re-used for other purposes. One alternative is for the OS to "pin"
+the buffer in physical memory, allowing the NIC to safely hold the
+physical addresses corresponding to the buffer.  Once the region
+mapping is removed, the OS can "unpin" the physical memory.
+
+4.2. Unsolicited payloads
+
+NFS, CIFS, and HTTP all support sending data in a WRITE (or POST)
+request along with the request. This is optimistic; it assumes the
+receiving application has space (other than TCP window) to buffer the
+WRITE payload. The payload and transfer are called "unsolicited" in that
+they were not requested by the receiver.  RDMA WRITE is
+straightforward for solicited data, since the sender can receive the
+RID and buffer address in the message that solicits the data, as in
+the preceding example.  In the case of unsolicited data, it is not
+clear how the sender obtains the RID necessary for an RDMA WRITE.
+
+RDMA may be used for unsolicited data in the following way.  The
+receiver may expose a memory region for unsolicited data from each
+sender.  The sender, when it wishes to do an unsolicited WRITE, can
+RDMA its data into that region. Then, along with the WRITE request,
+the sender may pass a pointer (e.g., region offset) to the data it
+wrote.  This requires that the receiver (server) pass an RID for
+unsolicited data at connection open and supply a new region if the
+unsolicited region fills.  Alternatively, the receiver may handle
+unsolicited data by responding to the WRITE request with an RDMA
+READ (if supported) to fetch the data, as described in Section 4.3.
+
+4.3  Reading remote memory
+
+Some RDMA protocols allow one party to read another's memory with an
+RDMA READ operation. As with the RDMA WRITE, the NICs and not the CPUs
+process the RDMA READs.
+
+The receiving NIC may complete the RDMA READ from the receiver's
+memory without interrupting the CPU. The operation is potentially
+useful because CPU interrupts are expensive in general-purpose
+systems. Switching between the currently executing task and the
+interrupt handler involves flushing pipelines, saving and restoring
+context, and other overheads.
+
+Although any RDMA READ may be emulated using an RDMA WRITE in the
+opposite direction, use of RDMA READ as an alternative has potential
+advantages.  First, an RDMA READ requester does not need to export a
+region RID to receive the incoming data as an RDMA WRITE.  This is
+useful because it allows servers to avoid reserving and exposing
+memory regions for large numbers of clients.  Second, RDMA READ allows
+the requester to control the order and rate of data transmitted by the
+sender or RDMA READ target.
+
+For example, a network storage device or server may implement write
+operations by issuing RDMA READs to its client, rather than allowing
+the client to use RDMA WRITE to transfer the data to the server.  This
+allows the server to control use of the buffer space it allocates for
+the transfers, and to pull the data from the client in an order that is
+convenient for the server, e.g., to optimize disk performance.
+The emerging VI-based Direct Access File System uses RDMA READ for
+file write operations, in part for these reasons.
+
+RDMA READ is more complex than RDMA WRITE because it implies that the
+target NIC autonomously transmits data back to the requester, e.g.,
+without involving a host CPU.  This implies that the NIC implements the
+complete transport protocol necessary to send such data without involving
+or interfering with the protocol stack in host software.
+
+Use of RDMA READ requires ULPs designed to take advantage of it, as
+well as more powerful NICs.  While it offers several benefits, there
+may be alternative means to achieve many of the same benefits, such as
+simple interrupt suppressing NICs and ULP protocol features to control
+the rate and order of data flow, as provided in the iSCSI draft
+specification.
+
+In contrast to RDMA READ, RDMA WRITE is simple and general, does not
+require full implementation of the transport on the NIC, and is easily
+incorporated into existing request/response protocols with minimal
+impact.  The remainder of this document focuses on RDMA WRITE.
+
+4.4 Security
+
+The principal mechanism for RDMA security is region addressing using
+RID-based virtual addresses as described above in Section 4.1.  Under
+no circumstances may a transmitter access memory that has not been
+explicitly registered for RDMA use by the receiver.  Thus RDMA does
+not introduce fundamental new security issues beyond the standard
+concerns of interception and corruption of data and commands on an
+insecure connection.  In this case, the concern is whether RIDs for
+registered RDMA regions may be misused.
+
+To further improve safety, each RID may include a sparse (hard to
+guess) key value; only transmitters who know the key can read or write
+to the memory region.  RIDs protected in this way are essentially weak
+capabilities.  NICs may also place access-control lists or permissions
+on pages, or limit region access to specific connections.
+
+For real security on untrusted networks, the RDMA protocol may be
+protected in-transit using security and endpoint authentication
+features at the transport layer or below, such as TLS or IPsec.
+
+5 RDMA APIs
+
+Direct I/O to application buffers requires an interface for
+registering buffers with the NIC and receiving notification that RDMA
+transfers have completed.  It is straightforward to devise internal
+kernel interfaces to enable use of RDMA for kernel-based ULPs.
+However, use of RDMA by user-space applications may require extensions
+to existing kernel networking APIs.  For example, the Berkeley Unix
+sockets [Stevens] interface, as currently specified, does not directly
+support RDMA.
+
+5.1 The VI interface
+
+The VI programming interface [VI] supports both message passing and
+RDMA. The VI interface has calls for registering and pinning buffers.
+The interface supports both polling and asynchronous notification of
+events, e.g., RDMA completions.  The VI interface does not specify the
+wire protocol and allows a variety of protocols, including IP
+protocols.
+
+The VI interface assumes that user-space programs may directly access
+the NIC without transitioning to kernel mode. This precludes use of
+the full VI API in conjunction with conventional TCP/IP protocol
+stacks.  However, one option is to supplement the socket interface
+with RDMA-related elements of the VI interface.
+
+5.2 Winsock Direct
+
+The Winsock Direct API, available on Windows 2000, is an extension of
+the sockets interface that supports reliable messages and RDMA.
+
+6 Implementing RDMA
+
+Conceptually, the RDMA abstraction belongs at the transport layer so
+that it generalizes to multiple ULPs.  The sending side of the RDMA
+protocol is straightforward to implement at the boundary between the
+ULP and the underlying transport, i.e., as a "shim" to TCP.  However,
+the key aspects of the receiving side of an RDMA protocol are
+implemented within the NIC, a link-level device that is logically
+below the transport layer.  This is the crux of the problem for
+implementing RDMA.
+
+Transport-level support for enhanced framing (e.g., in TCP) would be
+useful for implementing RDMA.  For RDMA to be effective, the receiving
+NIC must be able to read and decode the control information necessary
+for it to implement RDMA.  At minimum, this requires it to recognize
+transport-layer headers and identify RDMA control headers embedded in
+the incoming data.  It is trivial to locate these headers within an
+ordered byte stream using a simple byte counting method (length field)
+for framing.  The difficulty is that packets may arrive at the RDMA
+receiver (NIC) out of order, and some or all of the transport-layer
+facility to reorder data may be implemented above the NIC, e.g., in
+host software, as shown in Figure 1.  Thus there must be some
+mechanism that enables the receiving NIC to retain or recover its
+ability to locate RDMA headers in the presence of sequence holes,
+i.e., when packets arrive out of order.
+
+One option is for the NIC to buffer out-of-order data until any late
+packets arrive, allowing the NIC to recover any lost framing
+information.  Note that this does not preclude delivering the
+out-of-order data to the host along a slow path that does not benefit
+from RDMA.  Keeping a copy of the data until all sequence holes are
+filled allows the NIC to traverse the RDMA headers in the data stream,
+positioning it to locate subsequent RDMA headers and re-establish the
+RDMA fast path.  If the NIC does not have sufficient memory to buffer
+the data, it may discard it, forcing the sender to retransmit more of
+the data after a sequence hole.
+
+A second option is to integrate framing support into the transport,
+allowing the receiver to locate RDMA headers even when packets arrive
+out of order.  Note that every packet must contain an RDMA header for
+this approach to be fully general.  For example, consider a packet
+carrying an RDMA header that applies to data in subsequent packets.
+Even with enhanced framing, if the packet containing the RDMA header
+is lost, the NIC cannot correctly apply the RDMA operation to the
+arriving data until it receives the RDMA header.
+
+Several alternatives have been proposed for integrating framing into
+TCP.  These include introducing a new TCP option [TCPRDMA] or
+constraining the TCP sender's selection of segment boundaries to
+correspond with framing boundaries [VITCP].  Each of these
+approaches would have some impact on TCP implementations and
+APIs, and some of them also extend the wire protocol.
+
+The TCP options approach requires a minor extension of the TCP wire
+protocol, and modification to both the sender and the receiver, which
+is especially painful considering today's inflexible in-kernel TCP
+implementations.  The TCP options approach does not break backward
+compatibility since unmodified endpoints will not negotiate the
+option. Also, the options information is regarded only as an
+optimization; it is not required for the application to parse the TCP
+stream.
+
+7 Conclusion
+
+Remote DMA provides for efficient placement of data in memory.  The
+NIC writes data into memory with the proper alignment.  Furthermore,
+the NIC can often place data directly into application buffers.
+
+The Remote DMA abstraction provides generalized mechanism useful with
+many higher level protocols such as NFS, without the need for ULP
+support in the NIC, and with only minor extensions to the ULP protocol
+implementations.
+
+
+Authors' Addresses
+
+Constantine Sapuntzakis
+Cisco Systems, Inc.
+170 W. Tasman Drive
+San Jose, CA 95134
+USA
+
+Phone: +1 408 525 5497
+Email: csapuntz@cisco.com
+
+Allyn Romanow
+Cisco Systems, Inc.
+170 W. Tasman Drive
+San Jose, CA 95134
+USA
+
+Phone: +1 408 525 8836
+Email: allyn@cisco.com
+
+Jeff Chase
+Department of Computer Science
+Duke University
+Durham, NC 27708-0129
+USA
+
+Phone: +1 919 660 6559
+Email: chase@cs.duke.edu
+
+References
+
+[ALF] D. D. Clark and D. L. Tennenhouse, "Architectural considerations
+for a new generation of protocols," in SIGCOMM Symposium on
+Communications Architectures and Protocols , (Philadelphia,
+Pennsylvania), pp. 200--208, IEEE, Sept. 1990.  Computer
+Communications Review, Vol. 20(4), Sept. 1990.
+
+[Brustoloni] J. Brustoloni and P. Steenkiste. "Effects of buffering
+semantics on I/O performance," in Operating System Design and
+Implementation (OSDI), Seattle, WA, Oct 1996.
+
+[Chase] J. Chase, A. Gallatin, and Ken Yocum, "End-system
+Optimizations for High-Speed TCP", IEEE Communications special
+issue on high-speed TCP, 2001.
+http://www.cs.duke.edu/ari/publications/end-system.ps (or .pdf).
+
+[CIFS] Paul Leach, "A Common Internet File System (CIFS/1.0) Protocol
+Preliminary Draft",
+http://www.cifs.com/specs/draft-leach-cifs-v1-spec-01.txt, December
+1997
+
+[HTTP] J. Gettys et al., "Hypertext Transfer Protocol - HTTP/1.1",
+RFC 2616, June 1999
+
+[NFSv3] B. Callaghan, "NFS Version 3 Protocol Specification",
+RFC 1813, June 1995
+
+[RPC] R. Srinivasan, "RPC: Remote Procedure Call Protocol
+Specification Version 2", RFC 1831, August 1995
+
+[iSCSI] J. Satran, et al., "iSCSI", draft-ietf-ips-iscsi-01.txt
+
+[Stevens] W. Richard Stevens, "Unix Network Programming Volume 1,"
+Prentice Hall, 1998, ISBN 0-13-490012-X
+
+[TCP] J. Postel, "Transmission Control Protocol - DARPA
+Internet Program Protocol Specification", RFC 793, September 1981
+
+[TCPRDMA] C. Sapuntzakis and D. Cheriton, "TCP RDMA option",
+http://www.ietf.org/internet-drafts/draft-csapuntz-tcprdma-00.txt
+
+[Winsock Direct] "Winsock Direct Specification", Windows 2000 DDK,
+http://www.microsoft.com/ddk/ddkdocs/win2K/wsdspec_1h66.htm
+
+[VI] Virtual Interface Architecture Specification version 1.0,
+http://www.viarch.org/
+
+
+[VITCP] DiCecco, S., et al., "VI/TCP (Internet VI)", 
+draft-dicecco-vitcp-01.txt, November 2000
+

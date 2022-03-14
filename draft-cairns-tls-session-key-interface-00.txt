@@ -1,0 +1,728 @@
+
+
+
+
+Network Working Group                                          K. Cairns
+Internet-Draft                               Washington State University
+Intended status: Standards Track                             J. Mattsson
+Expires: January 7, 2016                                         R. Skog
+                                                                Ericsson
+                                                            July 6, 2015
+
+
+              Session Key Interface (SKI) for TLS and DTLS
+               draft-cairns-tls-session-key-interface-00
+
+Abstract
+
+   This document describes a session key interface that can be used for
+   TLS and DTLS.  The Heartbleed attack has clearly illustrated the
+   security problems with storing private keys in the memory of the TLS
+   server.  Hardware Security Modules (HSM) offer better protection but
+   are inflexible, especially as more (D)TLS servers are running on
+   virtualized servers in data centers.
+
+Status of This Memo
+
+   This Internet-Draft is submitted in full conformance with the
+   provisions of BCP 78 and BCP 79.
+
+   Internet-Drafts are working documents of the Internet Engineering
+   Task Force (IETF).  Note that other groups may also distribute
+   working documents as Internet-Drafts.  The list of current Internet-
+   Drafts is at http://datatracker.ietf.org/drafts/current/.
+
+   Internet-Drafts are draft documents valid for a maximum of six months
+   and may be updated, replaced, or obsoleted by other documents at any
+   time.  It is inappropriate to use Internet-Drafts as reference
+   material or to cite them other than as "work in progress."
+
+   This Internet-Draft will expire on January 7, 2016.
+
+Copyright Notice
+
+   Copyright (c) 2015 IETF Trust and the persons identified as the
+   document authors.  All rights reserved.
+
+   This document is subject to BCP 78 and the IETF Trust's Legal
+   Provisions Relating to IETF Documents
+   (http://trustee.ietf.org/license-info) in effect on the date of
+   publication of this document.  Please review these documents
+   carefully, as they describe your rights and restrictions with respect
+   to this document.  Code Components extracted from this document must
+
+
+
+Cairns, et al.           Expires January 7, 2016                [Page 1]
+
+Internet-Draft                   TLS SKI                       July 2015
+
+
+   include Simplified BSD License text as described in Section 4.e of
+   the Trust Legal Provisions and are provided without warranty as
+   described in the Simplified BSD License.
+
+Table of Contents
+
+   1.  Introduction  . . . . . . . . . . . . . . . . . . . . . . . .   2
+   2.  Session Key Interface (SKI) . . . . . . . . . . . . . . . . .   3
+     2.1.  Key Server Processing . . . . . . . . . . . . . . . . . .   5
+   3.  Interaction with TLS Extensions . . . . . . . . . . . . . . .   6
+   4.  Examples  . . . . . . . . . . . . . . . . . . . . . . . . . .   6
+     4.1.  ECDHE_ECDSA Key Exchange  . . . . . . . . . . . . . . . .   6
+       4.1.1.  SKI Request and Response with JSON/HTTP . . . . . . .   7
+       4.1.2.  SKI Request and Response with CBOR/CoAP . . . . . . .   8
+     4.2.  Static RSA Key Exchange . . . . . . . . . . . . . . . . .   9
+       4.2.1.  SKI Request and Response with JSON/HTTP . . . . . . .   9
+       4.2.2.  SKI Request and Response with CBOR/CoAP . . . . . . .  10
+   5.  IANA Considerations . . . . . . . . . . . . . . . . . . . . .  11
+   6.  Security Considerations . . . . . . . . . . . . . . . . . . .  11
+   7.  Acknowledgements  . . . . . . . . . . . . . . . . . . . . . .  11
+   8.  References  . . . . . . . . . . . . . . . . . . . . . . . . .  11
+   Authors' Addresses  . . . . . . . . . . . . . . . . . . . . . . .  13
+
+1.  Introduction
+
+   Transport Layer Security (TLS) is specified in [RFC5246] and the
+   Datagram Transport Layer Security (DTLS), which is based on TLS, is
+   specified in [RFC6347].  During the TLS handshake, the TLS client and
+   the TLS server exchange a symmetric session key called the premaster
+   secret.  From the premaster secret, the client random, and the server
+   random, the endpoints derive a master secret, which in turn is used
+   to derive the traffic encryption keys and IVs.  The TLS server is
+   authenticated during this process by presenting a certificate and
+   then proving possession of the private key corresponding to the
+   public key in the certificate.
+
+   An important principle in designing security architectures is to
+   limit access to keying material, especially long-lived secrets such
+   as private keys.  The Heartbleed attack [HEART] has illustrated the
+   dangers of storing private keys in the memory of the TLS server.  One
+   common practice used to protect keys is to delegate the private key
+   operations to a separate entity such as a Hardware Security Module
+   (HSM), something that is supported in many TLS libraries.  HSMs
+   provide good security but are inflexible and may be difficult to
+   deploy when the TLS server runs on a virtualized machine in the
+   cloud, especially if the application server that uses TLS moves
+   between different data centers.  Furthermore, while HSMs protect
+   against extraction of the private key, they do not protect against
+
+
+
+Cairns, et al.           Expires January 7, 2016                [Page 2]
+
+Internet-Draft                   TLS SKI                       July 2015
+
+
+   misuse in case an adversary gains possession of the HSM itself.  One
+   solution to these problems is to use a network-attached HSM, but
+   these use proprietary network protocols tied to the specific HSM
+   vendor.  There are several other proprietary session key interfaces
+   deployed but no standardized solution.
+
+   The TLS Session Key Interface (SKI) defined in this document makes it
+   possible to store private keys in a highly trusted key server,
+   physically separated from client facing servers.  With TLS SKI (see
+   Figure 1), the TLS server is split into two distinct entities called
+   Edge Server and Key Server that communicate over an encrypted and
+   mutually authenticated channel using e.g.  TLS.  This increases the
+   security by shrinking the attack surface and reducing the damage if
+   the Edge Server is compromised.  It also enables secure handling of
+   TLS connections in the cloud.  The Edge Server can be placed close to
+   the clients, reducing latency, while the Key Server is placed in a
+   safe location.  One important use case is an origin that operates a
+   number of distributed HTTPS servers.
+
+      +--------+  Handshake  +-------------+    SKI    +------------+
+      | Client | <---------> | Edge Server | <-------> | Key Server |
+      +--------+             +-------------+           +------------+
+
+             Figure 1: TLS Session Key Interface Architecture
+
+   The public certificates (not private keys) are pre-provisioned in the
+   Edge Server.  The Key Server handles all the private key operations.
+   It retains control of the private keys and can at any time reject a
+   request from the Edge Server, e.g. if there is reason to suspect that
+   the Edge Server has been compromised.  The interface uses modern web
+   technologies like JSON, CBOR, HTTP, CoAP, TLS, and REST.  To minimize
+   latency, the Edge Server SHOULD keep a persistent connection to the
+   Key Server.  By making TLS SKI specific to TLS, the number of valid
+   inputs that the Key Server accepts is limited and the risk of having
+   a general signing interface reduced.  SKI supports the most commonly
+   used key exchange methods ECDHE_ECDSA, ECDHE_RSA, and RSA, together
+   with X.509 [RFC5280] or raw public key [RFC7250] authentication.  It
+   soes not work with PSK or SRP authentication.  Even though the
+   industry is quickly moving towards the more secure ECDHE key exchange
+   methods, which provides perfect forward secrecy, static RSA still
+   needs be supported in many deployments.
+
+2.  Session Key Interface (SKI)
+
+   The Session Key Interface is based on a request-response pattern
+   where the Edge Server sends a SKI Request to the Key Server
+   requesting a specific private key operation that the Edge Server
+   needs to complete a TLS handshake.  The Edge Server's request
+
+
+
+Cairns, et al.           Expires January 7, 2016                [Page 3]
+
+Internet-Draft                   TLS SKI                       July 2015
+
+
+   includes data to be processed, the identifier of the private key to
+   be used, and any options necessary for the Key Server to correctly
+   perform the requested operation.  The Key Server answers with a SKI
+   Response containing either the requested output data or an error.
+
+   Any request-response protocol can be used to carry the SKI payloads.
+   Two obvious choices are the Hypertext Transfer Protocol (HTTP)
+   [RFC7540] and the Constrained Application Protocol (CoAP) [RFC7252].
+   Which protocol to use is application specific.  SKI requests are by
+   default sent to the Request-URI '/ski'.  The interface between the
+   Edge Server and the Key Server MUST be protected by a security
+   protocol providing integrity protection, confidentiality, and mutual
+   authentication.  If TLS is used, the implementation MUST fulfill at
+   least the security requirements in [RFC7540] Section 9.2.
+
+   Two formats are defined for the SKI Payload format: the JavaScript
+   Object Notation (JSON) [RFC7159] and the Concise Binary Object
+   Representation (CBOR) [RFC7049].  In JSON, byte strings are Base64
+   encoded [RFC4648].  Which format to use is application specific.  The
+   payload consists of a single JSON or CBOR object consisting of one or
+   more attribute-value pairs.  The following attributes are defined:
+
+   'protocol'  REQUIRED in SKI requests.  Specifies the protocol version
+      negotiated in the handshake between Client and Edge Server.  Can
+      take one of the values 'TLS 1.0', 'TLS 1.1', 'TLS 1.2', 'DTLS
+      1.0', or 'DTLS 1.2'.
+
+   'spki'  REQUIRED in SKI requests.  Byte string that identifies the
+      Subject Public Key Info (SPKI) of a X.509 certificate [RFC5280] or
+      a raw public key [RFC7250].  Contains a SHA-256 SPKI Fingerprint
+      as defined in [RFC7469]
+
+   'method'  Included in SKI requests to indicate the key exchange
+      method.  Can take one of the values 'ECDHE' or 'RSA'.  MAY be
+      omitted if the default value 'ECDHE' is used.
+
+   'hash'  Included in SKI requests.  MUST be used if a hash algorithm
+      other than the default hash algorithm has been negotiated using
+      the "signature_algorithms" extension.  Can take one of the values
+      'SHA-224', 'SHA-256', 'SHA-384', or 'SHA-512'.
+
+   'input'  REQUIRED in SKI requests.  Byte string containing the input
+      data to the private key operation.  For static RSA it contains the
+      encrypted premaster secret (EncryptedPreMasterSecret).  For ECDHE
+      it contains the data to be signed (ClientRandom + ServerRandom +
+      ServerECDHParams).
+
+
+
+
+
+Cairns, et al.           Expires January 7, 2016                [Page 4]
+
+Internet-Draft                   TLS SKI                       July 2015
+
+
+   'output'  Included in successful SKI responses.  Byte string
+      containing the output data from the private key operation.  For
+      static RSA it contains the premaster secret (PreMasterSecret).
+      For ECDHE is contains the signature (Signature).
+
+   'error'  Included in SKI responses to indicate a fatal error.  Can
+      take one of the values 'request denied', 'spki not found',
+      'malformed request', or 'unspecified error'.  SHALL not be sent
+      together with 'output'.
+
+2.1.  Key Server Processing
+
+   The Key Server determines how to handle a SKI request based on the
+   values provided for the 'protocol', 'spki', 'hash', and 'method'
+   attributes.  If the Key Server cannot parse the SKI request it MUST
+   respond with a 'malformed request' error.  If a private key matching
+   the 'spki' value is not found, the Key Server MUST respond with a
+   'spki not found' error.  If the Edge Server is not authorized to
+   receive a response to the specific request, the Key Server MUST
+   respond with a 'request denied' error.
+
+   The Key Server MUST check that the input and output data is valid for
+   the given protocol version and key exchange method:
+
+   o  When the key exchange method is 'ECDHE', the corresponding
+      operation is to sign the given input data.  Before doing so, the
+      Key Server MUST check that the ECDH public key and associated
+      domain parameters are valid and that the input data has the
+      expected length.  If the input data is not valid or has the wrong
+      size, the Key Server MUST reply with a 'malformed request' error.
+      If any other error occurs during the signing process, the server
+      responds with an 'unspecified error' error.  If signing is
+      successful, the server responds with the output data set to the
+      result of the signing operation.
+
+   o  When the key exchange method is 'RSA', the corresponding operation
+      is to decrypt the given input data.  In this case, the Key Server
+      MUST check that the output data has the expected length and that
+      the protocol version is valid.  If the output data is not valid or
+      has the wrong size, the Key Server MUST reply with a 'malformed
+      request' error.  If any other error occurs during the decryption
+      process, the server responds with an 'unspecified error' error.
+      If decryption is successful and the output is valid, the server
+      responds with the output data set to the result of the decryption
+      operation.
+
+
+
+
+
+
+Cairns, et al.           Expires January 7, 2016                [Page 5]
+
+Internet-Draft                   TLS SKI                       July 2015
+
+
+3.  Interaction with TLS Extensions
+
+   Most TLS extensions interact seamlessly with SKI, but it is worth
+   noting the few that do not:
+
+      [RFC6091] defines the use of OpenPGP certificates with TLS.  As
+      OpenPGP certificates do not have a SPKI field, SKI will not work
+      with this extension unless the public key identification mechanism
+      is updated.
+
+      [RFC6962] certificate transparency conflict with the proposed
+      version of SKI since it requires signing of timestamps, while SKI
+      only allows signing of valid ECDHE parameters.
+
+   A few other TLS extensions may have problems if a TLS client connects
+   to different Edge Servers:
+
+      [RFC5077] defines session resumption with session tickets.  As
+      this extension uses a secret key stored on the server issuing the
+      ticket, it only works if the resumption Edge Server has the same
+      secret key.
+
+      [RFC5746] defines the renegotiation_info extension for secure
+      renegotiation.  As this extension is facilitated by binding the
+      renegotiation to the previous connection, it only works if the
+      renegotiation is done to the same Edge Server.
+
+4.  Examples
+
+   Note: Lengths of hexadecimal and base64 encoded strings in examples
+   are not intended to be realistic.  For readability, COSE objects are
+   represented using CBOR's diagnostic notation [RFC7049].
+
+4.1.  ECDHE_ECDSA Key Exchange
+
+   If an ECDHE key exchange method is used, the Edge Server MUST receive
+   the SKI Response before it can send the ServerKeyExchange message.
+   An example message flow is shown in Figure 2.
+
+
+
+
+
+
+
+
+
+
+
+
+
+Cairns, et al.           Expires January 7, 2016                [Page 6]
+
+Internet-Draft                   TLS SKI                       July 2015
+
+
++--------+                            +-------------+     +------------+
+| Client |                            | Edge Server |     | Key Server |
++--------+                            +-------------+     +------------+
+
+        ClientHello (Client Random)
+     --------------------------------------->
+        ServerHello (Server Random)
+     <---------------------------------------
+        Certificate (Server Certificate)
+     <---------------------------------------
+                                                 SKI Request
+                                            -------------------->
+                                                 SKI Response
+        ServerKeyExchange                   <--------------------
+        (ECDHParams, Signature)
+     <---------------------------------------
+        ClientKeyExchange (ClientDHPublic)
+     --------------------------------------->
+        Finished
+     <-------------------------------------->
+
+               Figure 2: Message Flow for ECDHE Key Exchange
+
+4.1.1.  SKI Request and Response with JSON/HTTP
+
+   SKI Request:
+
+     PUT /ski HTTP/1.1
+     Host: keyserver.example.com
+     Content-Type: application/json
+     Content-Length: 166
+
+     {
+       "protocol": "TLS 1.2",
+       "method": "ECDHE",
+       "hash": "SHA-256",
+       "spki": "mPgHXSvrW6ygN4uhPnl0W2uGMSbCDjFV1bfkaVT5",
+       "input": "Bn1eaonvIyCDFd9Ek8UyghL9SA1FXcDplnk8zNlLXBL4H0FAEFyvFO"
+     }
+
+
+
+
+
+
+
+
+
+
+
+
+Cairns, et al.           Expires January 7, 2016                [Page 7]
+
+Internet-Draft                   TLS SKI                       July 2015
+
+
+   SKI Response:
+
+     HTTP/1.1 200 OK
+     Content-Type: application/json
+     Content-Length: 62
+
+     {
+       "output": "eysh5GCSbIjjHzDt7Co5PUuVnDePbUYI839yv30bJWquwJ3vyADor"
+     }
+
+   SKI Request:
+
+     PUT /ski HTTP/1.1
+     Host: keyserver.example.com
+     Content-Type: application/json
+     Content-Length: 128
+
+     {
+       "protocol": "TLS 1.1",
+       "spki": "p8FU0McKWBBLEEFfQbnJPjW3Q6EcZ5t11cKKcuwj",
+       "input": "yWCMO9P0yINtHUT17ZO1X1mUgwh1CrTGan9QaAGph9AnCO4HA44nez"
+     }
+
+   SKI Response:
+
+     HTTP/1.1 200 OK
+     Content-Type: application/json
+     Content-Length: 62
+
+     {
+       "output": "m7nJUltTVMiaQJyDcKPaq0ZOtfuRVnUt1cUx5KoP3w75MqpSelutO"
+     }
+
+4.1.2.  SKI Request and Response with CBOR/CoAP
+
+   SKI Request:
+
+     Header: PUT (T=CON, Code=0.03, MID=0x1337)
+     Uri-Path: "ski"
+     Content-Format: 60 (application/cbor)
+     Payload: { "protocol": "TLS 1.0",
+                "spki": h'a1fa7ec57a6a5485756c45ab58b2c992',
+                "input": h'd2e61706059a16714e4716853e2917e34'
+              }
+
+
+
+
+
+
+
+Cairns, et al.           Expires January 7, 2016                [Page 8]
+
+Internet-Draft                   TLS SKI                       July 2015
+
+
+   SKI Response:
+
+     Header: 2.04 Changed (T=ACK, Code=2.04, MID=0x1337)
+     Content-Format: 60 (application/cbor)
+     Payload: { "output": h'2c8a0001b8295ab44d1930b8efdd9fb40' }
+
+
+4.2.  Static RSA Key Exchange
+
+   If the static RSA key exchange method is used, the Edge Server MUST
+   receive the SKI Response before it can send the Finished message.  An
+   example message flow is shown in Figure 3.
+
++--------+                            +-------------+     +------------+
+| Client |                            | Edge Server |     | Key Server |
++--------+                            +-------------+     +------------+
+
+          ClientHello (Client Random)
+     --------------------------------------->
+          ServerHello (Server Random)
+     <---------------------------------------
+          Certificate (Server Certificate)
+     <---------------------------------------
+          ClientKeyExchange
+          (Encrypted Premaster Secret)
+     --------------------------------------->
+                                                 SKI Request
+                                            -------------------->
+                                                 SKI Response
+                                            <--------------------
+                     Finished
+     <-------------------------------------->
+
+            Figure 3: Message Flow for Static RSA Key Exchange
+
+4.2.1.  SKI Request and Response with JSON/HTTP
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Cairns, et al.           Expires January 7, 2016                [Page 9]
+
+Internet-Draft                   TLS SKI                       July 2015
+
+
+   SKI Request:
+
+     PUT /ski HTTP/1.1
+     Host: keyserver.example.com
+     Content-Type: application/json
+     Content-Length: 145
+
+     {
+       "protocol": "TLS 1.2",
+       "method": "RSA",
+       "spki": "QItwmcEKcuMhCWIdESDPBbZtNgfwS7w84wizTk47",
+       "input": "dEHffkdIoi2YhQmsqcum3kDk2cToQqO2JLzJVi4q8pJSvfSUyyhRv7"
+     }
+
+   SKI Response:
+
+     HTTP/1.1 200 OK
+     Content-Type: application/json
+     Content-Length: 62
+
+     {
+       "output": "CtehRGUae6NQ0daIuClSTg3nW62zqPvYTjnvIV0mt5kM49tIq9uDG"
+     }
+
+4.2.2.  SKI Request and Response with CBOR/CoAP
+
+   SKI Request:
+
+     Header: PUT (T=CON, Code=0.03, MID=0xabba)
+     Uri-Path: "ski"
+     Content-Format: 60 (application/cbor)
+     Payload: {
+                "protocol": "TLS 1.2",
+                "method": "RSA",
+                "spki": h'8378d0547da09484b8ae509565b0a595',
+                "input": h'9da2d7a363ead429141f4dcad20befb6043'
+              }
+
+   SKI Response:
+
+     Header: 2.04 Changed (T=ACK, Code=2.04, MID=0xabba)
+     Content-Format: 60 (application/cbor)
+     Payload: { "output" : h'827628ca533a1d1191acb0e106fb' }
+
+
+
+
+
+
+
+
+Cairns, et al.           Expires January 7, 2016               [Page 10]
+
+Internet-Draft                   TLS SKI                       July 2015
+
+
+5.  IANA Considerations
+
+   This document defines the following.  TODO...
+
+6.  Security Considerations
+
+   The security considerations in [RFC5246], [RFC4492], and [RFC7525]
+   apply to this document as well.
+
+   The TLS Session Key Interface increases the security by making it
+   possible to store private keys in a highly trusted location,
+   physically separated from client facing servers.  The main feature
+   that separates TLS SKI from traditional TLS is the secure connection
+   between the Edge Server and the Key Server.  This connection is
+   relied on to ensure that the servers are mutually authenticated and
+   that the connection between them is private.  A compromised Edge
+   Server can still access client data as well as submit requests to the
+   Key Server.  However, the risks are reduces since no private keys can
+   be compromised and the Key Server can at any time prevent the Edge
+   Server from starting new TLS connections.
+
+   A compromised Edge Server could potentially launch timing side-
+   channel attacks or buffer overflow attacks.  And as the Key Server
+   has limited knowledge of the input data it signs or decrypts, a
+   compromised edge server could try to get the Key Server to process
+   maliciously crafted input data resulting in a signed message or the
+   decryption of the PreMasterSecret from another connection.  However,
+   these attacks are not introduced by SKI since they could be performed
+   on a compromised traditional TLS server and, with the exception of
+   the signing attack, can even be launched by a TLS client against an
+   uncompromised TLS server.
+
+7.  Acknowledgements
+
+   The authors would like to thank Magnus Thulstrup and Hans Spaak for
+   their valuable comments and feedback.
+
+8.  References
+
+   [HEART]    Codenomicon, "The Heartbleed Bug",
+              <http://heartbleed.com/>.
+
+   [RFC4492]  Blake-Wilson, S., Bolyard, N., Gupta, V., Hawk, C., and B.
+              Moeller, "Elliptic Curve Cryptography (ECC) Cipher Suites
+              for Transport Layer Security (TLS)", RFC 4492, May 2006.
+
+   [RFC4648]  Josefsson, S., "The Base16, Base32, and Base64 Data
+              Encodings", RFC 4648, October 2006.
+
+
+
+Cairns, et al.           Expires January 7, 2016               [Page 11]
+
+Internet-Draft                   TLS SKI                       July 2015
+
+
+   [RFC5054]  Taylor, D., Wu, T., Mavrogiannopoulos, N., and T. Perrin,
+              "Using the Secure Remote Password (SRP) Protocol for TLS
+              Authentication", RFC 5054, November 2007.
+
+   [RFC5077]  Salowey, J., Zhou, H., Eronen, P., and H. Tschofenig,
+              "Transport Layer Security (TLS) Session Resumption without
+              Server-Side State", RFC 5077, January 2008.
+
+   [RFC5246]  Dierks, T. and E. Rescorla, "The Transport Layer Security
+              (TLS) Protocol Version 1.2", RFC 5246, August 2008.
+
+   [RFC5280]  Cooper, D., Santesson, S., Farrell, S., Boeyen, S.,
+              Housley, R., and W. Polk, "Internet X.509 Public Key
+              Infrastructure Certificate and Certificate Revocation List
+              (CRL) Profile", RFC 5280, May 2008.
+
+   [RFC5746]  Rescorla, E., Ray, M., Dispensa, S., and N. Oskov,
+              "Transport Layer Security (TLS) Renegotiation Indication
+              Extension", RFC 5746, February 2010.
+
+   [RFC6091]  Mavrogiannopoulos, N. and D. Gillmor, "Using OpenPGP Keys
+              for Transport Layer Security (TLS) Authentication", RFC
+              6091, February 2011.
+
+   [RFC6347]  Rescorla, E. and N. Modadugu, "Datagram Transport Layer
+              Security Version 1.2", RFC 6347, January 2012.
+
+   [RFC6962]  Laurie, B., Langley, A., and E. Kasper, "Certificate
+              Transparency", RFC 6962, June 2013.
+
+   [RFC7049]  Bormann, C. and P. Hoffman, "Concise Binary Object
+              Representation (CBOR)", RFC 7049, October 2013.
+
+   [RFC7159]  Bray, T., "The JavaScript Object Notation (JSON) Data
+              Interchange Format", RFC 7159, March 2014.
+
+   [RFC7250]  Wouters, P., Tschofenig, H., Gilmore, J., Weiler, S., and
+              T. Kivinen, "Using Raw Public Keys in Transport Layer
+              Security (TLS) and Datagram Transport Layer Security
+              (DTLS)", RFC 7250, June 2014.
+
+   [RFC7252]  Shelby, Z., Hartke, K., and C. Bormann, "The Constrained
+              Application Protocol (CoAP)", RFC 7252, June 2014.
+
+   [RFC7469]  Evans, C., Palmer, C., and R. Sleevi, "Public Key Pinning
+              Extension for HTTP", RFC 7469, April 2015.
+
+
+
+
+
+Cairns, et al.           Expires January 7, 2016               [Page 12]
+
+Internet-Draft                   TLS SKI                       July 2015
+
+
+   [RFC7525]  Sheffer, Y., Holz, R., and P. Saint-Andre,
+              "Recommendations for Secure Use of Transport Layer
+              Security (TLS) and Datagram Transport Layer Security
+              (DTLS)", BCP 195, RFC 7525, May 2015.
+
+   [RFC7540]  Belshe, M., Peon, R., and M. Thomson, "Hypertext Transfer
+              Protocol Version 2 (HTTP/2)", RFC 7540, May 2015.
+
+Authors' Addresses
+
+   Kelsey Cairns
+   Washington State University
+   Pullman, WA 99164-2752
+   USA
+
+   Email: kcairns@wsu.edu
+
+
+   John Mattsson
+   Ericsson AB
+   SE-164 80 Stockholm
+   Sweden
+
+   Email: john.mattsson@ericsson.com
+
+
+   Robert Skog
+   Ericsson AB
+   SE-164 80 Stockholm
+   Sweden
+
+   Email: robert.skog@ericsson.com
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Cairns, et al.           Expires January 7, 2016               [Page 13]
