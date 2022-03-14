@@ -1,0 +1,704 @@
+
+Network Working Group                                         W. Aiello
+Internet Draft                                            S.M. Bellovin
+draft-ietf-ipsec-jfk-00.txt                                    M. Blaze
+Expires in 6 months                                          R. Canetti
+                                                           J. Ioannidis
+                                                         A.D. Keromytis
+                                                            O. Reingold
+
+
+
+                          Just Fast Keying (JFK)
+
+Status of this Memo
+
+   This document is an Internet-Draft and is in full conformance with
+   all provisions of Section 10 of RFC2026.
+
+   Internet-Drafts are draft documents valid for a maximum of six
+   months and may be updated, replaced, or obsoleted by other
+   documents at any time.  It is inappropriate to use Internet- Drafts
+   as reference material or to cite them other than as "work in
+   progress."
+
+   The list of current Internet-Drafts can be accessed at
+   http://www.ietf.org/ietf/1id-abstracts.txt
+
+   The list of Internet-Draft Shadow Directories can be accessed at
+   http://www.ietf.org/shadow.html.
+
+
+Abstract
+
+   This draft discusses JFK, a key management protocol.
+
+
+1.  Introduction
+
+   Many public-key-based key setup and key agreement protocols already
+   exist and have been implemented for a variety of applications and
+   environments.  Several have been proposed for the IPsec protocol,
+   and one, IKE [rfc2409], is the current standard.  IKE has a number
+   of deficiencies, the three most important being that the number of
+   rounds is high, that it is vulnerable to denial-of-service attacks,
+   and the complexity of its specification.  (This complexity has led
+   to interoperability problems, so much so that, several years after
+   its initial adoption by the IETF, there are still completely
+   non-interoperating implementations.)
+
+   While it may be possible to ``patch'' the protocol to fix some of
+   these problems, we would prefer to replace IKE with something
+   better.  With that in mind, we set out to engineer a new key
+   exchange protocol specifically for Internet security applications.
+   With a view toward its possible role as a successor to IKE, we call
+   our new protocol ``JFK,'' which stands for ``Just Fast Keying.''
+
+
+1.1  Design Goals
+
+   We seek a protocol with the following characteristics (in no
+   particular order):
+
+   o Security: The resulting key should be cryptographically secure,
+     according to standard measures of cryptographic security for
+     key-exchange.
+
+   o Simplicity: It must be as simple as possible.
+
+   o Memory-DoS: It must resist memory exhaustion attacks on the
+     responder.
+
+   o Computation-DoS: It must resist CPU exhaustion attacks on the
+     responder.
+
+   o Privacy: It must preserve the privacy of the initiator.
+
+   o Efficiency: It must be efficient with respect to computation,
+     bandwidth, and number of rounds.
+
+   o Non-Negotiated: It must avoid complex negotiations over
+     capabilities.
+
+   o PFS: It must approach perfect forward secrecy.
+
+   The Security property is obvious enough; the rest, however, require
+   some discussion.
+
+   The Simplicity property is motivated by several factors.
+   Efficiency is one; increased likelihood of correctness is another.
+   But our motivation is especially colored by our experience with
+   IKE.  Even if the protocol is defined correctly, it must be
+   implemented correctly; if a protocol definition is too complex,
+   implementors will get it wrong.  This hinders both security and
+   interoperability.
+
+   The Memory-DoS and Computation-DoS properties have become more
+   important in the context of recent Internet denial-of-service
+   attacks.  Photuris [RFC2522] was the first published key management
+   protocol for which DoS-resistance was a design consideration; we
+   suggest that these properties are at least as important today.
+   Photuris first introduced the concept of cookies to counter
+   ``blind'' denial of service attacks.  Although the concept of the
+   cookie was adopted by IKE, its use in that protocol did not follow
+   the guidelines established by Photuris and left it open to DoS
+   attacks.
+
+   The Privacy property means that the protocol must not reveal the
+   initiator's identity to any unauthorized party, including an active
+   attacker that attempts to act as the responder. Protecting the
+   responder's privacy does not appear to be of much value, except
+   perhaps in peer-to-peer communication: in many cases, the responder
+   is a server with a fixed address or characteristics (e.g.,
+   well-known web server). A third approach is to allow for a protocol
+   that allows the two parties to negotiate who needs identity
+   protection. In JFK, we decided against this approach: it is unclear
+   what, if any, metric can be used to determine which party should
+   receive identity protection; furthermore, this negotiation could
+   act as a loophole to make initiators reveal their identity first.
+
+   The Efficiency property is worth discussing.  In many protocols,
+   key setup is must be performed frequently enough that it can become
+   a bottleneck to communication.  The key exchange protocol must
+   minimize both computation as well total bandwidth and round trips.
+   Round trips can be an especially important factor over unreliable
+   media.
+
+   The Non-Negotiated property is necessary for several reasons.  The
+   first, of course, is as a corollary to Simplicty and Efficiency.
+   Negotiations create complexity and round trips, and hence should be
+   avoided.  Denial of service resistance is also relevant here; a
+   partially-negotiated security association is consuming resources.
+
+   The PFS property is perhaps the most controversial.  Rather than
+   assert that ``we must have perfect forward secrecy at all costs'',
+   we treat the amount of forward secrecy as an engineering parameter
+   that can be traded off against other necessary functions, such as
+   resistance to denial-of-service attacks.  In fact, this corresponds
+   quite nicely to the reality of today's Internet systems, where a
+   compromise during the existence of a security association will
+   reveal the plaintext of any ongoing transmissions.  JFK has the
+   concept of a ``forward secrecy interval''; associations are
+   protected against compromises that occur outside of that interval.
+
+   Protocol design is, to some extent, an engineering activity, and we
+   need to provide for trade-offs between different types of security.
+   There are trade-offs that we made during the protocol design, and
+   others, such as the trade-off between forward secrecy and
+   computational effort, that are left to the implementation and to
+   the user, e.g., selected as parameters during configuration and
+   session negotiation.
+
+
+2.  The JFK Protocol
+
+2.1  Notation
+
+   E{K}(M): encryption of M with symmetric key K.
+
+   HMAC{K}(M): keyed hash of M using key K in an HMAC scheme [RFC2104].
+
+   SIG{x}(M): digital signature of M using the private key belonging
+              to principal x (Initiator or Responder).  It is assumed
+              to be a non-message-recovering signature (but it can be).
+
+   The message components used in JFK are as follows:
+
+   g^x: Diffie-Hellman exponentials, also identifying the group-ID.
+        The Diffie-Hellman groups identified in [RFC2409] are used.
+
+   g^i, g^r: Initiator and Responder exponentials.
+
+   Ni: Initiator nonce, a random bit-string.  The Initiator MUST pick
+       a fresh nonce at each invocation of the JFK protocol.
+
+   Nr: Responder nonce, a random bit-string.  The Responder MUST pick
+       a fresh nonce at each invocation of the JFK protocol.  The
+       nonces are used in the session key computation, to provide key
+       independence when one or both parties reuse the same
+       Diffie-Hellman exponential; the session key will be different
+       different between independent runs of the protocol, as long as
+       one of the nonces or exponentials changes.
+
+   sa: Defines the cryptographic and other properties of the Security
+       Association (SA) the Initiator wants to establish.  It contains
+       a Domain-of-Interpretation, which JFK understands, and an
+       application-specific bitstring.
+
+   sa': Any information that the Responder needs to provide to the
+        Initiator with respect to the application SA (e.g., the
+        Responder's SPI, in IPsec).
+
+   HKr: A transient hash key private to the Responder; this is a
+        global parameter for the Responder (i.e., it is not different
+        for every different protocol run), which changes periodically:
+        the Responder must pick a new g^r everytime HKr changes.  The
+        use of HKr and the implications of changing it periodically
+        will be explained later in this section.
+
+   Kir: A shared key derived from g^ir, Ni, and Nr, used as part of
+        the application SA (e.g., IPsec SA).
+
+   Ke: A shared key derived from g^ir, Ni, and Nr, used to protect
+       messages 3 and 4 of the protocol.  Although the input
+       parameters are the same with Kir, a different key derivation
+       mechanism is used to ensure key independence.
+
+   IDi, IDr: Initiator and Responder certificates or public-key
+             identifying information.
+
+   GRPINFOr: A list of all Diffie-Hellman groups supported by the
+             Responder,  the symmetric algorithm used to protect
+             messages 3 and 4, and the hash function used for key
+             generation.
+
+
+2.2  Protocol
+
+   In the following, "I->R" means a message from the Initiator to the
+   Responder and "R->I" means the opposite direction.
+
+   Message 1, I->R:  Ni, g^i
+
+   Message 2, R->I:  Ni, Nr, g^r, GRPINFOr, IDr,
+                     SIG{r}(g^r), HMAC{HKr}(Ni, Nr, g^i, g^r)
+
+   Message 3, I->R:  Ni, Nr, g^i, g^r, HMAC{HKr}(Ni, Nr, g^i, g^r),
+                     E{Ke}(IDi, sa, SIG{i}(Ni, Nr, g^i, g^r, IDr, sa))
+
+   Message 4, R->I:  E{Ke}(SIG{r}(Ni, Nr, g^i, g^r , IDi, sa, sa'), sa')
+
+   The key used to protect Messages (3) and (4), Ke, is computed as
+   HMAC{g^ir}{Ni, Nr, 1}. The session key used by IPsec (or any other
+   application), Kir, is HMAC{g^ir}(Ni, Nr, 0).
+
+   Message (1) is straightforward; note that it assumes that the
+   Initiator already knows a group and generator that is acceptable to
+   the Responder.  The Initiator can reuse a g^i value in multiple
+   instances of the protocol with the Responder or other responders
+   that accept the same group, for as long as she wishes her forward
+   secrecy interval to be.  We discuss how the Initiator can discover
+   what groups to use later.
+
+   Message (2) is more complex.  Assuming that the Responder accepts
+   the Diffie-Hellman group in the Initiator's message (rejections are
+   discussed later in this document), he replies with a signed copy of
+   his own exponential (in the same group), information on what secret
+   key algorithms are acceptable for the next message, a random nonce,
+   his identity (certificates or a bitstring identifying his public
+   key), and an authenticator calculated from a secret, HKr, known to
+   the Responder; the authenticator is computed over the two
+   exponentials and nonces.  The authenticator key is changed at least
+   as often as g^r, thus preventing replays of stale data.  The
+   Responder's exponential may also be reused; again, it is
+   regenerated according to the Responder's forward secrecy interval.
+   The signature on the exponential needs to be calculated at the same
+   rate as the Responder's forward secrecy interval (when the
+   exponential itself changes).  Finally, note that the Responder does
+   not need to generate any state at this point, and the only
+   ``expensive'' operation is a MAC calculation.
+
+   Message (3) echoes back the data sent by the Responder, including
+   the authenticator.  The authenticator is used by the Responder to
+   verify the authenticity of the returned data.  The message also
+   includes the Initiator's identity and service request, and a
+   signature computed over the nonces, the Responder's identity, and
+   the two exponentials.  This latter information is all encrypted
+   under a key derived from the Diffie-Hellman computation and the
+   nonces Ni and Nr.  The encryption and authentication use algorithms
+   specified in GRPINFOr.  The Responder keeps a copy of
+   recently-received Message (3)'s, and their corresponding Message
+   (4).  Receiving a duplicate (or replayed) Message (3) causes the
+   Responder to simply retransmit the corresponding Message (4),
+   without creating new state or invoking IPsec.  This cache of
+   messages can be reset as soon as g^r or HKr are changed.  The
+   Responder's exponential (g^r) is re-sent by the Initiator because
+   the Responder may be generating a new g^r for every new JFK
+   protocol run (e.g., if the arrival rate of requests is below some
+   threshold).  Note: It is important that the responder deals with
+   repeated Message (3)'s as described above.  Responders that create
+   new state for a repeated Message (3) open the door to attacks
+   against the protocol.
+
+   Note that the signature is protected by the encryption.  This is
+   necessary, since everything signed is public except the sa, and
+   that is often guessable.  An attacker could verify guesses at
+   identities, were it not encrypted.
+
+   Message (4) contains application-specific information (such as the
+   Responder's IPsec SPI), and a signature on both nonces, both
+   exponentials, and the Initiators identity. Everything is encrypted
+   by Ke, which is derived from Ni, Nr, and g^ir (the result of the
+   Diffie-Hellman computation).
+
+2.3  Discussion
+
+   The design follows from our requirements.  With respect to
+   communication efficiency, observe that the protocol requires only
+   two round trips.  The protocol is optimized to protect the
+   Responder against denial of service attacks on state or
+   computation.  The Initiator bears the initial computational burden
+   and must establish round-trip communication with the Responder
+   before the latter is required to perform expensive operations.  At
+   the same time, the protocol is designed to limit the private
+   information revealed by the Initiator; she does not reveal her
+   identity until she is sure that only the Responder can retrieve
+   it. (An active attacker can replay an old Message (2) as a response
+   to the Initiator's initial message, but he cannot retrieve the
+   Initiator's identity from Message (3) because he cannot complete
+   the Diffie-Hellman computation).
+
+   The Initiator's initial message, Message (1), is a straight-forward
+   Diffie-Hellman exponential.  Note that this is assumed to be
+   encoded in a self-identifying manner, i.e., it contains a tag
+   indicating which modulus and base was used. The nonce Ni serves two
+   purposes: first, to allow the Initiator to reuse the same
+   exponential across different sessions (with the same or different
+   Responders, within the Initiator's forward secrecy interval) while
+   ensuring that the resulting session key will be
+   different. Secondly, it can be used to differentiate between
+   different parallel sessions.
+
+   Message (2) must require only minimal work for the Responder, since
+   at that point he has no idea whether the Initiator is a legitimate
+   correspondent or, e.g., a forged message from an denial of service
+   attack; no round trip has yet occurred with the Initiator.
+   Therefore, it is important that the Responder not be required at
+   this point to perform expensive calculations or create state.
+   Here, the Responder's cost will be a single authentication
+   operation, the cost of which (for HMAC) is dominated by two
+   invocations of a cryptographic hash function, plus generation of a
+   random nonce Nr.
+
+   The Responder may compute a new exponential g^r for each
+   interaction.  This is an expensive option, however, and at times of
+   high load (or attack) it would be inadvisable.  The nonce prevents
+   two successive session keys from being the same, even if both the
+   Initiator and the Responder are reusing exponentials.
+
+   If the Responder is willing to accept the group identified in the
+   Initiator's message, his exponential must be in the same group.
+   Otherwise, he may respond with an exponential from any group of his
+   own choosing. The field GRPINFOr lists what groups the Responder
+   finds acceptable, if the Initiator should wish to restart the
+   protocol.  This provides a simple mechanism for the Initiator to
+   discover the groups currently allowed by the Responder.  That field
+   also lists what encryption algorithm is acceptable for the next
+   message.  This is not negotiated; the Responder has the right to
+   decide what strength encryption is necessary to use his services.
+
+   Note that the Responder creates no state when sending this message.
+   If it is bogus --- that is, if the Initiator is non-existent or
+   intent on perpetrating a denial-of-service attack --- the Responder
+   will not have committed any storage resources.
+
+   In Message (3), the Initiator echoes content from the Responder's
+   message, including the authenticator.  The authenticator allows the
+   Responder to verify that he is in round-trip communication with a
+   legitimate potential correspondent.  She also uses the key derived
+   from the two exponentials and the two nonces to encrypt her
+   identity and service request.  (The Initiator's nonce is used to
+   ensure that this session key is unique, even if both the Initiator
+   and the Responder are reusing their exponentials and the Responder
+   has ``forgotten'' to change nonces.) The key used to protect
+   Messages (3) and (4), Ke, is computed as HMAC{g^ir}{Ni, Nr, 1}. The
+   session key used by IPsec (or any other application), Kir, is
+   HMAC{g^ir}(Ni, Nr, 0).
+
+   Because the Initiator can validate the Responder's identity before
+   sending her own and because her identifying information (ignoring
+   her public key signature) is sent encrypted, her privacy is
+   protected from both passive and active attackers.  (An active
+   attacker can replay an old Message (2) as a response to the
+   Initiator's initial message, but he cannot retrieve the Initiator's
+   identity from Message (3) because he cannot complete the
+   Diffie-Hellman computation).  The service request is encrypted,
+   too, since disclosure of it might identify the requester. The
+   Responder may wish to require a certain strength of cryptographic
+   algorithm for certain services.
+
+   Upon successful receipt and verification of this message, the
+   Responder has a shared key with a party known to be the Initiator.
+   The Responder further knows what service the Initiator is
+   requesting.  At this point, he may accept or reject the request.
+
+   The Responder's processing on receipt of Message (3) requires
+   verifying an authenticator and --- if that is successful ---
+   performing several public key operations to verify the Initiator's
+   signature and certificate chain.  The authenticator (again
+   requiring two hash operations) is sufficient defense against
+   forgery; replays, however, could cause considerable computation.
+   The defense against this is to cache the corresponding Message (4);
+   if a duplicate Message (3) is seen, the cached response is
+   retransmitted; the Responder does not create any new state or
+   notify the application (e.g., IPsec).
+
+   Caching Message (3) and refraining from creating new state for
+   replayed instances of Message (3) serves also another security
+   purpose.  If the Responder were to create a new state and send a
+   new Message (4), and a new sa' for a replayed Message (3), then an
+   attacker that compromised the Initiator could replay a recent
+   session with the Responder.  That is, by replaying Message (3) from
+   a recent exchange between the Initiator and the Responder, the
+   attacker could establish a session with the Responder where the
+   session-key is identical to the key of the previous session (which
+   took place when the Initiator was not yet compromised).  This could
+   compromise the Forward Security of the Initiator.
+
+   There is a risk, however, to keeping this message cached for too
+   long: if the Responder's machine is compromised during this period,
+   perfect forward secrecy is compromised.  We can tune this by
+   changing the MAC key HKr more frequently.  The cache can be reset
+   when a new g^r or HKr is chosen.
+
+   In Message (4), the Responder sends to the Initiator any
+   Responder-specific application data (e.g., the Responder's IPsec
+   SPI), along with a signature on both nonces, both exponentials, and
+   the Initiator's identity. All the information is encrypted using a
+   key derived the two nonces, Ni and Nr, and the Diffie-Hellman
+   result. The Initiator can verify that the Responder is present and
+   participating in the session, by decrypting the message and
+   verifying the enclosed signature.
+
+
+2.4  Rejection Messages
+
+   Instead of sending Messages (2) or (4), the Responder can send a
+   rejection instead.  For Message (2), this rejection can only be on
+   the grounds that he does not accept the group that the Initiator
+   has used for her exponential.  Accordingly, the reply should
+   indicate what groups are acceptable.  (For efficiency's sake, this
+   information could also be in the Responder's long-lived
+   certificate, which the Initiator may already have.)
+
+   Message (4) can be a rejection for several reasons, including lack
+   of authorization for the service requested.  But it could also be
+   caused by the Initiator requesting cryptographic algorithms that
+   the Responder regards as inappropriate, given the requester
+   (Initiator), the service requested, and possibly other information
+   available to the Responder, such as the time of day or the
+   Initiator's location as indicated by the network.  In these cases,
+   the Responder's reply should list acceptable cryptographic
+   algorithms, if any.  The Initiator would then send a new Message
+   (3), which the Responder would accept \emph{de novo}; again, the
+   Responder does not create any state until after a successful
+   Message (3) receipt.
+
+
+2.5  What JFK Avoids
+
+   By intent, JFK does not do certain things.  It is worth enumerating
+   them, if only to forestall later attempts to add them in.  The
+   ``missing'' items were omitted by design, in the interests of
+   simplicity.
+
+   The most obvious ``omission'' is any form of authentication other
+   than certificate chain trusted by the each party.  We make no
+   provisions for shared secrets, token-based authentication,
+   certificate discovery, or explicit cross-certification of PKIs.  In
+   our view, these are best accomplished by outboard protocols.
+   Initiators that wish to rely on any form of legacy authentication
+   can use the protocols being defined by the IPSRA or SACRED working
+   groups.  While these mechanisms do add extra round trips, the
+   expense can be amortized across many JFK negotiations.  Similarly,
+   certificate chain discovery (beyond the minimal capabilities
+   implicit in $\mbox{ID}_I$ and $\mbox{ID}_R$) should be accomplished
+   by protocols defined for that purpose.  By excluding these
+   protocols for JFK, we can exclude them from our security analysis;
+   the only interface between the two is a certificate chain, which by
+   definition is a stand-alone secure object.
+
+   We also eliminate negotiation, in favor of ukases issued by the
+   Responder.  The Responder is providing a service; it is entitled to
+   set its own requirements for that service.  Any cryptographic
+   primitive mentioned by the Responder is acceptable; the Initiator
+   can choose any it wishes.  We thus eliminate complex rules for
+   selecting the ``best'' choice from two different sets.  We also
+   eliminate state to be kept by the Responder; the Initiator can
+   either accept the Responder's desires or restart the protocol.
+
+   Finally, we reject the notion of two different phases.  Tthe
+   practical benefits of quick mode are limited.  Furthermore, we do
+   not agree that frequent rekeying is necessary.  If the underlying
+   block cipher is sufficiently limited as to bar long-term use of any
+   one key, the proper solution is to replace that cipher.  For
+   example, 3DES is inadequate for protection of very high speed
+   transmissions, because the probability of collision in CBC mode
+   becomes too high after less than encryption of $2^{32}$ plaintext
+   blocks.  Using AES instead of 3DES solves that problem without
+   complication the key exchange.
+
+
+3.  Rekeying
+
+   When a negotiated SA expires (or shortly before it does), the JFK
+   protocol is run again.  It is up to the application to select the
+   appropriate SA to use among many valid ones.  In the case of IPsec,
+   implementations should switch to using the new SA for outgoing
+   traffic, but would still accept traffic on the old SA (as long as
+   that SA has not expired).
+
+   That said, if for some reason fast rekeying is needed for some
+   application domain, that should be done by a separate protocol.
+
+
+4.  Wire Format
+
+   This section describes a proposal for the specific protocol
+   elements for the protocol described in this document.  The authors
+   of the document are not strongly attached to these proposed
+   elements.  More detail on the protocol elements will be added in
+   later drafts.
+
+   The protocol will be run over UDP on a port to be assigned later by
+   IANA.  UDP is chosen to avoid well-known TCP attacks, although
+   running JFK over UDP may cause some problems with packet
+   fragmentation and reordering.  For pre-standards testing purposes,
+   UDP port 1024 which is reserved by IANA and will *not* be the
+   eventual port for JFK.
+
+   Implementors of IKE have long complained that the specification
+   required or strongly suggested too many algorithms that had
+   essentially the same properties.  Because of this, JFK only lists
+   one option for each type of algorithm below.  In the future,
+   additional options might be added (which is why there are algorithm
+   identifiers in the protocol), but they should only be added if
+   there is a strong security requirement for them.  Two such
+   requirements would be the compromise of one of the listed
+   algorithms or the adoption of a much stronger or much more capable
+   algorithm.  Additional algorithms can only be added by a
+   standards-track RFC.
+
+4.1  Structure
+
+   Each message is a string of tag-length-value elements concatenated
+   together.  Tags are one octet.  Lengths are two octets, and specify
+   the number of octets of the value.  Values are always integral
+   numbers of octets.  All octets are in big-endian order.
+
+   The values for the tags are:
+
+   Tag                 Value (in decimal)
+   Ni                  1
+   Nr                  2
+   g^i                 3
+   g^r                 4
+   GRPINFOr            5
+   IDi                 6
+   IDr                 7
+   Signature           8
+   HashedInfo          9
+   encrypt_i           10
+   encrypt_r           11
+   sa                  12
+   rejectinfo_to_msg1  13
+   rejectinfo_to_msg3  14
+
+
+4.2  Description of the values for each tag
+
+   Nonces Ni and Nr MUST be 8 octets or longer.
+
+   g^i and g^r are expressed as a single octet specifying the group
+   number, followed by value of Diffie-Hellman exponential.  The group
+   number is the same as the group numbers used in [RFC2409].
+
+   grpInfo is expressed as a string of at least four octets. The first
+   octet is the encryption algorithm ID, the second octet is the
+   signature algorithm ID, and the third octet is the hash function
+   used for session key derivation.  Each remaining octet specifies an
+   acceptable group number.
+
+   IDi and IDr is expressed as a single octet specifying the type of
+   ID used, followed by the ID material. The following ID types are
+   specified.
+
+   ID tag  Meaning
+   1       A bundle of one or more PKIX certificates, CRLs, and OCSP
+           responses, concatenated.
+
+   Signatures are expressed as one octet specifying the signature
+   algorithm followed by the octets of the signature.
+
+   HashedInfo is expressed as one octet specifying the keyed hash
+   algorithm followed y the octets of the hash.
+
+   encrypt_i and encrypt_r are expressed as one octet specifying the
+   encryption algorithm followed by the encrypted content.
+
+   sa is expressed by one octet specifying the SA type followed by the
+   SA itself. The following SA types are specified.
+
+   SA tag  Meaning
+   1       IPsec SA, as described in [RFC2409]
+
+   rejectinfo_to_msg1 and rejectinfo_to_msg3 have the same structure
+   as grpInfo.
+
+   Encryption algorithm IDs
+   3DES     1
+
+   Signature algorithm IDs
+   RSA      1
+
+   Hash algorithm IDs
+   SHA-1    1
+
+
+5.  Security Considerations
+
+   This document discusses a key establishment protocol.  The authors
+   are in the process of formally analyzing the protocol, and have
+   good initial results which will be added in following versions of
+   this draft.
+
+
+6.  IANA Considerations
+
+   IANA is asked to assign a UDP port for JFK at the time that this
+   draft becomes an RFC.  Also, the algorithm identifiers will need to
+   be kept in an IANA registry.  These two requests will be described
+   in more detail in a future version of this draft.
+
+
+7.  Acknowledgements
+
+   We would like to thank Paul Hoffman for suppying us with the draft
+   text in Section 4 (Wire Format), and his constant prodding us in
+   getting this document done.
+
+   XXX More.
+
+
+References:
+
+   [RFC2401]  Kent, S. and R. Atkinson, "Security Architecture for the
+              Internet Protocol", RFC 2401,  November 1998.
+
+   [RFC2409]  Harkins, D. and D. Carrel, "The Internet Key Exchange
+              (IKE)", RFC 2409, November 1998.
+
+
+Authors' addresses:
+
+   The authors as a group can be reached by email at jfk@crypto.com
+
+   William Aiello
+   AT&T Labs - Research
+   180 Park Avenue
+   Florham Park, New Jersey 07932-0971
+
+   Email: aiello@research.att.com
+
+   Steven M. Bellovin
+   AT&T Labs - Research
+   180 Park Avenue
+   Florham Park, New Jersey 07932-0971
+
+   Email: smb@research.att.com
+
+   Matt Blaze
+   AT&T Labs - Research
+   180 Park Avenue
+   Florham Park, New Jersey 07932-0971
+
+   Email: mab@research.att.com
+
+   Ran Canetti
+   IBM T.J. Watson Research Center
+   30 Saw Mill Rover Road
+   Hawthorne, New York 10532
+   Email: canetti@watson.ibm.com
+
+   John Ioannidis
+   AT&T Labs - Research
+   180 Park Avenue
+   Florham Park, New Jersey 07932-0971
+
+   Email: ji@research.att.com
+
+   Angelos D. Keromytis
+   Columbia University, CS Department
+   515 CS Building
+   1214 Amsterdam Avenue, Mailstop 0401
+   New York, New York 10027-7003
+
+   Phone: +1 212 939 7095
+   Email: angelos@cs.columbia.edu
+
+   Omer Reingold
+   AT&T Labs - Research
+   180 Park Avenue
+   Florham Park, New Jersey 07932-0971
+
+   Email: omer@research.att.com
+
+Expiration and File Name
+
+   This draft expires in May 2002
+
+   Its file name is draft-ietf-ipsec-jfk-00.txt
+
+
+
+

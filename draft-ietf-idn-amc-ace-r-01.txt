@@ -1,0 +1,1175 @@
+INTERNET-DRAFT                                          Adam M. Costello
+draft-ietf-idn-amc-ace-r-01.txt                              2001-May-31
+Expires 2001-Nov-30
+
+                         AMC-ACE-R version 0.2.1
+
+Status of this Memo
+
+    This document is an Internet-Draft and is in full conformance with
+    all provisions of Section 10 of RFC2026.
+
+    Internet-Drafts are working documents of the Internet Engineering
+    Task Force (IETF), its areas, and its working groups.  Note
+    that other groups may also distribute working documents as
+    Internet-Drafts.
+
+    Internet-Drafts are draft documents valid for a maximum of six
+    months and may be updated, replaced, or obsoleted by other documents
+    at any time.  It is inappropriate to use Internet-Drafts as
+    reference material or to cite them other than as "work in progress."
+
+    The list of current Internet-Drafts can be accessed at
+    http://www.ietf.org/ietf/1id-abstracts.txt
+
+    The list of Internet-Draft Shadow Directories can be accessed at
+    http://www.ietf.org/shadow.html
+
+    Distribution of this document is unlimited.  Please send comments
+    to the author at amc@cs.berkeley.edu, or to the idn working
+    group at idn@ops.ietf.org.  A non-paginated (and possibly
+    newer) version of this specification may be available at
+    http://www.cs.berkeley.edu/~amc/charset/amc-ace-r
+
+Abstract
+
+    AMC-ACE-R is a reversible transformation from a sequence of Unicode
+    [UNICODE] code points to a sequence of letters, digits, and hyphens
+    (LDH characters).  AMC-ACE-R could be used as an ASCII-Compatible
+    Encoding (ACE) for internationalized domain names [IDN] [IDNA].
+
+    Besides domain names, there might also be other contexts where it is
+    useful to transform Unicode characters into "safe" (delimiter-free)
+    ASCII characters.  (If other contexts consider hyphens to be
+    unsafe, a different character could be used to play its role, like
+    underscore.)
+
+Contents
+
+    Technical changes from earlier versions
+    Features
+    Name
+    Terminology
+    Description
+    Base-32 characters
+    Encoding and decoding algorithms
+    Signature
+    Mixed-case annotation
+    Comparison with other ACEs
+    Example strings
+    Security considerations
+    Acknowledgements
+    References
+    Author
+    Example implementation
+
+Technical changes from earlier versions
+
+    From 0.0.x to 0.1.x:
+
+        In update(), the test "latest - first == 1" was a bug, changed
+        to "latest == first".
+
+        In encode(), "codepoint" was a misspelling of "input[i]".
+
+        Initializing refpoint[1] to 0x60 was a design flaw, because this
+        initial value is useless for nameprep'd strings.  The initial
+        value is changed to 0xE0.
+
+        encode() now fails if input[i] is not in 0..10FFFF, in order to
+        avoid an array bounds error.  This does not affect the encoding
+        of valid Unicode strings.
+
+    From 0.1.x to 0.2.x:
+
+        The test "latest == first" tests for the first code point, but
+        the intention was to test for the first non-LDH code point,
+        or equivalently, for the first time update() is called.  The
+        boolean flag "updated" has been introduced for performing the
+        proper test.  This alters the encoding of some strings, usually
+        for the better.
+
+        The initial value of refpoint[2] has been changed from 0 to
+        0xA0, which is more useful in light of nameprep's prohibition of
+        non-LDH code points below 0xA0.
+
+        In decode() the number of base-32 characters consumed has been
+        limited to 5, to avoid an array bounds error on invalid input.
+
+Features
+
+    Completeness:  Every Unicode string maps to an LDH string.
+    Restrictions on which Unicode strings are allowed, and on length,
+    may be imposed by higher layers.
+
+    Uniqueness:  Every Unicode string maps to at most one LDH string.
+
+    Reversibility:  Any Unicode string mapped to an LDH string can be
+    recovered from that LDH string.
+
+    Efficient encoding:  The ratio of encoded size to original size is
+    small for all Unicode strings.  This is important in the context
+    of domain names because [RFC1034] restricts the length of a domain
+    label to 63 characters.
+
+    Simplicity:  The encoding and decoding algorithms are reasonably
+    simple to implement.  The goals of efficiency and simplicity are at
+    odds; AMC-ACE-R aims at a reasonable balance between them.
+
+    Mixed-case annotation:  Even if the Unicode string has been
+    case-folded prior to encoding, it is possible to used mixed case
+    in the encoded string as an annotation telling how to convert the
+    folded Unicode string into a mixed-case Unicode string for display
+    purposes.  This feature is optional; see section "Mixed-case
+    annotation".
+
+    Readability:  The letters A-Z and a-z and the digits 0-9 appearing
+    in the Unicode string are represented as themselves in the label.
+    This comes for free because it usually the most efficient encoding
+    anyway.
+
+Name
+
+    AMC-ACE-R is a working name that should be changed if it is adopted.
+    (The R merely indicates that it is the eighteenth ACE devised by
+    this author.  BRACE was the third.  Most were not worth releasing.)
+    Rather than waste good names on experimental proposals, let's
+    wait until one proposal is chosen, then assign it a good name.
+    Suggestions:
+
+        UniHost
+        NUDE (Normal Unicode Domain Encoding)
+        UTF-D ("D" for "domain names")
+        UTF-37 (there are 37 characters in the output repertoire)
+
+Terminology
+
+    LDH characters are the letters A-Z and a-z, the digits 0-9, and
+    hyphen-minus.
+
+    A quartet is a sequence of four bits (also known as a nibble or
+    nybble).
+
+    A quintet is a sequence of five bits.
+
+    Hexadecimal values are shown preceeded by "0x".  For example, 0x60
+    is decimal 96.
+
+    As in the Unicode Standard [UNICODE], Unicode code points are
+    denoted by "U+" followed by four to six hexadecimal digits, while a
+    range of code points is denoted by two hexadecimal numbers separated
+    by "..", with no prefixes.
+
+    "x..y" means the range of integers x through y inclusive.
+
+    "x << y" means x left-shifted by y bits (equivalent to x times
+    2 to the power y), and "x >> y" means x right-shifted by y bits
+    (equivalent to x divided by 2 to the power y, discarding the
+    remainder).  These operations are used only with nonnegative
+    integral values.
+
+Description
+
+    AMC-ACE-R represents a sequence of Unicode code points as a sequence
+    of LDH characters, although implementations will also need to
+    represent the LDH characters somehow, typically as ASCII octets.
+    The encoder input and decoder output are arrays of Unicode code
+    points (integral values in the range 0..10FFFF, but not D800..DFFF,
+    which are reserved for use by UTF-16).
+
+    This section describes the representation.  Section "Encoding
+    and decoding algorithms" presents the algorithms as commented
+    pseudocode.  There is also commented C code in section "Example
+    implementation".
+
+    The encoded string alternates between two modes: literal mode and
+    base-32 mode.  Unicode code points representing LDH characters
+    are encoded as those LDH characters, except that hyphen-minus is
+    doubled.  Other Unicode code points are encoded as one or more LDH
+    characters using base-32, in which each character of the encoded
+    string represents a quintet according to the table in section
+    "Base-32 characters".  A mode change is indicated by an unpaired
+    hyphen-minus.  A pair of consecutive hyphen-minuses represents a
+    hyphen-minus and does not change the mode.
+
+    In base-32 mode a variable-length code sequence of one to five
+    quintets represents a delta, which is added to a reference point to
+    yield a Unicode code point.  There are five reference points, one
+    for each code length.  The delta is represented by the lowest four
+    bits of each quintet.  The highest bit of each quintet is 1, except
+    for the last quintet, where it is 0, allowing the decoder to detect
+    the end of the sequence.
+
+    Code sequences:
+        delta from reference point 1: 0xxxx
+        delta from reference point 2: 1xxxx 0xxxx
+        delta from reference point 3: 1xxxx 1xxxx 0xxxx
+        delta from reference point 4: 1xxxx 1xxxx 1xxxx 0xxxx
+        delta from reference point 5: 1xxxx 1xxxx 1xxxx 1xxxx 0xxxx
+
+    For reference point k, the delta is constrained by the available
+    bits to range from 0 to (1 << (4*k)) - 1, so each reference point is
+    the bottom of a window of 1 << (4*k) code points.  A code point is
+    encoded as an offset into the smallest window that contains it.
+
+    Reference points 4 and 5 are fixed at 0 and 0x10000 respectively,
+    so that windows 4 and 5 always cover the entire Unicode code space
+    0..10FFFF.  The other reference points are updated whenever a code
+    point has been encoded or decoded in base-32 mode, using following
+    heuristic.
+
+    The latest code point is rounded down to a multiple of 0x10 to
+    obtain a candidate for replacing reference point 1.  If a non-LDH
+    code point falling within the candidate window has appeared more
+    recently than one falling within the current window, then the
+    reference point is changed.  Otherwise a similar check is performed
+    for reference point 2 using 0x100 as the divisor, and failing that,
+    reference point 3 is checked using 0x1000.  At most one window is
+    changed each time, except that after the very first non-LDH code
+    point (when there is no useful history), all three windows are
+    changed.
+
+    The initial values of the state variables are:
+
+                     mode:  base-32
+        reference point 1:  0xE0
+        reference point 2:  0xA0
+        reference point 3:  0
+        reference point 4:  0
+        reference point 5:  0x10000
+
+Base-32 characters
+
+        "a" =  0 = 0x00 = 00000         "s" = 16 = 0x10 = 10000
+        "b" =  1 = 0x01 = 00001         "t" = 17 = 0x11 = 10001
+        "c" =  2 = 0x02 = 00010         "u" = 18 = 0x12 = 10010
+        "d" =  3 = 0x03 = 00011         "v" = 19 = 0x13 = 10011
+        "e" =  4 = 0x04 = 00100         "w" = 20 = 0x14 = 10100
+        "f" =  5 = 0x05 = 00101         "x" = 21 = 0x15 = 10101
+        "g" =  6 = 0x06 = 00110         "y" = 22 = 0x16 = 10110
+        "h" =  7 = 0x07 = 00111         "z" = 23 = 0x17 = 10111
+        "i" =  8 = 0x08 = 01000         "2" = 24 = 0x18 = 11000
+        "j" =  9 = 0x09 = 01001         "3" = 25 = 0x19 = 11001
+        "k" = 10 = 0x0A = 01010         "4" = 26 = 0x1A = 11010
+        "m" = 11 = 0x0B = 01011         "5" = 27 = 0x1B = 11011
+        "n" = 12 = 0x0C = 01100         "6" = 28 = 0x1C = 11100
+        "p" = 13 = 0x0D = 01101         "7" = 29 = 0x1D = 11101
+        "q" = 14 = 0x0E = 01110         "8" = 30 = 0x1E = 11110
+        "r" = 15 = 0x0F = 01111         "9" = 31 = 0x1F = 11111
+
+    The digits "0" and "1" and the letters "o" and "l" are not used, to
+    avoid transcription errors.
+
+    All decoders must recognize both the uppercase and lowercase forms
+    of the base-32 characters (including mixtures of both forms).
+    An encoder should output only lowercase forms or only uppercase
+    forms unless it uses the feature described in section "Mixed-case
+    annotation").
+
+Encoding and decoding algorithms
+
+    All ordering of bits, quartets, and quintets is big-endian (most
+    significant first).  When subroutines alter variables that are
+    passed in as arguments, those changes are seen by the caller after
+    the subroutine returns.  As in C, "continue" means terminate the
+    current iteration of the innermost loop, and "break" means terminate
+    the innermost loop.
+
+    procedure initialize(refpoint,literal,updated):
+      let refpoint[1..5] = (0xE0, 0xA0, 0, 0, 0x10000)
+      let literal = updated = false
+
+    procedure update(refpoint, updated, history[first..latest]):
+      # Update the reference points based on the history.
+      for k = 1 to 3 do begin
+        let b = 4 * k
+        # The first time here change all the windows:
+        if not updated
+        then let refpoint[k] = (history[latest] >> b) << b
+        else for i = latest - 1 down to first do begin
+          if history[i] represents an LDH character then continue
+          # If a code point falling in the existing window has appeared
+          # at least as recently as one falling in the candidate window,
+          # then leave this window unchanged and go on to the next one:
+          if (refpoint[k] XOR history[i]) >> b == 0 then break
+          if (history[latest] XOR history[i]) >> b == 0 then begin
+            # A code point falling in the candidate window has appeared
+            # more recently than one falling in the existing window, so
+            # change this window (and no others):
+            let refpoint[k] = (history[latest] >> b) << b
+            goto update_end
+          end
+        end
+      end
+      update_end: let updated = true
+
+    procedure encode(input[first..last]):
+      initialize(refpoint,literal,updated)
+      for i = first to last do begin
+        # Check code point range to avoid array bounds errors later:
+        if input[i] is not in 0..10FFFF then fail
+        if input[i] == 0x2D then output two hyphen-minuses
+        else if input[i] represents an LDH character then begin
+          # Letter/digit is encoded literally, so get into literal mode.
+          if not literal then output hyphen-minus
+          let literal = true
+          output the character represented by input[i]
+        end
+        else begin
+          # Non-LDH code point is encoded in base-32.
+          # Compute the number of base-32 characters to use:
+          for k = 1 to infinity do begin
+            let delta = input[i] - refpoint[k]
+            if delta >= 0 and delta >> (4*k) == 0 then break
+          end
+          # Switch to base-32 mode if necessary:
+          if literal then output hyphen-minus
+          let literal = false
+          represent delta in base 16 as k quartets
+          prepend 0 to the last quartet and 1 to each of the others
+          output a base-32 character corresponding to each quintet
+          update(refpoint, updated, input[first..i])
+        end
+      end
+
+    procedure decode(input string):
+      initialize(refpoint,literal,updated)
+      let history = the empty array
+      while the input string is not exhausted do begin
+        read the next character into c
+        # Unpaired hyphen-minus toggles the mode:
+        if c is hyphen-minus and the next character is not
+        then read the next character into c and toggle literal
+        # Double hyphen-minus represents 0x2D:
+        if c is hyphen-minus
+        then read the next character and append 0x2D to history
+        else if literal then append the code point of c to history
+        else begin
+          # Decode a base-32 sequence.
+          convert c to a quintet
+          while a quintet beginning with 0 has not been seen
+          do read and convert up to four more characters
+          concatenate the lowest four bits of each quintet to form delta
+          append refpoint[number of quintets] + delta to history
+          update(refpoint,updated,history)
+        end
+      end
+      # Enforce the uniqueness of the encoding:
+      encode history and compare it to the input string
+      fail if they are not equal
+      output history
+
+    The decoder must always be prepared for premature end-of-input or
+    invalid input characters, and must either fail immediately or forge
+    ahead and let the comparison at the end fail.  The comparison must
+    be case-insensitive if ACEs are always compared case-insensitively
+    (which is true of domain names), case-sensitive otherwise.  This
+    check is necessary to guarantee the uniqueness property (there
+    cannot be two distinct encoded strings representing the same
+    sequence of integers).  (If the decoder is one step of a larger
+    decoding process, it may be possible to defer the re-encoding and
+    comparison to the end of that larger decoding process.)
+
+Signature
+
+    The issue of how to distinguish ACE strings from unencoded strings
+    is largely orthogonal to the encoding scheme itself, and is
+    therefore not specified here.  In the context of domain name labels,
+    a standard prefix and/or suffix (chosen to be unlikely to occur
+    naturally) would presumably be attached to ACE labels.
+
+    In order to use AMC-ACE-R in domain names, the choice of signature
+    must be mindful of the requirement in [RFC952] that labels never
+    begin or end with hyphen-minus.  Since the raw encoded string
+    sometimes begins with a hyphen-minus, the signature must include
+    a prefix that does not begin with hyphen-minus.  If the Unicode
+    strings are forbidden from ending with hyphen-minus (which seems
+    prudent anyway), then the raw encoded string will never end with
+    hyphen-minus; otherwise, the signature must include a suffix as well
+    as a prefix.
+
+Mixed-case annotation
+
+    In order to use AMC-ACE-R to represent case-insensitive Unicode
+    strings, higher layers need to case-fold the Unicode strings prior
+    to AMC-ACE-R encoding.  The encoded string can, however, use
+    mixed-case base-32 (rather than all-lowercase or all-uppercase
+    as recommended in section "Base-32 characters") as an annotation
+    telling how to convert the folded Unicode string into a mixed-case
+    Unicode string for display purposes.
+
+    Each non-LDH code point is represented by a sequence of base-32
+    characters, the last of which is always a letter (as opposed to
+    a digit).  If that letter is uppercase, it is a suggestion that
+    the Unicode character be mapped to uppercase (if possible); if the
+    letter is lowercase, it is a suggestion that the Unicode character
+    be mapped to lowercase (if possible).
+
+    AMC-ACE-R encoders and decoders are not required to support these
+    annotations, and higher layers need not use them.
+
+Comparison with other ACEs
+
+    Please refer to the comparison in [AMCACEW].
+
+Example strings
+
+    In the ACE encodings below, no signatures are shown.  AMC-ACE-R is
+    abbreviated AMC-R.  Backslashes show where line breaks have been
+    inserted in strings too long for one line.
+
+    The first several examples are all translations of the sentence "Why
+    can't they just speak in <language>?" (courtesy of Michael Kaplan's
+    "provincial" page [PROVINCIAL]).  Word breaks and punctuation have
+    been removed, as is often done in domain names.
+
+    (A) Arabic (Egyptian):
+        u+0644 u+064A u+0647 u+0645 u+0627 u+0628 u+062A u+0643 u+0644
+        u+0645 u+0648 u+0634 u+0639 u+0631 u+0628 u+064A u+061F
+        AMC-R:  ywekhfuhuikwdwefivevjbuiwktr
+
+    (B) Chinese (simplified):
+        u+4ED6 u+4EEC u+4E3A u+4EC0 u+4E48 u+4E0D u+8BF4 u+4E2D u+6587
+        AMC-R:  w87g8nvk6awisp259eupyx2h
+
+    (C) Czech: Pro<ccaron>prost<ecaron>nemluv<iacute><ccaron>esky
+        U+0050 u+0072 u+006F u+010D u+0070 u+0072 u+006F u+0073 u+0074
+        u+011B u+006E u+0065 u+006D u+006C u+0075 u+0076 u+00ED u+010D
+        u+0065 u+0073 u+006B u+0079
+        AMC-R:  -Pro-yp-prost-tm-nemluv-s8pp-esky
+
+    (D) Hebrew:
+        u+05DC u+05DE u+05D4 u+05D4 u+05DD u+05E4 u+05E9 u+05D5 u+05D8
+        u+05DC u+05D0 u+05DE u+05D3 u+05D1 u+05E8 u+05D9 u+05DD u+05E2
+        u+05D1 u+05E8 u+05D9 u+05EA
+        AMC-R:  x7nqeep8e8j7f7inaqdb8ijp8cb8ij8k
+
+    (E) Hindi (Devanagari):
+        u+092F u+0939 u+0932 u+094B u+0917 u+0939 u+093F u+0928 u+094D
+        u+0926 u+0940 u+0915 u+094D u+092F u+094B u+0902 u+0928 u+0939
+        u+0940 u+0902 u+092C u+094B u+0932 u+0938 u+0915 u+0924 u+0947
+        u+0939 u+0948 u+0902
+        AMC-R:  3urvjvcwmthjruiwpugwatfwpurmscuivjascunmvcvitfuewhjwisc
+
+    (F) Japanese (kanji and hiragana):
+        u+306A u+305C u+307F u+3093 u+306A u+65E5 u+672C u+8A9E u+3092
+        u+8A71 u+3057 u+3066 u+304F u+308C u+306A u+3044 u+306E u+304B
+        AMC-R:  vsykxnzr3dkyx8fyzun243q3c24zbxhgwr2nkweqwm
+
+    (G) Korean (Hangul syllables):
+        u+C138 u+ACC4 u+C758 u+BAA8 u+B4E0 u+C0AC u+B78C u+B4E4 u+C774
+        u+D55C u+AD6D u+C5B4 u+B97C u+C774 u+D574 u+D55C u+B2E4 u+BA74
+        u+C5BC u+B9C8 u+B098 u+C88B u+C744 u+AE4C
+        AMC-R:  6tvi466ezxi544i5w8a6s4nz2nw8e6zze7xxn47yp6x5e53znze7xze\
+                7xxn5u8e54ze6x5n36is3i622m6zwe48wn
+
+    (H) Russian (Cyrillic):
+        U+043F u+043E u+0447 u+0435 u+043C u+0443 u+0436 u+0435 u+043E
+        u+043D u+0438 u+043D u+0435 u+0433 u+043E u+0432 u+043E u+0440
+        u+044F u+0442 u+043F u+043E u+0440 u+0443 u+0441 u+0441 u+043A
+        u+0438
+        AMC-R:  wvRqwhfnwdgfqpipfdqcqwawrcvrvqwawdbbvkvi
+
+    (I) Spanish: Porqu<eacute>nopuedensimplementehablarenEspa<ntilde>ol
+        U+0050 u+006F u+0072 u+0071 u+0075 u+00E9 u+006E u+006F u+0070
+        u+0075 u+0065 u+0064 u+0065 u+006E u+0073 u+0069 u+006D u+0070
+        u+006C u+0065 u+006D u+0065 u+006E u+0074 u+0065 u+0068 u+0061
+        u+0062 u+006C u+0061 u+0072 u+0065 u+006E U+0045 u+0073 u+0070
+        u+0061 u+00F1 u+006F u+006C
+        AMC-R:  -Porqu-j-nopuedensimplementehablarenEspa-9b-ol
+
+    (J) Taiwanese:
+        u+4ED6 u+5011 u+7232 u+4EC0 u+9EBD u+4E0D u+8AAA u+4E2D u+6587
+        AMC-R:  w87gxstbzuvc6a385psp244kupyx2h
+
+    (K) Vietnamese:
+        Ta<dotbelow>isaoho<dotbelow>kh<ocirc>ngth<ecirc><hookabove>chi\
+        <hookabove>no<acute>iti<ecirc><acute>ngVi<ecirc><dotbelow>t
+        U+0054 u+0061 u+0323 u+0069 u+0073 u+0061 u+006F u+0068 u+006F
+        u+0323 u+006B u+0068 u+00F4 u+006E u+0067 u+0074 u+0068 u+00EA
+        u+0309 u+0063 u+0068 u+0069 u+0309 u+006E u+006F u+0301 u+0069
+        u+0074 u+0069 u+00EA u+0301 u+006E u+0067 U+0056 u+0069 u+00EA
+        u+0323 u+0074
+        AMC-R:  -Ta-vud-isaoho-d-kh-s9e-ngth-s8kvsj-chi-vsj-no-b-iti-s8\
+                kb-ngVi-s8kud-t
+
+    The next several examples are all names of Japanese music artists,
+    song titles, and TV programs, just because the author happens to
+    have them handy (but Japanese is useful for providing examples
+    of single-row text, two-row text, ideographic text, and various
+    mixtures thereof).
+
+    (L) 3<nen>B<gumi><kinpachi><sensei>
+        u+0033 u+5E74 U+0042 u+7D44 u+91D1 u+516B u+5148 u+751F
+        AMC-R:  -3-x8ze-B-z7we3t7btymtwizxtr
+
+    (M) <amuro><namie>-with-SUPER-MONKEYS
+        u+5B89 u+5BA4 u+5948 u+7F8E u+6075 u+002D u+0077 u+0069 u+0074
+        u+0068 u+002D U+0053 U+0055 U+0050 U+0045 U+0052 u+002D U+004D
+        U+004F U+004E U+004B U+0045 U+0059 U+0053
+        AMC-R:  x52j4e3wiz92qyszf---with--SUPER--MONKEYS
+
+    (N) Hello-Another-Way-<sorezore><no><basho>
+        U+0048 u+0065 u+006C u+006C u+006F u+002D U+0041 u+006E u+006F
+        u+0074 u+0068 u+0065 u+0072 u+002D U+0057 u+0061 u+0079 u+002D
+        u+305D u+308C u+305E u+308C u+306E u+5834 u+6240
+        AMC-R:  -Hello--Another--Way---vsxp2nq2nyqx2veyuwa
+
+    (O) <hitotsu><yane><no><shita>2
+        u+3072 u+3068 u+3064 u+5C4B u+6839 u+306E u+4E0B u+0032
+        AMC-R:  vszcyiyex6wmy2vjqw8sm-2
+
+    (P) Maji<de>Koi<suru>5<byou><mae>
+        U+004D u+0061 u+006A u+0069 u+3067 U+004B u+006F u+0069 u+3059
+        u+308B u+0035 u+79D2 u+524D
+        AMC-R:  -Maji-vsyh-Koi-xj2m-5-z37cxuwp
+
+    (Q) <pafii>de<runba>
+        u+30D1 u+30D5 u+30A3 u+30FC u+0064 u+0065 u+30EB u+30F3 u+30D0
+        AMC-R:  vs7bf4d9n-de-8m9d7a
+
+    (R) <sono><supiido><de>
+        u+305D u+306E u+30B9 u+30D4 u+30FC u+30C9 u+3067
+        AMC-R:  vsxpyq5j7e9n6jyh
+
+    The last example is an ASCII string that breaks not only the
+    existing rules for host name labels but also the rules proposed in
+    [NAMEPREP03] for internationalized domain names.
+
+    (S) -> $1.00 <-
+        u+002D u+003E u+0020 u+0024 u+0031 u+002E u+0030 u+0030 u+0020
+        u+003C u+002D
+        AMC-R:  --svquaue-1-q-00-avn--
+
+Security considerations
+
+    Users expect each domain name in DNS to be controlled by a single
+    authority.  If a Unicode string intended for use as a domain label
+    could map to multiple ACE labels, then an internationalized domain
+    name could map to multiple ACE domain names, each controlled by
+    a different authority, some of which could be spoofs that hijack
+    service requests intended for another.  Therefore AMC-ACE-R is
+    designed so that each Unicode string has a unique encoding.
+
+    However, there can still be multiple Unicode representations of the
+    "same" text, for various definitions of "same".  This problem is
+    addressed to some extent by the Unicode standard under the topic of
+    canonicalization, and this work is leveraged for domain names by
+    "nameprep" [NAMEPREP03].
+
+Acknowledgements
+
+    AMC-ACE-R reuses a number of preexisting techniques.
+
+    The basic encoding of integers to quartets to quintets to base-32
+    comes from UTF-5 [UTF5], and the particular variant used here comes
+    from AMC-ACE-M [AMCACEM].
+
+    The idea of avoiding 0, 1, o, and l in base-32 strings was taken
+    from SFS [SFS].
+
+    The idea of encoding deltas from reference points was taken from
+    RACE (of which the latest version is [RACE03]), which may have
+    gotten the idea from Unicode Technical Standard #6 [UTS6].
+
+    The idea of switching between literal mode and base-32 mode comes
+    from BRACE [BRACE].
+
+    The general idea of using the alphabetic case of base-32 characters
+    to indicate the desired case of the Unicode characters was suggested
+    by this author, and first applied to the UTF-5-style encoding in
+    DUDE (of which the latest version is [DUDE01]).
+
+    The heuristic used to adapt the reference points based on past code
+    points is new in AMC-ACE-R.
+
+References
+
+    [AMCACEM] Adam Costello, "AMC-ACE-M version 0.1.4", 2001-Apr-01,
+    update of draft-ietf-idn-amc-ace-m-00, latest version at
+    http://www.cs.berkeley.edu/~amc/charset/amc-ace-m.
+
+    [AMCACEW] Adam Costello, "AMC-ACE-W version 0.1.0",
+    2001-May-31, draft-ietf-idn-amc-ace-w-00, latest version at
+    http://www.cs.berkeley.edu/~amc/charset/amc-ace-w.
+
+    [BRACE] Adam Costello, "BRACE: Bi-mode Row-based
+    ASCII-Compatible Encoding for IDN version 0.1.2",
+    2000-Sep-19, draft-ietf-idn-brace-00, version at
+    http://www.cs.berkeley.edu/~amc/charset/brace.
+
+    [DUDE01] Mark Welter, Brian Spolarich, "DUDE: Differential Unicode
+    Domain Encoding", 2001-Mar-02, draft-ietf-idn-dude-01.
+
+    [IDN] Internationalized Domain Names (IETF working group),
+    http://www.i-d-n.net/, idn@ops.ietf.org.
+
+    [IDNA] Patrik Faltstrom, Paul Hoffman, "Internationalizing Host
+    Names In Applications (IDNA)", draft-ietf-idn-idna-01.
+
+    [NAMEPREP03] Paul Hoffman, Marc Blanchet, "Preparation
+    of Internationalized Host Names", 2001-Feb-24,
+    draft-ietf-idn-nameprep-03.
+
+    [PROVINCIAL] Michael Kaplan, "The 'anyone can be provincial!' page",
+    http://www.trigeminal.com/samples/provincial.html.
+
+    [RACE03] Paul Hoffman, "RACE: Row-based ASCII Compatible Encoding
+    for IDN", 2000-Nov-28, draft-ietf-idn-race-03.
+
+    [RFC952] K. Harrenstien, M. Stahl, E. Feinler, "DOD Internet Host
+    Table Specification", 1985-Oct, RFC 952.
+
+    [RFC1034] P. Mockapetris, "Domain Names - Concepts and Facilities",
+    1987-Nov, RFC 1034.
+
+    [SFS] David Mazieres et al, "Self-certifying File System",
+    http://www.fs.net/.
+
+    [UNICODE] The Unicode Consortium, "The Unicode Standard",
+    http://www.unicode.org/unicode/standard/standard.html.
+
+    [UTF5] James Seng, Martin Duerst, Tin Wee Tan, "UTF-5, a
+    Transformation Format of Unicode and ISO 10646", draft-jseng-utf5-*.
+
+    [UTS6] Misha Wolf, Ken Whistler, Charles Wicksteed,
+    Mark Davis, Asmus Freytag, "Unicode Technical Standard
+    #6: A Standard Compression Scheme for Unicode",
+    http://www.unicode.org/unicode/reports/tr6/.
+
+Author
+
+    Adam M. Costello <amc@cs.berkeley.edu>
+    http://www.cs.berkeley.edu/~amc/
+
+
+Example implementation
+
+
+/******************************************/
+/* amc-ace-r.c 0.2.1 (2001-May-31-Thu)    */
+/* Adam M. Costello <amc@cs.berkeley.edu> */
+/******************************************/
+
+/* This is ANSI C code (C89) implementing AMC-ACE-R version 0.2.*. */
+
+
+/************************************************************/
+/* Public interface (would normally go in its own .h file): */
+
+#include <limits.h>
+
+enum amc_ace_status {
+  amc_ace_success,
+  amc_ace_bad_input,
+  amc_ace_big_output  /* Output would exceed the space provided. */
+};
+
+enum case_sensitivity { case_sensitive, case_insensitive };
+
+#if UINT_MAX >= 0x10FFFF
+typedef unsigned int u_code_point;
+#else
+typedef unsigned long u_code_point;
+#endif
+
+enum amc_ace_status amc_ace_r_encode(
+  unsigned int input_length,
+  const u_code_point input[],
+  const unsigned char uppercase_flags[],
+  unsigned int *output_size,
+  char output[] );
+
+    /* amc_ace_r_encode() converts Unicode to AMC-ACE-R (without      */
+    /* any signature).  The input must be represented as an array     */
+    /* of Unicode code points (not code units; surrogate pairs        */
+    /* are not allowed), and the output will be represented as        */
+    /* null-terminated ASCII.  The input_length is the number of      */
+    /* code points in the input.  The output_size is an in/out        */
+    /* argument: the caller must pass in the maximum number of        */
+    /* characters that may be output (including the terminating       */
+    /* null), and on successful return it will contain the number of  */
+    /* characters actually output (including the terminating null,    */
+    /* so it will be one more than strlen() would return, which is    */
+    /* why it is called output_size rather than output_length).  The  */
+    /* uppercase_flags array must hold input_length boolean values,   */
+    /* where nonzero means the corresponding Unicode character should */
+    /* be forced to uppercase after being decoded, and zero means it  */
+    /* is caseless or should be forced to lowercase.  Alternatively,  */
+    /* uppercase_flags may be a null pointer, which is equivalent     */
+    /* to all zeros.  The letters a-z and A-Z are always encoded      */
+    /* literally, regardless of the corresponding flags.  The encoder */
+    /* always outputs lowercase base-32 characters except when        */
+    /* nonzero values of uppercase_flags require otherwise.  The      */
+    /* return value may be any of the amc_ace_status values defined   */
+    /* above; if not amc_ace_success, then output_size and output may */
+    /* contain garbage.  On success, the encoder will never need to   */
+    /* write an output_size greater than input_length*5+1, because of */
+    /* how the encoding is defined.                                   */
+
+enum amc_ace_status amc_ace_r_decode(
+  enum case_sensitivity case_sensitivity,
+  char scratch_space[],
+  const char input[],
+  unsigned int *output_length,
+  u_code_point output[],
+  unsigned char uppercase_flags[] );
+
+    /* amc_ace_r_decode() converts AMC-ACE-R (without any signature)  */
+    /* to Unicode.  The input must be represented as null-terminated  */
+    /* ASCII, and the output will be represented as an array of       */
+    /* Unicode code points.  The case_sensitivity argument influences */
+    /* the check on the well-formedness of the input string; it       */
+    /* must be case_sensitive if case-sensitive comparisons are       */
+    /* allowed on encoded strings, case_insensitive otherwise.        */
+    /* The scratch_space must point to space at least as large        */
+    /* as the input, which will get overwritten (this allows the      */
+    /* decoder to avoid calling malloc()).  The output_length is      */
+    /* an in/out argument: the caller must pass in the maximum        */
+    /* number of code points that may be output, and on successful    */
+    /* return it will contain the actual number of code points        */
+    /* output.  The uppercase_flags array must have room for at       */
+    /* least output_length values, or it may be a null pointer        */
+    /* if the case information is not needed.  A nonzero flag         */
+    /* indicates that the corresponding Unicode character should      */
+    /* be forced to uppercase by the caller, while zero means it      */
+    /* is caseless or should be forced to lowercase.  The letters     */
+    /* a-z and A-Z are output already in the proper case, but their   */
+    /* flags will be set appropriately so that applying the flags     */
+    /* would be harmless.  The return value may be any of the         */
+    /* amc_ace_status values defined above; if not amc_ace_success,   */
+    /* then output_length, output, and uppercase_flags may contain    */
+    /* garbage.  On success, the decoder will never need to write     */
+    /* an output_length greater than the length of the input (not     */
+    /* counting the null terminator), because of how the encoding is  */
+    /* defined.                                                       */
+
+
+/**********************************************************/
+/* Implementation (would normally go in its own .c file): */
+
+#include <string.h>
+
+/* is_ldh(n) returns 1 if the code point n represents an LDH      */
+/* character (ASCII letter, digit, or hyphen-minus), 0 otherwise. */
+
+static int is_ldh(u_code_point n)
+{
+  return n <= 122 && ( n >= 97 || n == 45 ||
+         (n >= 48 && n <= 57) || (n >= 65 && n <= 90) );
+}
+
+/* base32[q] is the lowercase base-32 character representing  */
+/* the number q from the range 0 to 31.  Note that we cannot  */
+/* use string literals for ASCII characters because an ANSI C */
+/* compiler does not necessarily use ASCII.                   */
+
+static const char base32[] = {
+  97, 98, 99, 100, 101, 102, 103, 104, 105, 106, 107,     /* a-k */
+  109, 110,                                               /* m-n */
+  112, 113, 114, 115, 116, 117, 118, 119, 120, 121, 122,  /* p-z */
+  50, 51, 52, 53, 54, 55, 56, 57                          /* 2-9 */
+};
+
+/* base32_decode(c) returns the value of a base-32 character, in the */
+/* range 0 to 31, or the constant base32_invalid if c is not a valid */
+/* base-32 character.                                                */
+
+enum { base32_invalid = 32 };
+
+static unsigned int base32_decode(char c)
+{
+  if (c < 50) return base32_invalid;
+  if (c <= 57) return c - 26;
+  if (c < 97) c += 32;
+  if (c < 97 || c == 108 || c == 111 || c > 122) return base32_invalid;
+  return c - 97 - (c > 108) - (c > 111);
+}
+
+/* unequal(case_sensitivity,s1,s2) returns 0 if the strings s1 and s2 */
+/* are equal, 1 otherwise.  If case_sensitivity is case_insensitive,  */
+/* then ASCII A-Z are considered equal to a-z respectively.           */
+
+static int unequal( enum case_sensitivity case_sensitivity,
+                    const char s1[], const char s2[]        )
+{
+  char c1, c2;
+
+  if (case_sensitivity != case_insensitive) return strcmp(s1,s2) != 0;
+
+  for (;;) {
+    c1 = *s1;
+    c2 = *s2;
+    if (c1 >= 65 && c1 <= 90) c1 += 32;
+    if (c2 >= 65 && c2 <= 90) c2 += 32;
+    if (c1 != c2) return 1;
+    if (c1 == 0) return 0;
+    ++s1, ++s2;
+  }
+}
+
+/* update(refpoint,updated,history,latest) updates refpoint[1..3] */
+/* based on the updated flag and history[0..latest].              */
+
+static void update( u_code_point refpoint[6], unsigned int *updated,
+  const u_code_point history[], unsigned int latest )
+{
+  unsigned int k, b, i;
+
+  for (k = 1;  k <= 3;  ++k) {
+    b = k << 2;
+    /* The first time here change all the windows: */
+    if (!*updated) refpoint[k] = (history[latest] >> b) << b;
+    else for (i = latest;  i-- > 0; ) {
+      if (is_ldh(history[i])) continue;
+
+      /* If a code point falling in the existing window has appeared  */
+      /* at least as recently as one falling in the candidate window, */
+      /* then leave this window unchanged and go on to the next one:  */
+
+      if ((refpoint[k] ^ history[i]) >> b == 0) break;
+
+      if ((history[latest] ^ history[i]) >> b == 0) {
+        /* A code point falling in the candidate window has appeared */
+        /* more recently than one falling in the existing window, so */
+        /* change this window (and no others):                       */
+
+        refpoint[k] = (history[latest] >> b) << b;
+        goto update_end;
+      }
+    }
+  }
+
+  update_end: *updated = 1;
+}
+
+/* Main encode function: */
+
+enum amc_ace_status amc_ace_r_encode(
+  unsigned int input_length,
+  const u_code_point input[],
+  const unsigned char uppercase_flags[],
+  unsigned int *output_size,
+  char output[] )
+{
+  unsigned int literal, updated, max_out, in, out, k, j;
+  u_code_point n, delta;
+  char shift;
+
+  /* Initialize the state: */
+
+  u_code_point refpoint[6] = {0, 0xE0, 0xA0, 0, 0, 0x10000};
+
+  literal = updated = 0;
+  max_out = *output_size;
+
+  for (in = out = 0;  in < input_length;  ++in) {
+
+    /* At the start of each iteration, in and out are the number of */
+    /* items already input/output, or equivalently, the indices of  */
+    /* the next items to be input/output.                           */
+
+    n = input[in];
+    /* Check the code point range to avoid array bounds errors later: */
+    if (n > 0x10FFFF) return amc_ace_bad_input;
+
+    if (n == 0x2D) {
+      /* Hyphen-minus is doubled. */
+      if (max_out - out < 2) return amc_ace_big_output;
+      output[out++] = 0x2D;
+      output[out++] = 0x2D;
+    }
+    else if (is_ldh(n)) {
+      /* Encode an LDH character literally. */
+      if (max_out - out < 1 + !literal) return amc_ace_big_output;
+      /* Switch to literal mode if necessary: */
+      if (!literal) output[out++] = 0x2D;
+      literal = 1;
+      output[out++] = n;
+    }
+    else {
+      /* Encode a non-LDH character using base-32.           */
+      /* First compute the number of base-32 characters (k): */
+
+      for (k = 1; ; ++k) {
+        delta = n - refpoint[k];
+        if (delta >> (4*k) == 0) break;
+      }
+
+      if (max_out - out < k + literal) return amc_ace_big_output;
+      /* Switch to base-32 mode if necessary: */
+      if (literal) output[out++] = 0x2D;
+      literal = 0;
+      shift = uppercase_flags && uppercase_flags[in] ? 32 : 0;
+
+      /* Each quintet has the form 1xxxx except the last is 0xxxx. */
+      /* Computing the base-32 digits in reverse order is easiest. */
+
+      out += k;
+      output[out - 1] = base32[delta & 0xF] - shift;
+
+      for (j = 2;  j <= k;  ++j) {
+        delta >>= 4;
+        output[out - j] = base32[0x10 | (delta & 0xF)];
+      }
+
+      update(refpoint, &updated, input, in);
+    }
+  }
+
+  /* Append the null terminator: */
+  if (max_out - out < 1) return amc_ace_big_output;
+  output[out++] = 0;
+
+  *output_size = out;
+  return amc_ace_success;
+}
+
+/* Main decode function: */
+
+enum amc_ace_status amc_ace_r_decode(
+  enum case_sensitivity case_sensitivity,
+  char scratch_space[],
+  const char input[],
+  unsigned int *output_length,
+  u_code_point output[],
+  unsigned char uppercase_flags[] )
+{
+  u_code_point q, delta;
+  char c;
+  unsigned int literal, updated, max_out, in, out, k, scratch_size;
+  enum amc_ace_status status;
+
+  /* Initialize the state: */
+
+  u_code_point refpoint[6] = {0, 0xE0, 0xA0, 0, 0, 0x10000};
+
+  literal = updated = 0;
+  max_out = *output_length;
+
+  for (c = input[in = 0], out = 0;  c != 0;  c = input[++in], ++out) {
+
+    /* At the start of each iteration, in and out are the number of   */
+    /* items already input/output, or equivalently, the indices of    */
+    /* the next items to be input/output. c is the same as input[in]. */
+
+    if (c == 0x2D && input[in + 1] != 0x2D) {
+      /* Unpaired hyphen-minus toggles mode. */
+      literal = !literal;
+      c = input[++in];
+    }
+
+    if (max_out - out < 1) return amc_ace_big_output;
+
+    if (c == 0x2D) {
+      /* Double hyphen-minus represents a hyphen-minus. */
+      ++in;
+      output[out] = 0x2D;
+    }
+    else {
+      if (literal) output[out] = c;
+      else {
+        /* Decode a base-32 sequence.                  */
+        /* First decode quintets until 0xxxx is found: */
+
+        for (delta = 0, k = 1;  ;  c = input[++in], ++k) {
+          q = base32_decode(c);
+          if (q == base32_invalid || k > 5) return amc_ace_bad_input;
+          delta = (delta << 4) | (q & 0xF);
+          if (q >> 4 == 0) break;
+        }
+
+        output[out] = refpoint[k] + delta;
+        update(refpoint, &updated, output, out);
+      }
+    }
+
+    /* Case of last character determines uppercase flag: */
+    if (uppercase_flags) uppercase_flags[out] = c >= 65 && c <= 90;
+  }
+
+  /* Enforce the uniqueness of the encoding by re-encoding */
+  /* the output and comparing the result to the input:     */
+
+  scratch_size = ++in;
+  status = amc_ace_r_encode(out, output, uppercase_flags,
+                            &scratch_size, scratch_space);
+  if (status != amc_ace_success || scratch_size != in ||
+      unequal(case_sensitivity, scratch_space, input)
+     ) return amc_ace_bad_input;
+
+  *output_length = out;
+  return amc_ace_success;
+}
+
+
+/******************************************************************/
+/* Wrapper for testing (would normally go in a separate .c file): */
+
+#include <assert.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+/* For testing, we'll just set some compile-time limits rather than */
+/* use malloc(), and set a compile-time option rather than using a  */
+/* command-line option.                                             */
+
+enum {
+  unicode_max_length = 256,
+  ace_max_size = 256,
+  test_case_sensitivity = case_insensitive
+                          /* suitable for host names */
+};
+
+
+static void usage(char **argv)
+{
+  fprintf(stderr,
+    "%s -e reads code points and writes an AMC-ACE-R string.\n"
+    "%s -d reads an AMC-ACE-R string and writes code points.\n"
+    "Input and output are plain text in the native character set.\n"
+    "Code points are in the form u+hex separated by whitespace.\n"
+    "An AMC-ACE-R string is a newline-terminated sequence of LDH\n"
+    "characters (without any signature).\n"
+    "The case of the u in u+hex is the force-to-uppercase flag.\n"
+    , argv[0], argv[0]);
+  exit(EXIT_FAILURE);
+}
+
+static void fail(const char *msg)
+{
+  fputs(msg,stderr);
+  exit(EXIT_FAILURE);
+}
+
+static const char too_big[] =
+  "input or output is too large, recompile with larger limits\n";
+static const char invalid_input[] = "invalid input\n";
+static const char io_error[] = "I/O error\n";
+
+
+/* The following string is used to convert LDH      */
+/* characters between ASCII and the native charset: */
+
+static const char ldh_ascii[] =
+  "................"
+  "................"
+  ".............-.."
+  "0123456789......"
+  ".ABCDEFGHIJKLMNO"
+  "PQRSTUVWXYZ....."
+  ".abcdefghijklmno"
+  "pqrstuvwxyz";
+
+
+int main(int argc, char **argv)
+{
+  enum amc_ace_status status;
+  int r;
+  char *p;
+
+  if (argc != 2) usage(argv);
+  if (argv[1][0] != '-') usage(argv);
+  if (argv[1][2] != 0) usage(argv);
+
+  if (argv[1][1] == 'e') {
+    u_code_point input[unicode_max_length];
+    unsigned long codept;
+    unsigned char uppercase_flags[unicode_max_length];
+    char output[ace_max_size], uplus[3];
+    unsigned int input_length, output_size, i;
+
+    /* Read the input code points: */
+
+    input_length = 0;
+
+    for (;;) {
+      r = scanf("%2s%lx", uplus, &codept);
+      if (ferror(stdin)) fail(io_error);
+      if (r == EOF || r == 0) break;
+
+      if (r != 2 || uplus[1] != '+' || codept > (u_code_point)-1) {
+        fail(invalid_input);
+      }
+
+      if (input_length == unicode_max_length) fail(too_big);
+
+      if (uplus[0] == 'u') uppercase_flags[input_length] = 0;
+      else if (uplus[0] == 'U') uppercase_flags[input_length] = 1;
+      else fail(invalid_input);
+
+      input[input_length++] = codept;
+    }
+
+    /* Encode: */
+
+    output_size = ace_max_size;
+    status = amc_ace_r_encode(input_length, input, uppercase_flags,
+                              &output_size, output);
+    if (status == amc_ace_bad_input) fail(invalid_input);
+    if (status == amc_ace_big_output) fail(too_big);
+    assert(status == amc_ace_success);
+
+    /* Convert to native charset and output: */
+
+    for (p = output;  *p != 0;  ++p) {
+      i = *p;
+      assert(i <= 122 && ldh_ascii[i] != '.');
+      *p = ldh_ascii[i];
+    }
+
+    r = puts(output);
+    if (r == EOF) fail(io_error);
+    return EXIT_SUCCESS;
+  }
+
+  if (argv[1][1] == 'd') {
+    char input[ace_max_size], scratch[ace_max_size], *pp;
+    u_code_point output[unicode_max_length];
+    unsigned char uppercase_flags[unicode_max_length];
+    unsigned int input_length, output_length, i;
+
+    /* Read the AMC-ACE-R input string and convert to ASCII: */
+
+    fgets(input, ace_max_size, stdin);
+    if (ferror(stdin)) fail(io_error);
+    if (feof(stdin)) fail(invalid_input);
+    input_length = strlen(input);
+    if (input[input_length - 1] != '\n') fail(too_big);
+    input[--input_length] = 0;
+
+    for (p = input;  *p != 0;  ++p) {
+      pp = strchr(ldh_ascii, *p);
+      if (pp == 0) fail(invalid_input);
+      *p = pp - ldh_ascii;
+    }
+
+    /* Decode: */
+
+    output_length = unicode_max_length;
+    status = amc_ace_r_decode(test_case_sensitivity, scratch, input,
+                              &output_length, output, uppercase_flags);
+    if (status == amc_ace_bad_input) fail(invalid_input);
+    if (status == amc_ace_big_output) fail(too_big);
+    assert(status == amc_ace_success);
+
+    /* Output the result: */
+
+    for (i = 0;  i < output_length;  ++i) {
+      r = printf("%s+%04lX\n",
+                 uppercase_flags[i] ? "U" : "u",
+                 (unsigned long) output[i] );
+      if (r < 0) fail(io_error);
+    }
+
+    return EXIT_SUCCESS;
+  }
+
+  usage(argv);
+  return EXIT_SUCCESS;  /* not reached, but quiets compiler warning */
+}
+
+
+
+                   INTERNET-DRAFT expires 2001-Nov-30
