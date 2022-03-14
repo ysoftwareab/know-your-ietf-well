@@ -1,0 +1,504 @@
+
+
+
+
+Network Working Group                                          J. Levine
+Internet-Draft                                      Taughannock Networks
+Intended status: Experimental                         September 20, 2015
+Expires: March 23, 2016
+
+
+                Encoding mailbox local-parts in the DNS
+                      draft-levine-dns-mailbox-01
+
+Abstract
+
+   Many applications would like to store per-mailbox information
+   securely in the DNS.  Mapping mailbox local-parts into the DNS is a
+   difficult problem, due to the fuzzy matching that most mail systems
+   do, and the DNS design that only does exact matching.  We propose
+   several experimental approaches that attempt to implement the
+   required fuzzy matching through DNS queries.
+
+Status of This Memo
+
+   This Internet-Draft is submitted in full conformance with the
+   provisions of BCP 78 and BCP 79.
+
+   Internet-Drafts are working documents of the Internet Engineering
+   Task Force (IETF).  Note that other groups may also distribute
+   working documents as Internet-Drafts.  The list of current Internet-
+   Drafts is at http://datatracker.ietf.org/drafts/current/.
+
+   Internet-Drafts are draft documents valid for a maximum of six months
+   and may be updated, replaced, or obsoleted by other documents at any
+   time.  It is inappropriate to use Internet-Drafts as reference
+   material or to cite them other than as "work in progress."
+
+   This Internet-Draft will expire on March 23, 2016.
+
+Copyright Notice
+
+   Copyright (c) 2015 IETF Trust and the persons identified as the
+   document authors.  All rights reserved.
+
+   This document is subject to BCP 78 and the IETF Trust's Legal
+   Provisions Relating to IETF Documents
+   (http://trustee.ietf.org/license-info) in effect on the date of
+   publication of this document.  Please review these documents
+   carefully, as they describe your rights and restrictions with respect
+   to this document.  Code Components extracted from this document must
+   include Simplified BSD License text as described in Section 4.e of
+
+
+
+
+Levine                   Expires March 23, 2016                 [Page 1]
+
+Internet-Draft                 DNS mailbox                September 2015
+
+
+   the Trust Legal Provisions and are provided without warranty as
+   described in the Simplified BSD License.
+
+Table of Contents
+
+   1.  Introduction  . . . . . . . . . . . . . . . . . . . . . . . .   2
+     1.1.  Definitions . . . . . . . . . . . . . . . . . . . . . . .   3
+   2.  Summary of the approaches . . . . . . . . . . . . . . . . . .   3
+   3.  Literal bytes . . . . . . . . . . . . . . . . . . . . . . . .   3
+   4.  Encoded bytes . . . . . . . . . . . . . . . . . . . . . . . .   4
+     4.1.  Static or Dynamic name servers  . . . . . . . . . . . . .   4
+     4.2.  All names valid . . . . . . . . . . . . . . . . . . . . .   5
+   5.  Encoded regular expressions . . . . . . . . . . . . . . . . .   5
+     5.1.  Representing the DFA in the DNS . . . . . . . . . . . . .   6
+     5.2.  Matching a local-part against a DFA . . . . . . . . . . .   7
+   6.  Pointer to server . . . . . . . . . . . . . . . . . . . . . .   7
+   7.  Scaling Issues  . . . . . . . . . . . . . . . . . . . . . . .   8
+   8.  Security Considerations . . . . . . . . . . . . . . . . . . .   8
+   9.  References  . . . . . . . . . . . . . . . . . . . . . . . . .   9
+     9.1.  Normative References  . . . . . . . . . . . . . . . . . .   9
+     9.2.  Informative References  . . . . . . . . . . . . . . . . .   9
+   Author's Address  . . . . . . . . . . . . . . . . . . . . . . . .   9
+
+1.  Introduction
+
+   E-mail mailboxes consist of a local-part (sometimes informally called
+   left hand side or LHS), an @-sign and a domain name.  While the
+   domain name works like any other domain name, the local-part can
+   contain any ASCII characters, up to 64 characters long.  Mailboxes in
+   Internationalized mail [RFC6532] can contain arbitrary UTF-8
+   characters in the local-part, not just ASCII.  (The domain name also
+   can contain UTF-8 U-labels, but the process to translate U-labels to
+   ASCII A-labels for DNS resolution is well defined and is not further
+   addressed here.)  The DNS protocol is 8-bit clean, other than ASCII
+   case folding, although some DNS provisioning software does not handle
+   characters outside the ASCII set very well.
+
+   Mail systems usually handle variant forms of local-parts.  The most
+   common variants are ASCII upper and lower case, which are generally
+   treated as equivalent.  But many other variants are possible.  Some
+   systems allow and ignore "noise" characters such as dots, so local
+   parts johnsmith and John.Smith would be equivalent.  Many systems
+   allow "extensions" such as john-ext or mary+ext where john or mary is
+   treated as the effective local-part, and the ext is passed to the
+   recipient for further handling.  Yet other systems use an LDAP or
+   other directory to do approximate matching, so an address such as
+   john.smith might also match jsmith so long as there's no other
+   address that also matches.
+
+
+
+Levine                   Expires March 23, 2016                 [Page 2]
+
+Internet-Draft                 DNS mailbox                September 2015
+
+
+   [RFC5321] and its predecessors have always made it clear that only
+   the recipient MTA is allowed to interpret the local-part of an
+   address:
+
+      "... due to a long history of problems when intermediate hosts
+      have attempted to optimize transport by modifying them, the local-
+      part MUST be interpreted and assigned semantics only by the host
+      specified in the domain part of the address."  (Sec 2.3.11.)
+
+   This presents a problem when attempting to map local-parts into the
+   DNS, since the DNS only handles exact matchies, and clients cannot
+   make any assumptions about variants of local parts, and hence cannot
+   try to normalize variants to a "standard" version published in the
+   DNS.
+
+   This document suggests some approaches to shoehorn local-parts into
+   the DNS.  Since none of them have, to our knowledge, been implemented
+   they are all presented as experiments, with the hope that people
+   implement them, see how well the work, and perhaps later select one
+   of them for standardization.
+
+1.1.  Definitions
+
+   The ABNF terms "mailbox" and "local-part" are used as in [RFC5321].
+
+2.  Summary of the approaches
+
+   o  Literal bytes: put the local-part directly into the DNS as a name
+
+   o  Encoded bytes: encode the local-part into names consisting of
+      letters and digits
+
+   o  Regex: encode the set of names as a Deterministic Finite Automaton
+      (DFA) corresponding to a regular expression that matches the valid
+      names.
+
+   o  Pointer to server: securely identify an http server that will
+      handle the lookup.
+
+3.  Literal bytes
+
+   Since the DNS protocol is mostly 8-bit clean, one can put the local-
+   part into the DNS as is.  The suggested separator is _lmailbox so the
+   address Bob.Smith@example.com would be represented as:
+
+   Bob\.Smith._lmailbox.example.com
+
+
+
+
+
+Levine                   Expires March 23, 2016                 [Page 3]
+
+Internet-Draft                 DNS mailbox                September 2015
+
+
+   (The \. is the master file convention for a literal dot in a name.)
+   The maximum length of a local-part is 64 characters, while a DNS name
+   component is limited to 63, but actual local-parts of 64 characters
+   are vanishingly rare, and systems with distinct mailboxes with names
+   that differ only in the 64th character even rarer.  It also cannot
+   distinguish between upper and lower case ASCII characters, but MTAs
+   that do not treat them the same are also very rare.
+
+   This has the benefit of simplicity--the server can directly see
+   exactly what name the client is looking up.  Its disdvantage is that
+   some provisioning software does not handle names well if they contain
+   characters outside the usual ASCII printing character set.  Its other
+   characteristics are similar to those for encoded bytes, described
+   next.
+
+4.  Encoded bytes
+
+   To avoid problems with characters in DNS names, we can encode the
+   local-part with a simple reversible transformation that represents
+   names using the hostname subset of ASCII.  To preserve lexical order,
+   which might be useful, take the local-part, pad it out to 64 bytes
+   with xFF bytes, which are invalid both in ASCII and UTF-8, and break
+   the string into two 32 byte chunks.  Then encode each chunk as 52
+   characters in a variant of base32, with each 5-bit section
+   represented as a character from the sequence 0-9a-v.  Then use the
+   encoded low part, a dot, and the encoded high part as end of the DNS
+   name.  The suggested separator is _emailbox so the address
+   Bob.Smith@example.com would be represented as:
+
+   vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvg.
+   89nm4bijdlkn8q7vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvg.
+   _emailbox.example.com
+
+   (The name is is displayed on several lines to make it fit in the
+   margins, but the actual name is one long string delimited by dots.)
+   Since many local parts are 32 bytes or less, a simple optimization
+   would be to omit the low part if it's all encoded 0xff bytes.
+
+4.1.  Static or Dynamic name servers
+
+   A mail server with a small set of variants could export the names as
+   either literal or encoded bytes to be served by an ordinary
+   authoritative DNS server.  A mail server with the more typical wide
+   range of variants could be lashed up to a special purpose DNS server
+   that recovers the local-part from the literal or encoded bytes,
+   figures out what key it corresponds to, and synthesizes an key
+   record, or NXDOMAIN if there isn't one.
+
+
+
+
+Levine                   Expires March 23, 2016                 [Page 4]
+
+Internet-Draft                 DNS mailbox                September 2015
+
+
+4.2.  All names valid
+
+   Synthesizing NXDOMAIN responses is likely to be hard, due to the
+   difficulty of figuring what the valid addresses above and below it
+   are (or even worse, the NSEC3 hashes.)  Also, a static zone with NSEC
+   is easily enumerated, which would leak the set of mailboxes in the
+   domain.
+
+   A dynamic server has the option of returning a record for every query
+   for a syntactically valid encoded name, i.e. anything that is two
+   names of 52 characters from the set [0-9a-v].  If there is no key for
+   the mailbox (which may mean the mailbox doesn't exist or that it does
+   exist but doesn't have a key), the key field in the record is zero
+   length.  This makes dynamic DNSSEC somewhat easier, since the server
+   doesn't have to synthesize NXDOMAIN responses for valid encoded
+   names, and for other names it is straightforward to compute the
+   nearest possible encoded names.  It also makes it unproductive to try
+   to enumerate the names in the domain.
+
+5.  Encoded regular expressions
+
+   Many variant local-parts are easily described using regular
+   expressions.  For example, the local-parts matching "bobsmith" on a
+   system that ignores ASCII case distinctions and allows dots between
+   the characters would be described as
+   "[Bb].?[Oo].?[Bb].?[Ss].?[Mm].?[Ii].?[Tt].?[Hh]".  The local-parts
+   for the address "bob" with optional + extensions would be
+   "[Bb][Oo][Bb](\+.*)?"  For typical variant rules, it is
+   straightforward to generate the regular expressions, and even for
+   variants not easily described by patterns, it is possible to
+   enumerate distinct variants, e.g.
+   "([Bb][Oo][Bb]|[Bb][Oo][Bb][Bb][Yy]|[Rr][Oo][Bb][Ee][Rr][Tt])".
+
+   Regular expressions are equivalent to Deterministitic Finite Automata
+   (DFA), often called state machines, and algorithms to translate
+   betwen them are well known.  See, for example, chapter 3 of [ASU86].
+   Lexical analyzer generators such as lex [LESK75] take a collection of
+   regular expressions and translate them into a DFA that can be used to
+   match the regular expressions against input strings efficiently in a
+   single pass through the input string with one lookup per character in
+   the string.  For Unicode text, one can either treat the string as a
+   sequence of Unicode characters, or a sequence of the octets in the
+   UTF-8 repreentation, and translate either into a DFA and a state
+   machine.  In the discussion below we assume the machine matches the
+   octets, but the implementation using charactrs would be very similar.
+
+   This approach stores the state machine in the DNS, to allow DNS
+   clients to efficiently match valid local-parts against the regular
+
+
+
+Levine                   Expires March 23, 2016                 [Page 5]
+
+Internet-Draft                 DNS mailbox                September 2015
+
+
+   expression.  The state machine in a DFA consists of a set of states,
+   conventionally identified by decimal numbers.  Each state can be a
+   terminal state, which means that if the input is at the end of the
+   string, the regular expression has matched.  The state also has a set
+   of transitions, pairs of (octet,state) that tell the DFA to switch to
+   the given state based on the next input octet.
+
+   To match an input string, the client starts at state zero, then uses
+   each octet in the input string (in this case the local-part) to
+   choose a next state.  If at any stage the octet does not have a
+   corresponding next state, the match fails.  If at the end of the
+   string, the final state is a terminal state, the match succeeded and
+   the terminal state identifies which regular expression it matched.
+   The DFA matcher here is considerably simpler than the one that lex
+   and similar programs use, since they repeatedly match expressions
+   against a long string of input to divide it into lexical tokens,
+   while in this application there is one input string that either
+   matches or not.
+
+5.1.  Representing the DFA in the DNS
+
+   Each state in the DFA is represented by a collection of DNS names and
+   records.  We define a new DFA record that contains a single 16-bit
+   field, which is the state number of the next state.  Most records are
+   of the form:
+
+   cc.ddd._rmailbox.example.com IN DFA 123
+
+   In this example, ddd is the current state number as a decimal number,
+   and cc is the hex value of the next octet.  Non-terminal states have
+   a DFA record to identify the next state.  Terminal states (which may
+   also be non-terminal states if one local-part is a prefix of another)
+   have key records such as SMIMEA.
+
+   For wildcard subexpressions, written as "." , the cc is a * DNS
+   wildcard.  The DNS closest encloser rule allows states where a few
+   characters have specific matches, and everything goes to a default
+   state, as in situations were a user calls out a few specific address
+   extensions, e.g. "bob-dnslist" and "bob-jokes" and every other
+   extension matches "bob-.*".  This encoding makes the zone
+   considerably smaller than it would be if a record for every possible
+   octet value had to be stored separately.
+
+   Once the local-parts are compiled into the state machine records,
+   they are an ordinary DNS zone that can be served by an ordinary
+   authoritative server.
+
+
+
+
+
+Levine                   Expires March 23, 2016                 [Page 6]
+
+Internet-Draft                 DNS mailbox                September 2015
+
+
+5.2.  Matching a local-part against a DFA
+
+   Start by turning the local-part into a list of octets.  For
+   traditional ASCII local-parts, the characters are the octets, for
+   internationalized local-parts the characters are Unicode characters,
+   which may be represented by several UTF-8 octets.  Set the state
+   number to zero, which is by convention the initial state.
+
+   For each octet, create a DNS name using the hex code of the current
+   octet, the current state and _rmailbox.domain.  If this is not the
+   last octet in the local-part, look up a DFA record to find the next
+   state.  If the DFA record is found, use its value as the next state
+   and advance to the next octet.  If there is no DFA record, stop,
+   there is no key for this name.
+
+   If this is the last octet of the local-part, look up whatever key
+   record is desired.  If it's found, it's the key for the local-part.
+   If not, there is no key.
+
+   As a minor optimization, state number 65535 in a DFA record means a
+   trailing wildcard that matches the rest of the local-part.  This
+   permits more efficient matching of the common extension idioms such
+   as "bob+.*" without having to iterate through the octets in the
+   extension.  If a retrieved DFA record contains 65535, the name
+   matched so the client fetches the key record at the same name.
+
+6.  Pointer to server
+
+   Rather than trying to encode local-parts into the DNS, publish a
+   pointer to a per-domain web server that can provide the keys,
+   identified by URI RR [RFC7553].  Each key type will have to register
+   a new enumservice [RFC6117] type for naming the URI record, e.g.:
+
+   _smimecert._smtp.example.com URI 0 0 "https://keyserver.example.com/
+   smimecerts"
+
+   The URI has to be https, with the name suitably verified by TLSA
+   certificates.  To find a key, take the URI, add "?mailbox={escmbx}"
+   where {escmbx} is the full ASCII or UTF-8 mailbox name suitably hex
+   escaped for a URI, and fetch it.  The server will either return a
+   result as application/pgp-keys or application/pkix-cert or other
+   appropriate type or a 4xx status if there is no key available.
+
+   This is certainly slower than a single DNS lookup, but it's
+   comparable to the sequence of lookups for the DFA encoding, and it's
+   about the same speed as the subsequent SMTP session to send a
+   message, so it's probably fast enough.
+
+
+
+
+Levine                   Expires March 23, 2016                 [Page 7]
+
+Internet-Draft                 DNS mailbox                September 2015
+
+
+7.  Scaling Issues
+
+   Mail systems vary from tiny home systems with a handful of users to
+   giant public systems with hundreds of millions of users.  Signing and
+   publishing a zone with one key per user for a large mail system would
+   likely exceed the capacity of much DNS software.  For comparison, the
+   largest signed zone as of mid-2015 is probably the .COM TLD, with
+   about 280 million records and 117 million names.  Considering the
+   large size of key records, a zone with one key per user for a large
+   mail system could easily be an order of magnitude larger.  Hence, any
+   approach that requires putting all of the keys into a static signed
+   zone is unikely to be practical at scale.
+
+   With this in mind, the more promising approaches appear to be encoded
+   names (Section 4), which offers the possibility of responses
+   generated from the underlying database on the fly, or pointer to
+   server (Section 6) going directly to a web service.
+
+8.  Security Considerations
+
+   Some approaches may make it somewhat easier to extract valid local
+   parts for a domain.  The All Names Valid option makes name searches
+   unproductive.
+
+   The regular expression representation is difficult to reverse
+   engineer.  With NSEC records it's possible to recover the DFA and in
+   principle to translate it back into a large regular expression, but
+   there's no efficient way to take the regular expression and extract a
+   useful set of distinct names.  (It's easy to enumerate lots of
+   variants of the same name, which is not useful to spammers since a
+   blast of mail to the same recipient is typically shut down in moments
+   by bulk counters.)
+
+   All of the usual attacks against DNS servers are likely to occur.
+   The usual techniques for mitigating them should work.  Many queries
+   will cache poorly, but probably no worse than rDNS or DNSBL queries
+   do now.
+
+   If PGP or S/MIME keys are published in the DNS, it is unclear what
+   security assertions the publishing server is making about them.  The
+   server would presumably be saying this is the key for mailbox so-and-
+   so, but S/MIME and PGP have historically tried to bind keys to users
+   or organizations, not just mailboxes.
+
+
+
+
+
+
+
+
+Levine                   Expires March 23, 2016                 [Page 8]
+
+Internet-Draft                 DNS mailbox                September 2015
+
+
+9.  References
+
+9.1.  Normative References
+
+   [RFC5321]  Klensin, J., "Simple Mail Transfer Protocol", RFC 5321,
+              DOI 10.17487/RFC5321, October 2008,
+              <http://www.rfc-editor.org/info/rfc5321>.
+
+   [RFC6117]  Hoeneisen, B., Mayrhofer, A., and J. Livingood, "IANA
+              Registration of Enumservices: Guide, Template, and IANA
+              Considerations", RFC 6117, DOI 10.17487/RFC6117, March
+              2011, <http://www.rfc-editor.org/info/rfc6117>.
+
+   [RFC6532]  Yang, A., Steele, S., and N. Freed, "Internationalized
+              Email Headers", RFC 6532, DOI 10.17487/RFC6532, February
+              2012, <http://www.rfc-editor.org/info/rfc6532>.
+
+   [RFC7553]  Faltstrom, P. and O. Kolkman, "The Uniform Resource
+              Identifier (URI) DNS Resource Record", RFC 7553, DOI
+              10.17487/RFC7553, June 2015,
+              <http://www.rfc-editor.org/info/rfc7553>.
+
+9.2.  Informative References
+
+   [ASU86]    Aho, A., Sethi, R., and J. Ullman, "Compilers: Principles,
+              Techniques, and Tools", 1986.
+
+   [LESK75]   Lesk, M., "Lex--A Lexical Analyzer Generator", CSTR 39,
+              DOI 10.1234/567.890, 1975,
+              <http://dinosaur.compilertools.net/lex/>.
+
+Author's Address
+
+   John Levine
+   Taughannock Networks
+   PO Box 727
+   Trumansburg, NY  14886
+
+   Phone: +1 831 480 2300
+   Email: standards@taugh.com
+   URI:   http://jl.ly
+
+
+
+
+
+
+
+
+
+
+Levine                   Expires March 23, 2016                 [Page 9]
