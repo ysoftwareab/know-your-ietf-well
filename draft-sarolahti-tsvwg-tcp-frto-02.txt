@@ -1,0 +1,843 @@
+
+
+
+
+
+
+Internet Engineering Task Force                             P. Sarolahti
+INTERNET DRAFT                                     Nokia Research Center
+File: draft-sarolahti-tsvwg-tcp-frto-02.txt                      M. Kojo
+                                                  University of Helsinki
+                                                          November, 2002
+                                                      Expires: May, 2003
+
+
+                F-RTO: A TCP RTO Recovery Algorithm for
+                  Avoiding Unnecessary Retransmissions
+
+
+Status of this Memo
+
+   This document is an Internet-Draft and is in full conformance with
+   all provisions of Section 10 of [RFC2026].
+
+   Internet-Drafts are working documents of the Internet Engineering
+   Task Force (IETF), its areas, and its working groups.  Note that
+   other groups may also distribute working documents as Internet-
+   Drafts.
+
+   Internet-Drafts are draft documents valid for a maximum of six months
+   and may be updated, replaced, or obsoleted by other documents at any
+   time.  It is inappropriate to use Internet-Drafts as reference
+   material or to cite them other than as "work in progress."
+
+   The list of current Internet-Drafts can be accessed at
+   http://www.ietf.org/ietf/1id-abstracts.txt
+
+   The list of Internet-Draft Shadow Directories can be accessed at
+   http://www.ietf.org/shadow.html.
+
+
+Abstract
+
+   Spurious retransmission timeouts (RTOs) cause suboptimal TCP
+   performance, because they often result in unnecessary retransmission
+   of the last window of data. This document describes the "Forward RTO
+   Recovery" (F-RTO) algorithm for recovering from the TCP RTOs
+   efficiently even when the RTO was spurious. F-RTO is a TCP sender
+   only algorithm that does not require any TCP options to operate.
+   After retransmitting the first unacknowledged segment triggered by an
+   RTO, the F-RTO algorithm at a TCP sender monitors the incoming
+   acknowledgements to determine whether the timeout was spurious and to
+   decide whether to send new segments or retransmit unacknowledged
+   segments. The algorithm effectively avoids additional unnecessary
+   retransmissions and thereby improves TCP performance in case of a
+
+
+
+Expires: May 2003                                               [Page 1]
+
+draft-sarolahti-tsvwg-tcp-frto-02.txt                      November 2002
+
+
+   spurious timeout.
+
+
+1.  Introduction
+
+   The TCP protocol [Pos81] has two methods for triggering
+   retransmissions.  Primarily, the TCP sender relies on incoming
+   duplicate ACKs, which indicate that the receiver is missing some of
+   the data. After a required amount of successive duplicate ACKs have
+   arrived at the sender, it retransmits the first unacknowledged
+   segment [APS99]. Secondarily, the TCP sender maintains a
+   retransmission timer which triggers retransmission of segments, if
+   they have not been acknowledged within the retransmission timer
+   expiration period. When the retransmission timer expires, the
+   congestion window is initialized to one segment and unacknowledged
+   segments are retransmitted using the slow-start algorithm. The
+   retransmission timer is adjusted dynamically based on the measured
+   round-trip times [PA00].
+
+   It has been pointed out that the retransmission timer can expire
+   spuriously and trigger unnecessary retransmissions when no segments
+   have been lost [GL02]. After a spurious RTO the acknowledgements of
+   original segments arrive at the sender, usually triggering
+   unnecessary retransmissions of whole window of segments during the
+   RTO recovery.
+
+   There are a number of potential reasons for spurious RTOs. First,
+   some mobile networking technologies involve sudden delay peaks on
+   transmission because of actions taken during a hand-off. Second,
+   arrival of competing traffic, possibly with higher priority, on a
+   low-bandwidth link or some other change in available bandwidth
+   involves a sudden increase of round-trip time which may trigger a
+   spurious retransmission timeout. A persistently reliable link layer
+   can also cause a sudden delay when several data frames are lost for
+   some reason. This document does not distinguish the different causes
+   of such a delay, but discusses the spurious RTO caused by delay in
+   general.
+
+   This document describes an alternative algorithm called "Forward RTO-
+   Recovery" (F-RTO) to be used for retransmitting segments after an
+   RTO. The purpose of the F-RTO algorithm is to avoid most of the
+   unnecessary retransmissions following a spurious timeout and thereby
+   improve TCP performance. When the RTO is not spurious, the F-RTO
+   algorithm reverts back to the conventional RTO recovery algorithm and
+   should have similar performance. F-RTO does not require any TCP
+   options in its operation, and it can be implemented by modifying only
+   the TCP sender. This is different from alternative algorithms (Eifel
+   [LK00] and DSACK-based algorithms [BA02]) that have been suggested
+
+
+
+Expires: May 2003                                               [Page 2]
+
+draft-sarolahti-tsvwg-tcp-frto-02.txt                      November 2002
+
+
+   for detecting unnecessary retransmissions.  The Eifel algorithm uses
+   TCP timestamps for detecting a spurious timeout and the DSACK-based
+   algorithms require that the SACK option with DSACK extension [FMMP00]
+   is in use. With DSACK, the TCP receiver can report if it has received
+   a duplicate segment, making it possible for the sender to detect
+   afterwards whether it has made unnecessary retransmissions.
+
+   When an RTO occurs, the F-RTO sender retransmits the first
+   unacknowledged segment normally. If the next two acknowledgements
+   advance the window, the F-RTO sender continues sending new data and
+   exits the recovery.  However, if either of the next two
+   acknowledgements is a duplicate ACK, there was no sufficient evidence
+   of spurious RTO; therefore the F-RTO sender retransmits the
+   unacknowledged segments in slow start similarly to the traditional
+   algorithm.
+
+   The F-RTO algorithm only attempts to avoid unnecessary
+   retransmissions after a RTO. Eifel can also be used in avoiding
+   unnecessary retransmissions in other events, for example due to
+   packet reordering.  It is not recommended to use the F-RTO algorithm
+   for deciding whether to revert the congestion control parameters,
+   because similarly to Eifel, it cannot detect the possible loss of the
+   unnecessary RTO retransmission. Instead, we suggest that other means,
+   such as DSACK, would be used to revert the congestion control
+   parameters, if so desired.
+
+   This document is organized as follows. Section 2 describes the basic
+   F-RTO algorithm. Section 3 outlines an optional enhancement to the F-
+   RTO algorithm that takes leverage on the TCP Selective Acknowledgment
+   Option [MMFR96] and Section 4 outlines an alternative of F-RTO that
+   uses the TCP timestamp option. Section 5 discusses how the F-RTO
+   algorithm performs in different scenarios where RTOs typically occur.
+   Section 6 discusses the issue of reverting the congestion control
+   state after a spurious RTO.  Section 7 discusses security
+   considerations.
+
+
+
+2.  F-RTO Algorithm
+
+   The F-RTO algorithm affects the TCP sender behavior only after a
+   retransmission timeout. Otherwise the TCP behavior remains
+   unmodified.  This section describes a basic version of the F-RTO
+   algorithm that does not require TCP options to work. For congestion
+   control, a careful approach reducing the congestion window after
+   spurious RTO is presented. However, other kinds of actions on
+   congestion control could also be taken. The congestion control is
+   considered a subject of further research and is discussed in Section
+
+
+
+Expires: May 2003                                               [Page 3]
+
+draft-sarolahti-tsvwg-tcp-frto-02.txt                      November 2002
+
+
+   6.
+
+   When the retransmission timer expires, the F-RTO algorithm takes the
+   following steps at the TCP sender.
+
+   1) When RTO expires, the TCP sender SHOULD retransmit first
+      unacknowledged segment.
+
+      The TCP sender MUST adjust ssthresh to max(FlightSize / 2, 2 *
+      MSS), according to the TCP congestion control specifications
+      [APS99]. However, under F-RTO the congestion window (cwnd) is not
+      yet adjusted, but the TCP sender waits for the next incoming
+      acknowledgements before deciding on the following actions. Leaving
+      cwnd unadjusted in this stage does not cause TCP sender to inject
+      any additional segments to the network. The highest sequence
+      number transmitted so far is stored in variable "send_high".
+
+   2) When the first acknowledgement after the RTO arrives at the
+      sender, the sender chooses the following actions depending on
+      whether the ACK advances the window or whether it is a duplicate
+      ACK.
+
+      a) If the acknowledgement is a duplicate ACK OR it is
+         acknowledging a sequence number equal or above to the value of
+         "send_high", the TCP sender SHOULD revert to the conventional
+         recovery and not enter step 3 of this algorithm.
+
+         The sender MUST set cwnd to 1 * MSS. This duplicate ACK is
+         triggered by a segment that was sent before the retransmission
+         triggered by the RTO.  This is possible, for example, if the
+         RTO is triggered during fast recovery while forward
+         transmissions are triggering duplicate ACKs.  Furthermore, if a
+         segment retransmitted during fast recovery is lost, it needs to
+         be retransmitted again by retransmission timer. In this case it
+         is also possible that the duplicate ACK is triggered by a new
+         segment transmitted during the fast recovery before the RTO.
+
+      b) If the acknowledgement advances the window AND it is below the
+         value of "send_high", the TCP sender MAY transmit two new
+         (previously unsent) segments.
+
+         At this point the TCP sender MUST set cwnd to no more than the
+         current value ssthresh, thus halving the transmission rate.
+         Sending two new segments at this point is equally aggressive to
+         the conventional RTO recovery algorithm, which would have
+         increased its cwnd to 2 * MSS when the first ACK arrives after
+         RTO. It is possible that the sender can transmit only one new
+         segment at this time, because the receiver window limits it, or
+
+
+
+Expires: May 2003                                               [Page 4]
+
+draft-sarolahti-tsvwg-tcp-frto-02.txt                      November 2002
+
+
+         because the TCP sender does not have more data to send. This
+         does not prevent the algorithm from working. In any case, the
+         TCP sender SHOULD transmit at least one segment, either new
+         data or from the retransmission queue. If the sender
+         retransmits the next unacknowledged segment, it MUST NOT enter
+         the step 3 of this algorithm, but continue retransmitting
+         similarly to the conventional RTO recovery algorithm.
+
+   3) When the second acknowledgement after the RTO arrives at the
+      sender, either continue transmitting new data, or start
+      retransmitting the unacknowledged segments.
+
+      a) If the acknowledgement is a duplicate ACK, the TCP sender MUST
+         set congestion window to no more than 3 * MSS, and continue
+         with the slow start algorithm retransmitting unacknowledged
+         segments.
+
+         The duplicate ACK indicates that at least one segment other
+         than the segment which triggered RTO is lost in the last window
+         of data. There is no sufficient evidence that any of the
+         segments was delayed. Therefore, the sender proceeds with
+         retransmissions similarly to the conventional RTO recovery
+         algorithm, with the send_high variable stored when the
+         retransmission timer expired to avoid unnecessary fast
+         retransmits.
+
+      b) If the acknowledgement advances the window and acknowledges
+         data that was not retransmitted after the RTO, the TCP sender
+         SHOULD continue transmitting new data following the congestion
+         avoidance algorithm.
+
+         Because the TCP sender has retransmitted only one segment after
+         the RTO, this acknowledgement indicates that an originally
+         transmitted segment has arrived at the receiver. This is
+         regarded as a strong indication of a spurious RTO.  From this
+         point on, the TCP sender continues as in the normal congestion
+         avoidance. If the acknowledgement advances window, but does not
+         acknowledge other data than what was retransmitted in step 1,
+         the sender SHOULD stay in step 3 of the algorithm until the
+         acknowledgement is either dupack or acknowledges data that was
+         not retransmitted in step 1. This is to make sure that the
+         sender gets an acknowledgement for data that was not
+         retransmitted in order to declare the RTO spurious. A
+         misbehaving receiver acknowledging partial segments should not
+         cause wrong response at the F-RTO sender.
+
+         If this algorithm branch is taken, the TCP sender SHOULD set
+         the value of send_high variable to SND.UNA in order to disable
+
+
+
+Expires: May 2003                                               [Page 5]
+
+draft-sarolahti-tsvwg-tcp-frto-02.txt                      November 2002
+
+
+         the Reno "bugfix" [FH99]. The send_high variable was proposed
+         for avoiding unnecessary multiple fast retransmits when RTO
+         expires during fast recovery with NewReno TCP. As the sender
+         has not retransmitted other segments but the one that triggered
+         RTO, the problem addressed by the bugfix cannot occur.
+         Therefore, if there are duplicate ACKs arriving at the sender
+         after the RTO, they are likely to indicate a packet loss, hence
+         fast retransmit should be used to allow efficient recovery.  If
+         there are not enough duplicate ACKs arriving at the sender
+         after a packet loss, the retransmission timer expires another
+         time and the sender enters step 1 of this algorithm.
+
+   If the TCP sender does not have any new data to send in algorithm
+   branch (2b), or the receiver window limits the transmission, the
+   sender reverts back to retransmitting unacknowledged data similarly
+   to the regular TCP. The motivation for this is to ensure that the
+   flow of segments into the network does not stop. In the worst case
+   this would result in additional RTOs significantly degrading the TCP
+   performance.  One alternative to avoid some of the unnecessary
+   retransmissions would be to transmit one segment from the tail of the
+   retransmission queue, if it is not possible to transmit new data in
+   algorithm step (2b). Another would be to transmit data above the
+   receiver window. If the RTO was spurious, the receiver is likely to
+   be able to accept that segment at the time when it arrives. However,
+   the current recommendation is to revert to the conventional RTO
+   recovery if sending new data is not possible, because we believe the
+   benefits of doing otherwise are not very remarkable.
+
+   When algorithm branch (3b) is taken, the sender does not reduce the
+   congestion window to one segment, but halves it to the level of
+   ssthresh. Because the sender does not enter slow start, it increases
+   congestion window only once in a round-trip time after RTO, and
+   therefore is slightly more conservative than the conventional
+   recovery algorithm.
+
+   Branch (3b) can also be taken when a retransmission triggered by
+   delay is lost. Because loss of the retransmission cannot be detected
+   at the sender in this case, we consider that reducing the congestion
+   window to half of its previous size is an adequate action at this
+   point. A similar action is taken when TCP sender enters fast
+   recovery. The DSACK option can be used to detect whether the
+   retransmitted segment was sent unnecessarily and possibly revert the
+   congestion window to its earlier size in this case. However, fully
+   reverting the congestion window may be too aggressive action after
+   the spurious RTO, hence the possible adjustment of congestion window
+   in this case remains a future research issue.
+
+   The F-RTO algorithm has a side-effect on the TCP round-trip time
+
+
+
+Expires: May 2003                                               [Page 6]
+
+draft-sarolahti-tsvwg-tcp-frto-02.txt                      November 2002
+
+
+   measurement. Because the TCP sender avoids most of the unnecessary
+   retransmissions after a spurious RTO, the sender is able to take
+   round-trip time samples of the delayed segments. This would not be
+   possible due to retransmission ambiguity, if the regular RTO recovery
+   is used without TCP timestamps. As a result, the RTO estimator is
+   likely have larger values with F-RTO than with the regular TCP after
+   the spurious RTO. We believe this is an advantage in the networks
+   that are prone to delay spikes.
+
+   It is possible that the F-RTO algorithm does not always avoid
+   unnecessary retransmissions after spurious RTO. If packet reordering
+   or packet duplication occurs on the segment that triggered the
+   spurious RTO, the F-RTO algorithm ends up retransmitting the last
+   window of data similarly to the regular TCP. Additionally, if a
+   spurious RTO occurs during fast recovery, the F-RTO algorithm may
+   cause unnecessary retransmissions just like the regular RTO recovery.
+   However, we consider these cases relatively rare, and note that in
+   cases where F-RTO fails to avoid the unnecessary retransmissions, it
+   performs similarly to the regular RTO recovery.
+
+
+3.  A SACK-enhanced version of the F-RTO algorithm
+
+   We briefly describe an SACK-enhanced version of the F-RTO algorithm
+   for improving the performance in cases where a packet loss or a
+   similar event following the spurious RTO causes a wrong action by the
+   F-RTO algorithm, as described above. DCLOR is a related TCP
+   enhancement that uses SACK option for avoiding unnecessary
+   retransmissions after a spurious RTO [SL02]. However, DCLOR is
+   different to F-RTO in that it resets the congestion window to one
+   segment after spurious RTO, and stops transmitting new segments until
+   the TCP pipe is empty.
+
+   The difference to the basic F-RTO algorithm is, that the sender may
+   continue sending new data even when duplicate ACKs follow the RTO, if
+   the SACK blocks indicate that original, non-retransmitted data
+   arrives to the receiver after the RTO.
+
+   The SACK enhancement changes the F-RTO algorithm steps 1-3 as
+   follows. The undescribed details remain as in the basic version of
+   the F-RTO algorithm:
+
+   1) When RTO expires, retransmit first unacknowledged segment.
+
+   2) The first acknowledgement after RTO arrives at the sender.
+
+      a) if the ACK acknowledges all segments up to "send_high" stored
+         in algorithm step 1, the TCP sender SHOULD revert to the
+
+
+
+Expires: May 2003                                               [Page 7]
+
+draft-sarolahti-tsvwg-tcp-frto-02.txt                      November 2002
+
+
+         conventional RTO recovery and it MUST set congestion window to
+         no more than 2 * MSS. The sender does not enter step 3 of this
+         algorithm.
+
+      b) otherwise, the TCP sender MAY transmit two new segments. If the
+         TCP sender does not transmit any previously unsent data, it
+         MUST NOT enter step 3 of this algorithm, but revert to the
+         conventional recovery.
+
+   3) The second acknowledgement after RTO arrives at the sender.
+
+      a) if the ACK acknowledges data above send_high, either in SACK
+         blocks or as a cumulative ACK, the sender MUST set congestion
+         window to no more than 3 * MSS and proceed with slow start,
+         retransmitting unacknowledged segments. The sender MUST take
+         this branch also when the acknowledgement is a duplicate ACK
+         and it does not contain any SACK blocks.
+
+         Getting acknowledgements for segments transmitted in step 2
+         indicates that the RTO was not spurious, and actions similar to
+         the conventional TCP are required.
+
+      b) if the ACK does not acknowledge data above send_high, the TCP
+         sender SHOULD continue transmitting new data as if the RTO
+         didn't occur. If there are unacknowledged holes between the
+         SACK blocks, those segments SHOULD be retransmitted similarly
+         to the conventional SACK recovery algorithm.
+
+   As with the basic version of the F-RTO algorithm, in step (2b) the
+   sender may transmit only one segment if the receiver window does not
+   allow more, or there are no more application data.
+
+
+4.  On using the TCP timestamps with F-RTO
+
+   The F-RTO sender can avoid the need of transmitting new previously
+   unsent segments after RTO, if it has TCP timestamps available. The
+   Eifel detection algorithm [LK00] describes how the TCP timestamps can
+   be used to avoid unnecessary retransmissions after a spurious RTO.
+   However, if the RTO is declared spurious based on the timestamp
+   echoed with the first acceptable ACK following the RTO, the TCP
+   sender may falsely declare the RTO spurious and continue by
+   transmitting new data when the RTO was caused by loss of both data
+   segments and acknowledgements. The Eifel algorithm signals spurious
+   RTO falsely, if the first data segment retransmitted after RTO was
+   not lost, but the corresponding acknowledgement was.
+
+   An alternative algorithm for detecting spurious RTOs by using TCP
+
+
+
+Expires: May 2003                                               [Page 8]
+
+draft-sarolahti-tsvwg-tcp-frto-02.txt                      November 2002
+
+
+   timestamps is described below to avoid the false spurious RTO signals
+   after lost ACKs. When timestamps are used, the F-RTO algorithm MAY be
+   modified as follows. The undescribed details remain as in the basic
+   version of the F-RTO algorithm.
+
+   1) When RTO expires, retransmit first unacknowledged segment and
+      store the timestamp of retransmitted segment in variable
+      "RetransmitTS".
+
+   2) Wait until the first ACK that acknowledges previously
+      unacknowledged data arrives at the sender.
+
+      a) if the timestamp echoed with the ACK is later or equal than
+         what is stored in "RetransmitTS", the TCP sender SHOULD revert
+         to the conventional RTO recovery. The TCP sender MUST set the
+         congestion window to no more than 1 * MSS. However, if the
+         acknowledgement advances the window, the congestion window MAY
+         be increased similarly to the conventional RTO recovery
+         algorithm.
+
+      b) if the timestamp echoed with the first ACK is earlier than what
+         is stored in "RetransmitTS", the TCP sender SHOULD transmit the
+         first unacknowledged segment. The congestion control parameters
+         are set as in the basic version of the F-RTO algorithm.
+
+   3) Wait until the second ACK that acknowledges previously
+      unacknowledged data after RTO arrives at the sender.
+
+      a) if the timestamp echoed with the ACK is later or equal than
+         what is stored in "RetransmitTS", the TCP sender SHOULD revert
+         to the conventional RTO recovery. The TCP sender MUST set the
+         congestion window to no more than 3 * MSS, because two round-
+         trips have passed after the RTO.
+
+      b) if the timestamp echoed with the ACK is earlier than what is
+         stored in "RetransmitTS", the TCP sender SHOULD continue by
+         sending new data or in the fast recovery, depending on what it
+         was doing before the RTO.
+
+   The drawback of this algorithm compared to Eifel detection is that
+   the above-presented algorithm makes two possibly unnecessary
+   retransmissions instead of one.  Therefore, it may be desirable to
+   apply the basic F-RTO algorithm whenever the sender is able to
+   transmit unsent segments in step 2. However, we believe the algorithm
+   above effectively avoids false spurious RTO signals.
+
+
+
+
+
+
+Expires: May 2003                                               [Page 9]
+
+draft-sarolahti-tsvwg-tcp-frto-02.txt                      November 2002
+
+
+5.  Scenarios
+
+   We now discuss different scenarios where RTOs occur and discuss how
+   the basic F-RTO algorithm performs in those scenarios. The
+   interesting scenarios are a sudden delay triggering RTO, loss of a
+   retransmitted packet during fast recovery, link outage causing the
+   loss of several packets, and packet reordering. A performance
+   evaluation with a more thorough analysis on a real implementation of
+   F-RTO is given in [SKR02].
+
+
+5.1.  Sudden delay
+
+   An unexpectedly long delay can trigger an RTO, should it occur on a
+   single packet blocking the following packets, or appear as increased
+   RTTs for several successive packets. The example below illustrates
+   the sequence of packets and acknowledgements seen by the TCP sender
+   that follows the F-RTO algorithm, when a sudden delay occurs
+   triggering RTO but no packets are lost. For simplicity, delayed
+   acknowledgements are not used in the example.
+
+         ...                (cwnd = 6, ssthresh < 6, FlightSize = 5)
+         1.  SEND(10)
+         2.  ACK(6)
+         3.  SEND(11)
+         4.  <delay + RTO>  (set ssthresh <- 3)
+         5.  SEND(6)
+         6.  ACK(7)
+         7.  SEND(12)
+         8.  SEND(13)
+         9.  ACK(8)         (set cwnd <- 3, FlightSize = 6)
+         10. ACK(9)         (cwnd = 3,  FlightSize = 5)
+         11. ACK(10)        (cwnd = 3,  FlightSize = 4)
+         12. ACK(11)        (cwnd = 4,  FlightSize = 3)
+         13. SEND(14)
+         ...
+
+   When a sudden delay long enough to trigger RTO occurs at step 4, the
+   TCP sender retransmits the first unacknowledged segment (step 5).
+   Because the next ACK advances the cumulative ACK point, the TCP
+   sender continues by sending two new data segments (steps 7, 8) and
+   adjusts cwnd to 3 MSS. Because the second acknowledgement arriving
+   after the RTO also advances the cumulative ACK point, the TCP sender
+   exits the recovery and continues with the congestion avoidance. From
+   this point on the retransmissions are invoked either by fast
+   retransmit or when triggered by the retransmission timer. Because the
+   TCP sender reduces cwnd when receiving the first ACK after RTO and
+   sends the two new data segments at steps 7 and 8, it has to wait
+
+
+
+Expires: May 2003                                              [Page 10]
+
+draft-sarolahti-tsvwg-tcp-frto-02.txt                      November 2002
+
+
+   until the FlightSize is reduced to the level of congestion window
+   before it can continue transmitting again at step 13.
+
+
+5.2.  Loss of a retransmission
+
+   If a retransmitted segment is lost, the only way to retransmit it
+   again is to wait for the RTO to trigger the retransmission. Once the
+   segment is successfully received, the receiver usually acknowledges
+   several segments cumulatively. The example below shows a scenario
+   where retransmission (of segment 6) is lost, as well as a later
+   segment (segment 9) in the same window. The limited transmit [ABF01]
+   or SACK TCP [MMFR96] enhancements are not in use in this example.
+
+         ...                (cwnd = 6, ssthresh < 6, FlightSize = 5)
+             <segment 6 lost>
+         1.  SEND(10)
+         2.  ACK(6)
+         3.  SEND(11)
+         4.  ACK(6)
+         5.  ACK(6)
+         6.  ACK(6)
+         7.  SEND(6)        (set cwnd <- 6, set ssthresh <- 3)
+             <segment 6 lost>
+         8.  ACK(6)
+         9.  <RTO>          (set ssthresh <- 2)
+         10. SEND(6)
+         11. ACK(9)
+         12. SEND(12)
+         13. SEND(13)
+         14. ACK(9)         (set cwnd <- 3)
+         15. SEND(9)
+         16. SEND(10)
+         17. SEND(11)
+         18. ACK(11)
+         ...
+
+   In the example above, segment 6 is lost and the sender retransmits it
+   after three duplicate ACKs in step 7. However, the retransmission is
+   also lost, and the sender has to wait for the RTO to expire before
+   retransmitting it again. Because the first ACK following the RTO
+   advances the cumulative ACK point (step 11), the sender transmits two
+   new segments. The second ACK in step 14 does not advance the
+   cumulative ACK point, and the sender enters the slow start, sets cwnd
+   to 3 * MSS, and retransmits the next three unacknowledged segments,
+   as per the F-RTO algorithm description given in Section 2. After this
+   the receiver acknowledges all segments transmitted prior to entering
+   recovery and the sender can continue transmitting new data in
+
+
+
+Expires: May 2003                                              [Page 11]
+
+draft-sarolahti-tsvwg-tcp-frto-02.txt                      November 2002
+
+
+   congestion avoidance.
+
+
+5.3.  Link outage
+
+   A performance study shows that F-RTO performs similarly to the
+   regular recovery when consecutive packets are lost both up- and
+   downstream as a result of link outage, triggering a RTO [SKR02].  If
+   there was no delay spike, one of the next two ACKs after RTO does not
+   advance the cumulative ACK point when RTO was caused by data loss,
+   because the basic F-RTO retransmits only one segment after RTO. As a
+   result, F-RTO sender continues by retransmitting unacknowledged
+   segments similarly to the conventional RTO recovery.
+
+
+5.4.  Packet reordering
+
+   Since F-RTO modifies the TCP sender behavior only after a
+   retransmission timeout, we limit the discussion on the effects of
+   packet reordering in F-RTO behavior to the cases where packet
+   reordering occurs immediately after RTO. We consider the
+   retransmission timeout due to packet reordering to be very rare case,
+   since reordering often triggers fast retransmit due to duplicate ACKs
+   caused by out-of-order segments. Should packet reordering occur after
+   a RTO, duplicate ACKs arrive to the sender, taking the F-RTO
+   algorithm to retransmit in slow start as a regular RTO recovery would
+   do. Although this might not be the correct action, it is similar to
+   the behavior of the regular TCP, making F-RTO a safe modification
+   also in the presence of reordering.
+
+
+6.  Adjusting the Congestion Control State after Spurious RTO
+
+   The related work on improving the TCP performance on spurious
+   retransmission timeouts suggests that the congestion control state
+   would be reverted to the situation preceding the spurious timeout.
+   The justification for this is that since there are no packets
+   actually lost, the congestion window should not be reduced.  However,
+   the recovery algorithms that react immediately after RTO, such as the
+   F-RTO algorithm and Eifel algorithm, cannot detect the loss of the
+   spurious retransmission. Although the probability of such packet loss
+   is relatively small, we recommend that the congestion window would be
+   halved in order to avoid the risk of a congestion control violation.
+   By using the DSACK [FMMP00] option, the TCP sender can reliably
+   detect whether the retransmission was unnecessary.
+
+   An additional consideration related to congestion window adjustment
+   is whether a spurious RTO caused by a delay spike or a similar event
+
+
+
+Expires: May 2003                                              [Page 12]
+
+draft-sarolahti-tsvwg-tcp-frto-02.txt                      November 2002
+
+
+   should be taken as a minor congestion signal, even though no packets
+   were lost. During the delay outstanding packets will be queued up to
+   a network node before the delay point, thus increasing the congestion
+   level on that node and increasing the probability of a congestion
+   loss event later on. A retransmission timeout in general, even if
+   spurious, is a strong indication of some sort of disruption in the
+   network's ability to deliver packets to the destination in time.
+   Based on this discussion we consider reducing congestion window on
+   suspected spurious RTO to be a safer action than reverting it to the
+   level preceding the spurious RTO. However, we consider the exact
+   actions to be taken on the congestion control state after a spurious
+   RTO as a subject of further research.
+
+   When selective acknowledgements are available with the DSACK
+   enhancement, the TCP sender can employ the DSACK enhancement for
+   deciding when to revert the congestion control state. In the common
+   case, when the F-RTO algorithm is used, only the segment that
+   triggered the RTO is retransmitted if the RTO was spurious. Hence, if
+   the TCP sender gets a DSACK feedback indicating that the RTO
+   retransmission was unnecessary, it MAY revert the congestion control
+   parameters to the values preceding the RTO. If the F-RTO algorithm
+   results in retransmitting the last window of data, the sender must
+   get a DSACK acknowledgement for all retransmitted segments before
+   taking action on reverting the congestion control state.
+
+
+7.  Security Considerations
+
+   No additional security threats on TCP due to the F-RTO algorithm are
+   known.
+
+
+Acknowledgements
+
+   We are grateful to Reiner Ludwig, Andrei Gurtov, Josh Blanton, Mark
+   Allman, and Sally Floyd for the discussion and feedback contributed
+   to this text.
+
+
+References
+
+
+   [ABF01]   M. Allman, H. Balakrishnan, and S. Floyd. Enhancing TCP's
+             Loss Recovery Using Limited Transmit. RFC 3042, January
+             2001.
+
+   [APS99]   M. Allman, V. Paxson, and W. Stevens. TCP Congestion Con-
+             trol. RFC 2581, April 1999.
+
+
+
+Expires: May 2003                                              [Page 13]
+
+draft-sarolahti-tsvwg-tcp-frto-02.txt                      November 2002
+
+
+   [BA02]    E. Blanton and M. Allman. On Making TCP more Robust to
+             Packet Reordering. ACM Computer Communication Review,
+             32(1), January 2002.
+
+   [BBJ92]   D. Borman, R. Braden, and V. Jacobson. TCP Extensions for
+             High Performance. RFC 1323, May 1992.
+
+   [FH99]    S. Floyd and T. Henderson. The NewReno Modification to
+             TCP's Fast Recovery Algorithm. RFC 2582, April 1999.
+
+   [FMMP00]  S. Floyd, J. Mahdavi, M. Mathis, and M. Podolsky. An Exten-
+             sion to the Selective Acknowledgement (SACK) Option to TCP.
+             RFC 2883, July 2000.
+
+   [GL02]    A. Gurtov and R. Ludwig. Evaluating the Eifel Algorithm for
+             TCP in a GPRS Network. In Proc. of European Wireless, Flo-
+             rence, Italy, February 2002
+
+   [LK00]    R. Ludwig and R.H. Katz. The Eifel Algorithm: Making TCP
+             Robust Against Spurious Retransmissions. ACM Computer Com-
+             munication Review, 30(1), January 2000.
+
+   [MMFR96]  M. Mathis, J. Mahdavi, S. Floyd, and A. Romanow. TCP Selec-
+             tive Acknowledgement Options. RFC 2018, October 1996.
+
+   [PA00]    V. Paxson and M. Allman. Computing TCP's Retransmission
+             Timer. RFC 2988, November 2000.
+
+   [Pos81]   J. Postel. Transmission Control Protocol. RFC 793, Septem-
+             ber 1981.
+
+   [SKR02]   P. Sarolahti, M. Kojo, and K. Raatikainen. F-RTO: A New
+             Recovery Algorithm for TCP Retransmission Timeouts. Univer-
+             sity of Helsinki, Dept. of Computer Science. Series of Pub-
+             lications C, No. C-2002-07. February 2002. Available at:
+             http://www.cs.helsinki.fi/research/iwtcp/papers/f-rto.ps
+
+   [SL02]    Y. Swami and K. Le. DCLOR: De-correlated Loss Recovery
+             using SACK option for spurious timeouts. Internet draft
+             "draft-swami-tsvwg-tcp-dclor-00.txt". November 2002. Work
+             in progress.
+
+
+Authors' Addresses
+
+   Pasi Sarolahti
+   Nokia Research Center
+   P.O. Box 407
+
+
+
+Expires: May 2003                                              [Page 14]
+
+draft-sarolahti-tsvwg-tcp-frto-02.txt                      November 2002
+
+
+   FIN-00045 NOKIA GROUP
+   Finland
+
+   Phone: +358 50 4876607
+   EMail: pasi.sarolahti@nokia.com
+   http://www.cs.helsinki.fi/u/sarolaht/
+
+
+   Markku Kojo
+   University of Helsinki
+   Department of Computer Science
+   P.O. Box 26
+   FIN-00014 UNIVERSITY OF HELSINKI
+   Finland
+
+   Phone: +358 9 1914 4179
+   EMail: markku.kojo@cs.helsinki.fi
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Expires: May 2003                                              [Page 15]
+

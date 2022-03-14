@@ -1,0 +1,952 @@
+
+
+
+Network Working Group                                      Henry Spencer
+Internet Draft                                                SP Systems
+Expires: 21 May 2002                                  D. Hugh Redelmeier
+                                                          Mimosa Systems
+                                                             21 Nov 2001
+
+                       IKE Implementation Issues
+            <draft-spencer-ipsec-ike-implementation-01.txt>
+
+Status of this Memo
+
+   This document is an Internet-Draft and is in full conformance with
+   all provisions of Section 10 of RFC2026.
+
+   If approved as an Informational RFC...  This memo provides
+   information for the Internet community.  This memo does not specify
+   an Internet standard of any kind.
+
+   Distribution of this memo is unlimited.
+
+   Internet-Drafts are working documents of the Internet Engineering
+   Task Force (IETF), its areas, and its working groups.  Note that
+   other groups may also distribute working documents as Internet-
+   Drafts.
+
+   Internet-Drafts are draft documents valid for a maximum of six months
+   and may be updated, replaced, or obsoleted by other documents at any
+   time.  It is inappropriate to use Internet-Drafts as reference
+   material or to cite them other than as "work in progress."
+
+   The list of current Internet-Drafts can be accessed at
+   http://www.ietf.org/ietf/1id-abstracts.txt.
+
+   The list of Internet-Draft Shadow Directories can be accessed at
+   http://www.ietf.org/shadow.html.
+
+   This Internet-Draft will expire on 21 May 2002.
+
+Copyright Notice
+
+   Copyright (C) The Internet Society 2001.  All Rights Reserved.
+
+
+
+
+
+
+
+
+
+
+Spencer & Redelmeier                                            [Page 1]
+
+Internet Draft          IKE Implementation Issues            21 Nov 2001
+
+
+Table of Contents
+
+   1. Introduction ................................................... 3
+   2. Lower-level Background and Notes ............................... 4
+   3. IKE Infrastructural Issues ..................................... 5
+   3.1. Continuous Channel ........................................... 5
+   3.2. Retransmission ............................................... 5
+   3.3. Replay Prevention ............................................ 6
+   4. Basic Keying and Rekeying ...................................... 7
+   4.1. When to Create SAs ........................................... 7
+   4.2. When to Rekey ................................................ 7
+   4.3. Choosing an SA ............................................... 8
+   4.4. Why to Rekey ................................................. 9
+   4.5. Rekeying ISAKMP SAs .......................................... 9
+   4.6. Bulk Negotiation ............................................. 9
+   5. Deletions, Teardowns, Crashes .................................. 9
+   5.1. Deletions ................................................... 10
+   5.2. Teardowns and Shutdowns ..................................... 10
+   5.3. Crashes ..................................................... 11
+   5.4. Unknown SAs ................................................. 12
+   6. Misc. IKE Issues .............................................. 13
+   6.1. Group 1 ..................................................... 13
+   6.2. To PFS Or Not To PFS ........................................ 13
+   6.3. Debugging Tools, Lack Thereof ............................... 13
+   6.4. Terminology, Vagueness Thereof .............................. 14
+   6.5. A Question of Identity ...................................... 14
+   6.6. Opportunistic Encryption .................................... 14
+   7. Security Considerations ....................................... 15
+   8. References .................................................... 15
+   Author's Addresses ............................................... 16
+   Full Copyright Statement ......................................... 17
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Spencer & Redelmeier                                            [Page 2]
+
+Internet Draft          IKE Implementation Issues            21 Nov 2001
+
+
+Abstract
+
+   The current IPsec specifications for key exchange and connection
+   management, RFCs 2408 [ISAKMP] and 2409 [IKE], leave many aspects of
+   connection management unspecified, most prominently rekeying
+   practices.  We can hope that future revisions of the specifications
+   will clear this up.  Meanwhile, it seems useful to set down some
+   successful experiences, to minimize the extent to which new
+   implementors have to rely on unwritten folklore.
+
+   The Linux FreeS/WAN implementation of IPsec interoperates with almost
+   every other IPsec implementation.  This document describes how the
+   FreeS/WAN project has resolved some of the gaps in the IPsec
+   specifications (and plans to resolve some others), and what
+   difficulties have been encountered, in hopes that this generally-
+   successful experience might be informative to new implementors.
+
+   This is offered as an Informational RFC.
+
+   This -01 revision mostly just fills in the gaps in the -00 draft.
+
+1. Introduction
+
+   The current IPsec specifications for key exchange and connection
+   management, RFCs 2408 [ISAKMP] and 2409 [IKE], leave many aspects of
+   connection management unspecified, most prominently rekeying
+   practices.  This is a cryptic puzzle which each group of implementors
+   has to struggle with, and differences in how the ambiguities and gaps
+   are resolved are potentially a fruitful source of interoperability
+   problems.  We can hope that future revisions of the specifications
+   will clear this up.  Meanwhile, it seems useful to set down some
+   successful experiences, to minimize the extent to which new
+   implementors have to rely on unwritten folklore.
+
+   The Linux FreeS/WAN implementation of IPsec interoperates with almost
+   every other IPsec implementation, and because of its free nature, it
+   also sees some use as a reference implementation by other
+   implementors.  The high degree of interoperability is noteworthy
+   given its organizers' strong minimalist bias, which has caused them
+   to implement only a small subset of the full glory of IPsec.  This
+   document describes how the FreeS/WAN project has resolved some of the
+   gaps in the IPsec specifications (and plans to resolve some others),
+   and what difficulties have been encountered, in hopes that this
+   generally-successful experience might be informative to new
+   implementors.
+
+   One small caution about applicability: this experience may not be
+   relevant to severely resource-constrained implementations.
+
+
+
+Spencer & Redelmeier                                            [Page 3]
+
+Internet Draft          IKE Implementation Issues            21 Nov 2001
+
+
+   FreeS/WAN's target environment is previous-generation PCs, now
+   available at trivial cost (often, within an organization, at no
+   cost), which have quite impressive CPU power and memory by the
+   standards of only a few years ago.  Some of the approaches discussed
+   here may be inapplicable to implementations with severe external
+   constraints which prevent them from taking advantage of modern
+   hardware technology.
+
+2. Lower-level Background and Notes
+
+   FreeS/WAN implements ESP [ESP] and AH [AH] straightforwardly,
+   although AH sees little use among our users.  Our ESP/AH
+   implementation cannot currently handle packets with IP options;
+   somewhat surprisingly, this has caused little difficulty.  We insist
+   on encryption and do not support authentication-only connections, and
+   this has not caused significant difficulty either.
+
+   MTU and fragmentation issues, by contrast, have been a constant
+   headache.  We will not describe the details of our current approach
+   to them, because it still needs work.  One difficulty we have
+   encountered is that many combinations of packet source and packet
+   destination apparently cannot cope with an "interior minimum" in the
+   path MTU, e.g. where an IPsec tunnel intervenes and its headers
+   reduce the MTU for an intermediate link.  This is particularly
+   prevalent when using common PC software to connect to large well-
+   known web sites; we think it is largely due to misconfigured
+   firewalls which do not pass ICMP Fragmentation Required messages.
+   The only solution we have yet found is to lie about the MTU of the
+   tunnel, accepting the (undesirable) fragmentation of the ESP packets
+   for the sake of preserving connectivity.
+
+   We currently zero out the TOS field of ESP packets, rather than
+   copying it from the inner header, on the grounds that it lends itself
+   too well to traffic analysis and covert channels.  We provide an
+   option to restore RFC 2401 [IPSEC] copying behavior, but this appears
+   to see little use.
+
+   We initially implemented both DES [DES] and 3DES [CIPHERS] for both
+   IKE and ESP, but after the Deep Crack effort [CRACK] demonstrated its
+   inherent insecurity, we dropped support for DES.  Somewhat
+   surprisingly, our insistence on 3DES has caused almost no
+   interoperability problems, despite DES being officially mandatory.  A
+   very few other systems either do not support 3DES or support it only
+   as an optional upgrade, which inconveniences a few would-be users.
+   There have also been one or two cases of systems which don't quite
+   seem to know the difference!
+
+
+
+
+
+Spencer & Redelmeier                                            [Page 4]
+
+Internet Draft          IKE Implementation Issues            21 Nov 2001
+
+
+   See also section 6.1 for a consequence of our insistence on 3DES.
+
+   We currently employ PF_KEY version 2 [PFKEY], plus various non-
+   standard extensions, as our interface between keying and ESP.  This
+   has not proven entirely satisfactory.  Our feeling now is that keying
+   issues and policy issues do not really lend themselves to the clean
+   separation that PF_KEY envisions.
+
+3. IKE Infrastructural Issues
+
+   A number of problems in IPsec connection management become easier if
+   some attention is first paid to providing an infrastructure to
+   support solving them.
+
+3.1. Continuous Channel
+
+   FreeS/WAN uses an approximation to the "continuous channel" model, in
+   which ISAKMP SAs are maintained between IKEs so long as any IPsec SAs
+   are open between the two systems.  The resource consumption of this
+   is minor: the only substantial overhead is occasional rekeying.
+   IPsec SA management becomes significantly simpler if there is always
+   a channel for transmission of control messages.  We suggest (although
+   we do not yet fully implement this) that inability to maintain (e.g.,
+   to rekey) this control path should be grounds for tearing down the
+   IPsec SAs as well.
+
+3.2. Retransmission
+
+   The unreliable nature of UDP transmission is a nuisance.  IKE
+   implementations should always be prepared to retransmit the most
+   recent message they sent on an ISAKMP SA, since there is some
+   possibility that the other end did not get it.  This means, in
+   particular, that the system sending the supposedly-last message of an
+   exchange cannot relax and assume that the exchange is complete, at
+   least not until a significant timeout has elapsed.
+
+   Systems must also retain information about the message most recently
+   received in an exchange, so that a duplicate of it can be detected
+   (and possibly interpreted as a NACK for the response).
+
+   The retransmission rules FreeS/WAN follows are: (1) if a reply is
+   expected, retransmit only if it does not appear before a timeout; and
+   (2) if a reply is not expected (last message of the exchange),
+   retransmit only on receiving a retransmission of the previous
+   message.  Notably, in case (1) we do NOT retransmit on receiving a
+   retransmission, which avoids possible congestion problems arising
+   from packet duplication, at the price of slowing response to packet
+   loss.  The timeout for case (1) is 10 seconds for the first retry, 20
+
+
+
+Spencer & Redelmeier                                            [Page 5]
+
+Internet Draft          IKE Implementation Issues            21 Nov 2001
+
+
+   seconds for the second, and 40 seconds for all subsequent retries
+   (normally only one, except when configuration settings call for
+   persistence and the message is the first message of Main Mode with a
+   new peer).  These retransmission rules have been entirely successful.
+
+   (Michael Thomas of Cisco has pointed out that the retry timeouts
+   should include some random jitter, to de-synchronize hosts which are
+   initially synchronized by, e.g., a power outage.  We already jitter
+   our rekeying times, as noted in section 4.2, but that does not help
+   with initial startup.  We're implementing jittered retries, but
+   cannot yet report on experience with this.)
+
+   There is a deeper problem, of course, when an entire "exchange"
+   consists of a single message, e.g. the ISAKMP Informational Exchange.
+   Then there is no way to decide whether or when a retransmission is
+   warranted at all.  This seems like poor design, to put it mildly (and
+   there is now talk of fixing it).  We have no experience in dealing
+   with this problem at this time, although it is part of the reason why
+   we have delayed implementing Notification messages.
+
+3.3. Replay Prevention
+
+   The unsequenced nature of UDP transmission is also troublesome,
+   because it means that higher levels must consider the possibility of
+   replay attacks.  FreeS/WAN takes the position that systematically
+   eliminating this possibility at a low level is strongly preferable to
+   forcing careful consideration of possible impacts at every step of an
+   exchange.  RFC 2408 [ISAKMP] section 3.1 states that the Message ID
+   of an ISAKMP message must be "unique".  FreeS/WAN interprets this
+   literally, as forbidding duplication of Message IDs within the set of
+   all messages sent via a single ISAKMP SA.
+
+   This requires remembering all Message IDs until the ISAKMP SA is
+   superseded by rekeying, but that is not costly (four bytes per sent
+   or received message), and it ELIMINATES replay attacks from
+   consideration; we believe this investment of resources is well
+   worthwhile.  If the resource consumption becomes excessive--in our
+   experience it has not--the ISAKMP SA can be rekeyed early to collect
+   the garbage.
+
+   There is theoretically an interoperability problem when talking to
+   implementations which interpret "unique" more loosely and may re-use
+   Message IDs, but it has not been encountered in practice.  This
+   approach appears to be completely interoperable.
+
+   The proposal by Andrew Krywaniuk [REPLAY], which advocates turning
+   the Message ID into an anti-replay counter, would achieve the same
+   goal without the minor per-message memory overhead.  This may be
+
+
+
+Spencer & Redelmeier                                            [Page 6]
+
+Internet Draft          IKE Implementation Issues            21 Nov 2001
+
+
+   preferable, although it means an actual protocol change and more
+   study is needed.
+
+4. Basic Keying and Rekeying
+
+4.1. When to Create SAs
+
+   As Tim Jenkins [REKEY] pointed out, there is a potential race
+   condition in Quick Mode: a fast lightly-loaded Initiator might start
+   using IPsec SAs very shortly after sending QM3 (the third and last
+   message of Quick Mode), while a slow heavily-loaded Responder might
+   not be ready to receive them until after spending a significant
+   amount of time creating its inbound SAs.  The problem is even worse
+   if QM3 gets delayed or lost.
+
+   FreeS/WAN's approach to this is what Jenkins called "Responder Pre-
+   Setup": the Responder creates its inbound IPsec SAs before it sends
+   QM2, so they are always ready and waiting when the Initiator sends
+   QM3 and begins sending traffic.  This approach is simple and
+   reliable, and in our experience it interoperates with everybody.
+   (There is potentially still a problem if FreeS/WAN is the Initiator
+   and the Responder does not use Responder Pre-Setup, but no such
+   problems have been seen.)  The only real weakness of Responder Pre-
+   Setup is the possibility of replay attacks, which we have eliminated
+   by other means (see section 3.3).
+
+   With this approach, the Commit Bit is useless, and we ignore it.  In
+   fact, until quite recently we discarded any IKE message containing
+   it, and this caused surprisingly few interoperability problems;
+   apparently it is not widely used.  We have recently been persuaded
+   that simply ignoring it is preferable; preliminary experience with
+   this indicates that the result is successful interoperation with
+   implementations which set it.
+
+4.2. When to Rekey
+
+   To preserve connectivity for user traffic, rekeying of a connection
+   (that is, creation of new IPsec SAs to supersede the current ones)
+   must begin before its current IPsec SAs expire.  Preferably one end
+   should predictably start rekeying negotiations first, to avoid the
+   extra overhead of two simultaneous negotiations, although either end
+   should be prepared to rekey if the other does not.  There is also a
+   problem with "convoys" of keying negotiations: for example, a "hub"
+   gateway with many IPsec connections can be inundated with rekeying
+   negotiations exactly one connection-expiry time after it reboots, and
+   the massive overload this induces tends to make this situation self-
+   perpetuating, so it recurs regularly.  (Convoys can also evolve
+   gradually from initially-unsynchronized negotiations.)
+
+
+
+Spencer & Redelmeier                                            [Page 7]
+
+Internet Draft          IKE Implementation Issues            21 Nov 2001
+
+
+   FreeS/WAN has the concept of a "rekeying margin", measured in
+   seconds.  If FreeS/WAN was the Initiator for the previous rekeying
+   (or the startup, if none) of the connection, it nominally starts
+   rekeying negotiations at expiry time minus one rekeying margin.  Some
+   random jitter is added to break up convoys: rather than starting
+   rekeying exactly at minus one margin, it starts at a random time
+   between minus one margin and minus two margins.
+
+   If FreeS/WAN was the Responder for the previous rekeying/startup, and
+   nothing has been heard from the previous Initiator at expiry time
+   minus one-half the rekeying margin, FreeS/WAN will initiate rekeying
+   negotiations.  No jitter is applied (perhaps it should be).
+
+   Having the Initiator lead the way is an obvious way of deciding who
+   should speak first, since there is already an Initiator/Responder
+   asymmetry in the connection.  Moreover, our experience has been that
+   Initiator lead gives a significantly higher probability of successful
+   negotiation!  The negotiation process itself is asymmetric, because
+   the Initiator must make a few specific proposals which the Responder
+   can only accept or reject, so the Initiator must try to guess where
+   its "acceptable" region (in parameter space) might overlap with the
+   Responder's.  We have seen situations where negotiations would
+   succeed or fail depending on which end initiated them, because one
+   end was making better guesses.  Given an existing connection, we KNOW
+   that the previous Initiator WAS able to initiate a successful
+   negotiation, so it should (if at all possible) take the lead again.
+
+   FreeS/WAN defaults the rekeying margin to 9 minutes, although this
+   can be changed by configuration.  There is also a configuration
+   option to adjust the permissible range of jitter.  The defaults were
+   chosen somewhat arbitrarily, but they work extremely well and the
+   configuration options are rarely used.
+
+4.3. Choosing an SA
+
+   Once rekeying has occurred, both old and new IPsec SAs for the
+   connection exist, at least momentarily.  FreeS/WAN accepts incoming
+   traffic on either old or new inbound SAs, but sends outgoing traffic
+   only on the new outbound ones.  This approach appears to be
+   significantly more robust than using the old ones until they expire,
+   notably in cases where renegotiation has occurred because something
+   has gone wrong on the other end.  It avoids having to pay meticulous
+   attention to the state of the other end, state which is difficult to
+   learn reliably given the limitations of IKE.
+
+   This approach has interoperated successfully with ALMOST all other
+   implementations.  The only (well-characterized) problem cases have
+   been implementations which rely on receiving a Delete message for the
+
+
+
+Spencer & Redelmeier                                            [Page 8]
+
+Internet Draft          IKE Implementation Issues            21 Nov 2001
+
+
+   old SAs to tell them to switch over to the new ones.  Since delivery
+   of Delete is unreliable, and support for Delete is optional, this
+   reliance seems like a serious mistake.  This is all the more true
+   because Delete announces that the deletion has already occurred
+   [ISAKMP, section 3.15], not that it is about to occur, so packets
+   already in transit in the other direction could be lost.  Delete
+   should be used for resource cleanup, not for switchover control.
+   (These matters are discussed further in section 5.)
+
+4.4. Why to Rekey
+
+   FreeS/WAN currently implements only time-based expiry (life in
+   seconds), although we are working toward supporting volume-based
+   expiry (life in kilobytes) as well.  The lack of volume-based expiry
+   has not been an interoperability problem so far.
+
+   Volume-based expiry does add some minor complications.  In
+   particular, it makes explicit Delete of now-disused SAs more
+   important, because once an SA stops being used, it might not expire
+   on its own.  We believe this lacks robustness and is generally
+   unwise, and expect to use volume-based expiry only as a supplement to
+   time-based expiry.  However, Delete support (see section 5) does seem
+   advisable for use with volume-based expiry.
+
+   We do not believe that volume-based expiry alters the desirability of
+   switching immediately to the new SAs after rekeying.  Rekeying
+   margins are normally a small fraction of the total life of an SA, so
+   we feel there is no great need to "use it all up".
+
+4.5. Rekeying ISAKMP SAs
+
+   The above discussion has focused on rekeying for IPsec SAs, but
+   FreeS/WAN applies the same approaches to rekeying for ISAKMP SAs,
+   with similar success.
+
+4.6. Bulk Negotiation
+
+   Quick Mode nominally provides for negotiating possibly-large numbers
+   of similar but unrelated IPsec SAs simultaneously [IKE, section 9].
+   Nobody appears to do this.  FreeS/WAN does not support it, and its
+   absence has caused no problems.
+
+5. Deletions, Teardowns, Crashes
+
+   FreeS/WAN currently ignores all Notifications and Deletes, and never
+   generates them.  This has caused little difficulty in
+   interoperability, which shouldn't be surprising (since Notification
+   and Delete support is officially entirely optional) but does seem to
+
+
+
+Spencer & Redelmeier                                            [Page 9]
+
+Internet Draft          IKE Implementation Issues            21 Nov 2001
+
+
+   surprise some people.  Nevertheless, we do plan some changes to this
+   approach based on past experience.
+
+5.1. Deletions
+
+   As hinted at above, we plan to implement Delete support.  Shortly
+   after rekeying, the Responder will issue a Delete for its old inbound
+   SAs.  The Responder initiates this because the Initiator started
+   using the new SAs on sending QM3, while the Responder started using
+   them only on receiving QM3, so there is less chance of old-SA packets
+   still being in transit from the Initiator.  The Initiator will issue
+   a Delete only if it does not hear one from the Responder after a
+   longer delay.
+
+   Either party, on receiving a Delete for the old outbound SAs of a
+   connection, will respond with a Delete for the old inbound SAs.
+   Either party, on NOT receiving a Delete in response to a Delete it
+   sent, will re-send after a timeout (although only a few retries will
+   be attempted).
+
+   As noted in section 4.3, these Deletes are intended for resource
+   cleanup, not to control switching between SAs.  But we expect that
+   they will improve interoperability with some broken implementations.
+
+   We believe strongly that connections need to be considered as a
+   whole, rather than treating each SA as an independent entity.  We
+   will issue Deletes only for the full set of inbound SAs of a
+   connection, and will treat a Delete for any outbound SA as equivalent
+   to deletion of all the outbound SAs for the associated connection.
+
+5.2. Teardowns and Shutdowns
+
+   When a connection is not intended to be up permanently, there is a
+   need to coordinate teardown, so that both ends are aware that the
+   connection is down.  This is both for recovery of resources, and to
+   avoid routing packets through dangling SAs which can no longer
+   deliver them.
+
+   Connection teardown will use the same bidirectional exchange of
+   Deletes as discussed in section 5.1: a Delete received for current
+   SAs (not yet obsoleted by rekeying) indicates that the other host
+   wishes to tear down the associated connection.
+
+   When a host with current connections knows that it is about to shut
+   down, it will issue Deletes for all SAs involved, advising its peers
+   (as per the meaning of Delete [ISAKMP, section 3.15]) that the SAs
+   have become useless.  It will ignore attempts at rekeying or
+   connection startup thereafter, until it shuts down.
+
+
+
+Spencer & Redelmeier                                           [Page 10]
+
+Internet Draft          IKE Implementation Issues            21 Nov 2001
+
+
+   It would be better to have a Final-Contact notification, analogous to
+   Initial-Contact but indicating that no new negotiations should be
+   attempted until further notice.  Initial-Contact actually could be
+   used for this (!), but in networks where connections are intended to
+   exist permanently, it seems likely to provoke unwanted attempts to
+   renegotiate the lost connections.
+
+5.3. Crashes
+
+   Systems sometimes crash.  Coping with the resulting loss of
+   information is easily the most difficult problem we have found in
+   implementing robust IPsec systems.
+
+   When connections are intended to be permanent, it is simple to
+   specify renegotiation on reboot.  With our approach to SA selection
+   (see section 4.3), this handles such cases robustly and well.  We do
+   have to tell users that BOTH hosts should be set this way.  In cases
+   where crashes are synchronized (e.g. by power interruptions), this
+   may result in simultaneous negotiations at reboot.  We currently
+   allow both negotiations to proceed to completion, but our use-newest
+   selection method effectively ignores one connection or the other, and
+   when one of them rekeys, we notice that the new SAs replace those of
+   both old connections, and we then refrain from rekeying the other.
+   (This duplicate detection is desirable in any event, for robustness,
+   to ensure that the system converges on a reasonable state eventually
+   after it is perturbed by difficulties or bugs.)
+
+   When connections are not permanent, the situation is less happy.  One
+   particular situation in which we see problems is when a number of
+   "Road Warrior" hosts occasionally call in to a central server.  The
+   server is normally configured not to initiate such connections, since
+   it does not know when the Road Warrior is available (or what IP
+   address it is using).  Unfortunately, if the server crashes and
+   reboots, any Road Warriors then connected have a problem: they don't
+   know that the server has crashed, so they can't renegotiate, and the
+   server has forgotten both the connections and their (transient) IP
+   addresses, so it cannot renegotiate.  We believe that the simplest
+   answer to this problem is what John Denker has dubbed "address
+   inertia": the server makes a best-effort attempt to remember (in
+   nonvolatile storage) which connections were active and what the far-
+   end addresses were, so that it can attempt renegotiation on reboot.
+   We have not implemented this yet, but intend to; Denker has
+   implemented it himself, although in a somewhat messy way, and reports
+   excellent results.
+
+
+
+
+
+
+
+Spencer & Redelmeier                                           [Page 11]
+
+Internet Draft          IKE Implementation Issues            21 Nov 2001
+
+
+5.4. Unknown SAs
+
+   A more complete solution to crashes would be for an IPsec host to
+   note the arrival of ESP packets on an unknown IPsec SA, and report it
+   somehow to the other host, which can then decide to renegotiate.
+   This arguably might be preferable in any case--if the non-rebooted
+   host has no traffic to send, it does not care whether the connection
+   is intact--but delays and packet loss will be reduced if the
+   connection is renegotiated BEFORE there is traffic for it.  So
+   unknown-SA detection is best reserved as a fallback method, with
+   address inertia used to deal with most such cases.
+
+   A difficulty with unknown-SA detection is, just HOW should the other
+   host be notified?  IKE provides no good way to do the notification:
+   Notification payloads (e.g., Initial-Contact) are unauthenticated
+   unless they are sent under protection of an ISAKMP SA.  A "Security
+   Failures - Bad SPI" ICMP message [SECFAIL] is an interesting
+   alternative, but has the disadvantage of likewise being
+   unauthenticated.  It's fundamentally unlikely that there is a simple
+   solution to this, given that almost any way of arranging or checking
+   authentication for such a notification is costly.
+
+   We think the best answer to this is a two-step approach.  An
+   unauthenticated Initial-Contact or Security Failures - Bad SPI cannot
+   be taken as a reliable report of a problem, but can be taken as a
+   hint that a problem MIGHT exist.  There needs to be some reliable way
+   of checking such hints, subject to rate limiting since the checks are
+   likely to be costly (and checking the same connection repeatedly at
+   short intervals is unlikely to be worthwhile anyway).  Then the
+   rebooted host sends the notification, and the non-rebooted host--
+   which still thinks it has a connection--checks whether the connection
+   still works, and renegotiates if not.
+
+   We have not yet decided what form the notification should take.  IKE
+   Initial-Contact is an obvious possibility, but has some
+   disadvantages.  It does not specify which connection has had
+   difficulties.  Also, the specification [IKE section 4.6.3.3] refers
+   to "remote system" and "sending system" without clearly specifying
+   just what those terms mean; in the case of a multi-homed host using
+   multiple forms of identification, the question is not trivial.
+   Initial-Contact does have the fairly-decisive advantage that it is
+   likely to convey the right general meaning even to an implementation
+   which does not do things exactly the way ours does.
+
+   A more fundamental difficulty is what form the reliable check takes.
+   What is wanted is an "IKE ping", verifying that the ISAKMP SA is
+   still intact (it being unlikely that IPsec SAs have been lost while
+   the ISAKMP SA has not).  The lack of such a facility is a serious
+
+
+
+Spencer & Redelmeier                                           [Page 12]
+
+Internet Draft          IKE Implementation Issues            21 Nov 2001
+
+
+   failing of IKE.  An acknowledged Notification of some sort would be
+   ideal, but there is none at present.  Some existing implementations
+   are known to use the private Notification values 30000 as ping and
+   30002 as ping reply, and that seems the most attractive choice at
+   present.  If it is not recognized, there will probably be no reply,
+   and the result will be an unnecessary renegotiation, so this needs
+   strict rate limiting.
+
+   While we think this facility is desirable, and is about the best that
+   can be done with the poor tools available, we have not gotten very
+   far in implementation and cannot comment intelligently about how well
+   it works or interoperates.
+
+6. Misc. IKE Issues
+
+6.1. Group 1
+
+   We have dropped support for the first Oakley Group (group 1), despite
+   it being officially mandatory, on the grounds that it is grossly too
+   weak to provide enough randomness for 3DES.  There have been some
+   interoperability problems, mostly quite minor: ALMOST everyone
+   supports group 2 as well, although sometimes it has to be explicitly
+   configured.
+
+   We also support the quasi-standard group 5 [GROUPS].  This has not
+   been seriously exercised yet, because at the moment we offer group 2
+   first and almost everyone accepts it.  We plan to change to offering
+   group 5 first.
+
+6.2. To PFS Or Not To PFS
+
+   A persistent small interoperability problem is that the presence or
+   absence of PFS (for keys) is neither negotiated nor announced.  We
+   have it enabled by default, and successful interoperation often
+   requires having the other end turn it on in their implementation, or
+   having the FreeS/WAN end disable it.  Almost everyone supports it,
+   but it's usually not the default, and interoperability is often
+   impossible unless the two ends somehow reach prior agreement on it.
+
+   We do not explicitly support the other flavor of PFS, for identities,
+   and this has caused no interoperability problems.
+
+6.3. Debugging Tools, Lack Thereof
+
+   We find IKE lacking in basic debugging tools.  Section 5.4, above,
+   notes that an IKE ping would be useful for connectivity verification.
+   It would also be extremely helpful for determining that UDP/500
+   packets get back and forth successfully between the two ends, which
+
+
+
+Spencer & Redelmeier                                           [Page 13]
+
+Internet Draft          IKE Implementation Issues            21 Nov 2001
+
+
+   is often an important first step in debugging.
+
+   It's also quite common to have IKE negotiate a connection
+   successfully, but to have some firewall along the way blocking ESP,
+   and users find this mysterious and difficult to diagnose.  We have no
+   immediate suggestions on what could be done about it.
+
+6.4. Terminology, Vagueness Thereof
+
+   The terminology of IPsec needs work.  We feel that both the
+   specifications and more-user-oriented documentation would be greatly
+   clarified by concise, intelligible names for certain concepts.
+
+   We semi-consistently use "group" for the set of IPsec SAs which are
+   established in one direction by a single Quick Mode negotiation and
+   are used together to process a packet (e.g., an ESP SA plus an AH
+   SA), "connection" for the logical packet path provided by a
+   succession of pairs of groups (each rekeying providing a new pair,
+   one group in each direction), and "keying channel" for the
+   corresponding supervisory path provided by a sequence of ISAKMP SAs.
+
+   We think it's a botch that "PFS" refers to two very different things,
+   but we have no specific new terms to suggest, since we only implement
+   one kind of PFS and thus can just ignore the other.
+
+6.5. A Question of Identity
+
+   One specification problem deserves note: exactly when can an existing
+   phase 1 negotiation be re-used for a new phase 2 negotiation, as IKE
+   [IKE, section 4] specifies?  Presumably, when it connects the same
+   two "parties"... but exactly what is a "party"?
+
+   As noted in section 5.4, in cases involving multi-homing and multiple
+   identities, it's not clear exactly what criteria are used for
+   deciding whether the intended far end for a new negotiation is the
+   same one as for a previous negotiation.  Is it by Identification
+   Payload?  By IP address?  Or what?
+
+   We currently use a somewhat-vague notion of "identity", basically
+   what gets sent in Identification Payloads, for this, and this seems
+   to be successful, but we think this needs better specification.
+
+6.6. Opportunistic Encryption
+
+   Further IKE challenges appear in the context of Opportunistic
+   Encryption [OE], but operational experience with it is too limited as
+   yet for us to comment usefully right now.
+
+
+
+
+Spencer & Redelmeier                                           [Page 14]
+
+Internet Draft          IKE Implementation Issues            21 Nov 2001
+
+
+7. Security Considerations
+
+   Since this document discusses aspects of building robust and
+   interoperable IPsec implementations, security considerations permeate
+   it.
+
+8. References
+
+   [AH]     Kent, S., and Atkinson, R., "IP Authentication Header", RFC
+            2402, Nov 1998.
+
+   [CIPHERS]
+            Pereira, R., and Adams, R., "The ESP CBC-Mode Cipher
+            Algorithms", RFC 2451, Nov 1998.
+
+   [CRACK]  Electronic Frontier Foundation, "Cracking DES: Secrets of
+            Encryption Research, Wiretap Politics and Chip Design",
+            O'Reilly 1998, ISBN 1-56592-520-3.
+
+   [DES]    Madson, C., and Doraswamy, N., "The ESP DES-CBC Cipher
+            Algorithm", RFC 2405, Nov 1998.
+
+   [ESP]    Kent, S., and Atkinson, R., "IP Encapsulating Security
+            Payload (ESP)", RFC 2406, Nov 1998.
+
+   [GROUPS] Kivinen, T., and Kojo, M., "More MODP Diffie-Hellman groups
+            for IKE", <draft-ietf-ipsec-ike-modp-groups-02.txt>, 29 Aug
+            2001 (work in progress).
+
+   [IKE]    Harkins, D., and Carrel, D., "The Internet Key Exchange
+            (IKE)", RFC 2409, Nov 1998.
+
+   [IPSEC]  Kent, S., and Atkinson, R., "Security Architecture for the
+            Internet Protocol", RFC 2401, Nov 1998.
+
+   [ISAKMP] Maughan, D., Schertler, M., Schneider, M., and Turner, J.,
+            "Internet Security Association and Key Management Protocol
+            (ISAKMP)", RFC 2408, Nov 1998.
+
+   [OE]     Richardson, M., Redelmeier, D. H., and Spencer, H., "A
+            method for doing opportunistic encryption with IKE", <draft-
+            richardson-ipsec-opportunistic-03.txt>, Oct 2001 (work in
+            progress).
+
+   [PFKEY]  McDonald, D., Metz, C., and Phan, B., "PF_KEY Key Management
+            API, Version 2", RFC 2367, July 1998.
+
+
+
+
+
+Spencer & Redelmeier                                           [Page 15]
+
+Internet Draft          IKE Implementation Issues            21 Nov 2001
+
+
+   [REKEY]  Tim Jenkins, "IPsec Re-keying Issues", <draft-jenkins-ipsec-
+            rekeying-06.txt>, 2 May 2000 (draft expired, work no longer
+            in progress).
+
+   [REPLAY] Krywaniuk, A., "Using Isakmp Message Ids for Replay
+            Protection", <draft-krywaniuk-ipsec-antireplay-00.txt>, 12
+            July 2001 (work in progress).
+
+   [SECFAIL]
+            Karn, P., and Simpson, W., "ICMP Security Failures
+            Messages", RFC 2521, March 1999.
+
+Author's Addresses
+
+   Henry Spencer
+   SP Systems
+   Box 280 Stn. A
+   Toronto, Ont. M5W1B2
+   Canada
+
+   henry@spsystems.net
+   416-690-6561
+
+
+
+   D. Hugh Redelmeier
+   Mimosa Systems Inc.
+   29 Donino Ave.
+   Toronto, Ont. M4N2W6
+   Canada
+
+   hugh@mimosa.com
+   416-482-8253
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Spencer & Redelmeier                                           [Page 16]
+
+Internet Draft          IKE Implementation Issues            21 Nov 2001
+
+
+Full Copyright Statement
+
+   Copyright (C) The Internet Society 2001. All Rights Reserved.
+
+   This document and translations of it may be copied and furnished to
+   others, and derivative works that comment on or otherwise explain it
+   or assist in its implmentation may be prepared, copied, published and
+   distributed, in whole or in part, without restriction of any kind,
+   provided that the above copyright notice and this paragraph are
+   included on all such copies and derivative works.  However, this
+   document itself may not be modified in any way, such as by removing
+   the copyright notice or references to the Internet Society or other
+   Internet organizations, except as needed for the  purpose of
+   developing Internet standards in which case the procedures for
+   copyrights defined in the Internet Standards process must be
+   followed, or as required to translate it into languages other than
+   English.
+
+   The limited permissions granted above are perpetual and will not be
+   revoked by the Internet Society or its successors or assigns.
+
+   This document and the information contained herein is provided on an
+   "AS IS" basis and THE INTERNET SOCIETY AND THE INTERNET ENGINEERING
+   TASK FORCE DISCLAIMS ALL WARRANTIES, EXPRESS OR IMPLIED, INCLUDING
+   BUT NOT LIMITED TO ANY WARRANTY THAT THE USE OF THE INFORMATION
+   HEREIN WILL NOT INFRINGE ANY RIGHTS OR ANY IMPLIED WARRANTIES OF
+   MERCHANTABILITY OR FITNESS FOR A PARTICULAR PURPOSE.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Spencer & Redelmeier                                           [Page 17]
+
