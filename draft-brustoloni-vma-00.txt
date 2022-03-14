@@ -1,0 +1,827 @@
+
+
+Network Working Group                                     J. Brustoloni
+Internet-Draft                                      Lucent Technologies
+Document: <draft-brustoloni-vma-00.txt>                       July 2000
+Expires: January 13, 2001
+
+
+
+  VPN Masquerade Assist (VMA): An End-to-End Mechanism for Robust NAT
+          Interoperation with IPSec's IKE and ESP Tunnel Mode
+
+
+Status of this Memo
+
+   This document is an Internet-Draft and is in full conformance with
+   all provisions of Section 10 of RFC2026.
+
+   Internet-Drafts are working documents of the Internet Engineering
+   Task Force (IETF), its areas, and its working groups. Note that
+   other groups may also distribute working documents as Internet-
+   Drafts.
+
+   Internet-Drafts are draft documents valid for a maximum of six
+   months and may be updated, replaced, or obsoleted by other documents
+   at any time. It is inappropriate to use Internet- Drafts as
+   reference material or to cite them other than as "work in progress."
+
+   The list of current Internet-Drafts can be accessed at
+   http://www.ietf.org/ietf/1id-abstracts.txt
+
+   The list of Internet-Draft Shadow Directories can be accessed at
+   http://www.ietf.org/shadow.html.
+
+
+Copyright Notice
+
+   Copyright (C) The Internet Society (2000). All Rights Reserved.
+
+
+Abstract
+
+   Linux's NAT (Network Address Translator) implementation is called IP
+   Masquerade. Its "VPN Masquerade" feature provides interoperation of
+   NAT with IPSec's IKE and ESP tunnel mode protocols. VPN Masquerade
+   has two shortcomings: (1) It does not support AH or ESP transport
+   mode; and (2) It is susceptible to crashes, collisions and race
+   conditions that can disable IPSec communication. The first
+   shortcoming can be easily overcome because most IPSec applications,
+   including VPN, can be based on IKE and ESP tunnel mode only.
+
+   This document describes VPN Masquerade Assist (VMA), an end-to-end
+   mechanism that allows IPSec to overcome VPN Masquerade's second
+   shortcoming. VMA recovers from VPN Masquerade crashes or collisions
+   and prevents VPN Masquerade race conditions. VMA introduces simple
+   modifications in IPSec implementations, but conforms to IPSec
+
+Brustoloni                                                           1
+
+                     VPN Masquerade Assist (VMA)            July 2000
+
+
+   standards, does not use any new packet types, and does not modify
+   VPN Masquerade in any way. VMA has negligible effect on performance
+   and can improve robustness even if only one of the IPSec peers
+   implements it.
+
+   This document reviews how VPN Masquerade works, discusses how VPN
+   Masquerade may fail, explains how VMA prevents or recovers from VPN
+   Masquerade failures, and discusses VMA's backward and forward
+   compatibility.
+
+
+1. Introduction
+
+   Network Address Translators (NATs) allow an IP address to be shared
+   among multiple nodes. Although NATs are widely deployed on the
+   Internet, there is currently no NAT standard: The original NAT RFCs
+   are informational only [1,2]. In the absence of standards, the
+   source code of implementations distributed with free operating
+   systems have gained considerable influence. Among these, Linux's
+   implementation, IP Masquerade, stands out for its richness of
+   features and widespread distribution [3].
+
+   A NAT is typically installed between a domain that uses private IP
+   addresses (which are not routable) [4] and the Internet. When a
+   request packet is sent from the private domain to the Internet, NAT
+   translates the source private IP address and possibly TCP or UDP
+   port number to a global IP address and port number. When a
+   corresponding reply packet is received from the Internet, NAT
+   translates the destination global IP address and port number back to
+   the corresponding private ones.
+
+   NAT offers advantages and disadvantages. On the positive side, for
+   example, NAT may allow multiple hosts in a home or small office to
+   be each assigned a private IP address and collectively access the
+   Internet using one or a few global IP addresses. This provides
+   convenience and economy because Internet Service Providers (ISPs)
+   often charge extra for each additional global IP address and may
+   limit the number of addresses allocated to each client. On the
+   negative side, NAT's interoperation with certain protocols can be
+   problematic: When a protocol includes in the packet's payload
+   information that depends on the packet header, NAT may need to
+   translate not only the header, but also parts of the payload. This
+   is not always easy or even possible [2].
+
+   In particular, NAT's interoperation with certain IPSec [5]
+   protocols, AH [6] and ESP transport mode [7], may be impossible
+   (unless some form of communication between NAT and one of the IPSec
+   peers is added). AH is used mainly for packet authentication,
+   including the packet's source and destination IP addresses. If NAT
+   modifies one of the addresses, it would need to correspondingly
+   alter AH's cryptographic checksum. However, this is not possible,
+   because NAT does not (and should not) have access to the
+   authentication keys. On the other hand, ESP transport mode is used
+
+Brustoloni            Expires: January 13, 2001                     2
+
+                     VPN Masquerade Assist (VMA)            July 2000
+
+
+   mainly for end-to-end packet authentication and/or encryption. ESP's
+   authentication and encryption do not encompass the packet's source
+   and destination IP addresses. However, they do encompass TCP or UDP
+   checksums, which depend on the packet's source and destination IP
+   addresses. If NAT modifies one of these addresses, it would need to
+   correspondingly alter the TCP or UDP checksum. Again, this is not
+   possible, because NAT does not have access to the cryptographic
+   keys.
+
+   As described in Section 3, Linux's IP Masquerade includes a feature,
+   VPN Masquerade [3], that supports IPSec's other protocols, IKE [8,9]
+   and ESP tunnel mode [7]. IKE is used for negotiation of
+   cryptographic protocols, algorithms, and keys, whereas ESP tunnel
+   mode is used mainly for packet authentication and/or encryption
+   between two nodes on the packet's path. NAT support for these
+   protocols is possible because they do not authenticate or encrypt
+   any information that depends on the IP header of the packet itself
+   (IKE) or encapsulating packet (ESP tunnel mode).
+
+   VPN Masquerade's lack of AH and ESP transport mode support can be
+   easily overcome because most IPSec applications can use IKE and ESP
+   tunnel mode only. In fact, there have been numerous proposals to
+   forgo or eliminate AH and ESP transport mode altogether [10,11].
+   Although ESP transport mode (when applicable) can result in shorter
+   packet sizes than does ESP tunnel mode, the difference could be
+   nearly wiped by header compression [11].
+
+   Of greater concern is the fact that VPN Masquerade needs to use
+   heuristics to demultiplex packets returning from the Internet to
+   some host in the private domain. As discussed in Section 4, these
+   heuristics may fail because of collisions or race conditions.
+   Additionally, the NAT itself may crash. When one of these failures
+   happens, NAT impedes end-to-end IPSec communication.
+
+   This document presents a solution to this problem, VPN Masquerade
+   Assist (VMA). As described in Section 5, VMA is an end-to-end
+   mechanism that promotes IPSec recovery in case of VPN Masquerade
+   crashes or collisions, and prevents VPN Masquerade race conditions.
+   VMA introduces simple modifications in IPSec implementations, but
+   conforms to IPSec standards, does not use any new packet types, and
+   does not modify VPN Masquerade in any way.
+
+   Concluding this document, Sections 6 and 7 discuss VMA's backward
+   and forward compatibility, and Section 8 analyzes the security of
+   VPN Masquerade and VMA.
+
+
+
+
+
+
+
+
+
+Brustoloni            Expires: January 13, 2001                     3
+
+                     VPN Masquerade Assist (VMA)            July 2000
+
+
+2. Conventions used in this document
+
+   "Client" is the IPSec peer or node whose IP address (usually
+   private) is translated by NAT.
+
+   "Server" is the IPSec peer or node whose IP address (usually global)
+   is not translated by NAT.
+
+
+3. How VPN Masquerade works
+
+   VPN Masquerade translates only the source or destination IP address
+   of IKE packets and ESP tunnel mode encapsulating packets. In this
+   regard, VPN Masquerade differs markedly from IP Masquerade's
+   handling of TCP and UDP packets. In the latter cases, IP Masquerade
+   translates also the source or destination port number, so that all
+   clients can use the same global IP address, and NAT can identify the
+   particular client using the port number. Similar translations in IKE
+   and ESP tunnel mode are not possible because port numbers and other
+   identifiers are cryptographically protected.
+
+   Because all clients share a single global IP address, VPN Masquerade
+   allows, by default, at most one IKE and one ESP session between
+   clients and any given server. When a packet returns from the server,
+   VPN Masquerade uses the server's IP address to identify the
+   corresponding client. If a client sends an IKE or ESP packet to a
+   server that has an ongoing IKE or ESP session with another client,
+   respectively, VPN Masquerade drops that packet.
+
+   The limitation of at most one client per server may be bearable,
+   e.g., in a home office, but not, e.g., in a conference center, where
+   multiple attendees may work for the same company and simultaneously
+   want to access the respective VPN server. In the latter cases, VPN
+   Masquerade may be configured to operate without this limitation,
+   using the techniques and heuristics described in the remainder of
+   this section.
+
+   When more than one client may access the same server, VPN Masquerade
+   identifies the particular client by checking the server's IP address
+   and, for IKE, the initiator and responder cookies, or, for ESP, the
+   incoming SPI (Security Parameters Index). Cookies and SPIs are
+   transmitted unencrypted in IKE and ESP headers, respectively. Each
+   cookie has 64 bits and is selected randomly in the beginning of an
+   IKE session to uniquely identify the session within the respective
+   IPSec peer [8]. SPIs have 32 bits and are randomly selected during
+   an IKE negotiation to uniquely identify a security association (SA)
+   in the respective destination IPSec peer [5]. Each epoch of an ESP
+   tunnel comprises two SAs, one in each direction. SAs always have a
+   limited lifetime, after which an IKE negotiation happens and
+   establishes a new epoch's SAs with new keys and SPIs. SPIs are
+   transmitted encrypted in IKE negotiations.
+
+
+
+Brustoloni            Expires: January 13, 2001                     4
+
+                     VPN Masquerade Assist (VMA)            July 2000
+
+
+   VPN Masquerade handles IKE as follows. VPN Masquerade maintains a
+   hash table of items containing client and server IP addresses and
+   initiator and responder cookies. Each item corresponds to an IKE
+   session. An item is considered outstanding or established according
+   to whether the responder cookie is null or not, respectively. When a
+   client sends a packet such that no item in the table matches the
+   client and server IP addresses and initiator cookie, VPN Masquerade
+   creates an outstanding item containing those values. Conversely,
+   when a server sends a packet such that no established item in the
+   table matches the server IP address and initiator and responder
+   cookies, but an outstanding item matches the server IP address and
+   initiator cookie, VPN Masquerade converts that item into an
+   established one, including the packet's responder cookie. VPN
+   Masquerade then forwards the packet to the corresponding client.
+
+   VPN Masquerade allows more than one client to use the same initiator
+   cookie with the same server. This is possible because each client
+   chooses initiator cookies independently. It is, however, an
+   extremely rare event: If n clients simultaneously have an IKE
+   session with the same server and use good random number generators,
+   the probability of such a collision is about (n-1) /(2^64). VPN
+   Masquerade correctly handles such cases by using the responder
+   cookie to identify the client. To do this, VPN Masquerade needs to
+   slightly modify the above rules and serialize the initial IKE
+   handshake as follows. When a client c1 sends a packet whose client
+   and server IP addresses and initiator cookie match no item in the
+   table, but whose server IP address and initiator cookie match
+   another client c2's outstanding item, VPN Masquerade drops that
+   packet. Eventually, when c1's IKE implementation retries the
+   transmission, after timeouts, c2's item will already be established,
+   and VPN Masquerade will forward c1's packet normally.
+
+   VPN Masquerade handles ESP as follows. VPN Masquerade maintains a
+   hash table of items containing client and server IP addresses and
+   outgoing and incoming SPIs. Each item corresponds to an ESP tunnel's
+   epoch, between successive rekeyings. An item is considered
+   outstanding or established according to whether the incoming SPI is
+   null or not, respectively. When a client sends a packet such that no
+   item in the table matches the client and server IP addresses and
+   outgoing SPI:
+
+     (1)  If the server IP address matches no outstanding item, VPN
+          Masquerade creates an outstanding item containing the client
+          and server IP addresses and outgoing SPI;
+
+     (2)  Otherwise, VPN Masquerade drops the packet.
+
+
+
+
+
+
+
+
+Brustoloni            Expires: January 13, 2001                     5
+
+                     VPN Masquerade Assist (VMA)            July 2000
+
+
+   Conversely, when a server sends a packet such that no established
+   item matches the server IP address and incoming SPI:
+
+     (1)  If an outstanding item matches the server IP address, VPN
+          Masquerade converts that item into an established one,
+          including the packet's incoming SPI, and forwards the packet
+          to the corresponding client;
+
+     (2)  Otherwise, VPN Masquerade multicasts the packet to all
+          clients that have recently had an IKE negotiation with the
+          server.
+
+   To thwart denial of service attacks, VPN Masquerade:
+
+     (1)  Times out outstanding items after a short period Tout;
+
+     (2)  After an outstanding ESP item of client c1 causes a packet of
+          another client c2 to be dropped, limits to a maximum value
+          Nout the number of packets that c1 may send matching the
+          outstanding item; and
+
+     (3)  Times out established items after a period of inactivity Tei.
+
+
+
+4. How VPN Masquerade may fail
+
+   VPN Masquerade's failure modes are less numerous or severe than
+   those of NAT in general. For example, NAT can have difficulty
+   interoperating with protocols that include in packet payloads
+   information that depends on packet headers, e.g. FTP and H.323. In
+   VPN Masquerade's IKE case, similar difficulties can be avoided by
+   having clients identify themselves using fully qualified domain
+   names, instead of IP addresses. Likewise, in VPN Masquerade's ESP
+   case, encapsulated packets use a VPN-assigned IP address and are
+   insulated from NAT's translations, which are limited to
+   encapsulating headers. Even protocols like FTP and H.323 can be
+   tunneled without NAT interoperation problems.
+
+   As another example, NAT may in general use multiple global IP
+   addresses and translate also port numbers. Consequently, NAT may be
+   unable to maintain the same translations after it recovers from a
+   crash, thus severely disrupting end-to-end communication. VPN
+   Masquerade, however, translates only IP addresses and uses only one
+   global IP address. Therefore, it may preserve the same translations
+   after a crash and may successfully recover end-to-end communication.
+
+   Like NAT in general, however, VPN Masquerade may not support fail-
+   over recovery. Suppose a private domain is multi-homed and is
+   connected to the Internet via instances A and B of VPN Masquerade.
+   If a client establishes an ESP tunnel to a server via A and A
+   crashes, the client's ESP packets may be routed via B and reach the
+
+
+Brustoloni            Expires: January 13, 2001                     6
+
+                     VPN Masquerade Assist (VMA)            July 2000
+
+
+   server, but the server's ESP packets may continue to be sent to A
+   and therefore not reach the client.
+
+   Aside from VPN Masquerade's lack of fail-over support, VPN
+   Masquerade's heuristics for demultiplexing ESP packets may cause it
+   to demultiplex incoming packets incorrectly, as discussed in the
+   rest of this section.
+
+   VPN Masquerade's hash tables can be viewed as soft and possibly
+   incorrect state. VPN Masquerade loses state, e.g., when an item
+   times out or VPN Masquerade crashes, but automatically reacquires
+   state when subjected to further traffic. However, before or after
+   recovery, VPN Masquerade's state may be incorrect.
+
+   In IKE's case, VPN Masquerade's state may at times be incomplete,
+   but at least it is not incorrect (i.e., it does not incorrectly
+   associate client and server IP addresses and initiator and responder
+   cookies). Additionally, IKE has built-in timeouts and retry
+   mechanisms that will promote recovery of VPN Masquerade's state, if
+   necessary.
+
+   The same is not true, however, in ESP's case. VPN Masquerade's state
+   may be incomplete, incorrect (i.e., may incorrectly associate client
+   and server IP addresses and outgoing and incoming SPIs, as explained
+   in the following paragraphs), or both. Additionally, ESP does not
+   have built-in mechanisms that would promote timely recovery from
+   losses or errors in VPN Masquerade's state.
+
+   The first source of errors in VPN Masquerade's ESP state is incoming
+   SPI collisions. This is possible because each client chooses
+   incoming SPIs independently. It is, however, a rare event: If n
+   clients have an ESP tunnel to the same server and use good random
+   number generators, the probability of incoming SPI collision each
+   time a tunnel is created or rekeyed is about (n-1) / (2^32). When
+   such an event happens, VPN Masquerade will forward to the client
+   whose item is first established all packets sent by the server using
+   the given incoming SPI, and remaining clients will not receive their
+   packets.
+
+   The second source of errors in VPN Masquerade's ESP state is race
+   conditions that may cause misassociation of outgoing and incoming
+   SPIs. VPN Masquerade implicitly assumes that, after a tunnel is
+   created or rekeyed, or the corresponding item in the table is timed
+   out, or VPN Masquerade recovers from a crash, first the client uses
+   the tunnel to send a packet to the server, and, shortly after
+   receiving this packet (but not before), the server uses the tunnel
+   to send a packet back to the client. These assumptions may be
+   violated in a number of cases:
+
+     (1) Suppose client c has a tunnel t to server s. If there is no
+         outstanding item that matches s and s uses t before c does
+         (e.g., c was downloading a file when t was rekeyed), VPN
+
+
+Brustoloni            Expires: January 13, 2001                     7
+
+                     VPN Masquerade Assist (VMA)            July 2000
+
+
+         Masquerade has to multicast the packet to all clients that
+         have recently had an IKE negotiation with the server.
+
+     (2) Suppose clients c1 and c2 have tunnels t1 and t2 to the same
+         server s, respectively. If c1 uses t1 before s does, and,
+         before using t1, s uses t2 before c2 does, then VPN Masquerade
+         incorrectly associates t1's outgoing SPI with t2's incoming
+         SPI, and will deliver to c1 packets sent to c2. Thereafter,
+         neither c1 nor c2 will receive the respective packets.
+
+     (3) Suppose clients c1 and c2 have tunnels t1 and t2 to server s,
+         respectively. If c1 uses t1 before s does, t1's outstanding
+         item times out, and c2 uses t2 before s does, then if s
+         replies to c1 before it replies to c2, VPN Masquerade will
+         incorrectly associate t2's outgoing SPI with t1's incoming
+         SPI, and will deliver to c2 the packet sent to c1. Thereafter,
+         neither c1 nor c2 will receive the respective packets.
+
+     (4) Suppose clients c1 and c2 have tunnels t1 and t2 to server s,
+         respectively, and that t1's established item times out. If c2
+         uses t2 before s does, but, before replying to c2, s uses t1,
+         then VPN Masquerade will incorrectly associate t2's outgoing
+         SPI with t1's incoming SPI, and will deliver to c2 the packet
+         sent to c1. Thereafter, neither c1 nor c2 will receive the
+         respective packets.
+
+   In summary, VPN Masquerade failures may cause it to forward ESP
+   packets to clients other than the intended recipients. ESP preserves
+   security in spite of these errors, because ESP's verification of
+   packet authenticity and/or decryption depend on keys held only by
+   the packet's intended recipient, and other clients will simply drop
+   the misdelivered packets. However, VPN Masquerade failures may also
+   prevent the intended recipients from receiving their ESP packets. In
+   this regard, neither ESP nor IKE nor higher-level protocols (e.g.,
+   TCP) provide timely recovery. IKE may clear collisions and
+   misassociations when the lifetimes of the tunnels involved expire,
+   but lifetimes are often long (at least several hours).
+
+
+
+5. How VMA prevents or recovers from VPN Masquerade failure
+
+   VPN Masquerade Assist (VMA) is a mechanism that modifies IPSec
+   implementations so as to prevent VPN Masquerade race conditions and
+   recover from VPN Masquerade crashes or collisions.
+
+   In Linux's IPSec implementation, FreeS/WAN [14], for example, an ESP
+   tunnel's lifetime is characterized by three parameters: keylife
+   (default 8 hours), rekeymargin (default 9 minutes), and rekeyfuzz
+   (default 100%). Suppose IKE creates or rekeys an ESP tunnel, i.e.,
+   generates two new SAs, one in each direction, at time t0. Both peers
+   use these SAs to send packets since t0 until some time t1, when the
+   tunnel is rekeyed, and accept received packets that use these SAs
+
+Brustoloni            Expires: January 13, 2001                     8
+
+                     VPN Masquerade Assist (VMA)            July 2000
+
+
+   since time t0 until (t0 + keylife). At a random time between [t0 +
+   keylife - (1 + rekeyfuzz) * rekeymargin] and (t0 + keylife -
+   rekeymargin), one or both peers initiate an IKE negotiation to rekey
+   the tunnel, if none has started yet. This negotiation is expected to
+   complete successfully at some time t1, t1 <= (t0 + keylife).
+
+   VMA introduces a new parameter, clientlead, set to zero in servers
+   and set to a strictly positive value in clients. VMA's first
+   modification is that a client starts an IKE negotiation to rekey the
+   tunnel at a random time between:
+
+     [t0 + keylife - (1 + rekeyfuzz) * (rekeymargin + clientlead)]
+
+   and:
+
+     [t0 + keylife - (1 + rekeyfuzz) * rekeymargin - clientlead].
+
+   For a server, the rule is unchanged. At a random time between:
+
+     [t0 + keylife - (1 + rekeyfuzz) * rekeymargin]
+
+   and:
+
+     (t0 + keylife - rekeymargin),
+
+   a server initiates an IKE negotiation to rekey the tunnel, if none
+   has started yet. Parameters should obey the following constraints:
+   If the maximum clock drift between client and server during an epoch
+   is Tdrift, the maximum time necessary for an IKE negotiation to
+   rekey a tunnel is Tneg, and the maximum latency between client and
+   server is Tlat:
+
+     keylife > (1 + rekeyfuzz) * (rekeymargin + clientlead),
+
+   so that negotiation of the next epoch does not begin before the
+   start of the present epoch,
+
+     rekeymargin > Tdrift + Tneg + Tlat,
+
+   so that epochs start soon enough that packets sent in each epoch
+   arrive during that epoch's lifetime, and, in clients:
+
+     clientlead > Tdrift + Tlat,
+
+   so that the client starts the IKE negotiation to rekey the tunnel
+   before server does so.
+
+   VMA also introduces new parameters maxidle, pingtime, and pingtries
+   for clients. VMA's second modification is that a client, immediately
+   after a tunnel is created or rekeyed, sends a ping (ICMP echo)
+   request to the server using the new epoch's outgoing SA.
+   Additionally, if a client has not received any packets through an
+   incoming SA for a period greater than maxidle, the client sends a
+
+Brustoloni            Expires: January 13, 2001                     9
+
+                     VPN Masquerade Assist (VMA)            July 2000
+
+
+   ping request through the corresponding outgoing SA. If, having sent
+   the last ping request more than pingtime ago, the client has not
+   received any packet through the corresponding incoming SA, the
+   client resends the ping request, up to pingtries times. If, after
+   pingtries attempts, the client has not received any packet through
+   the incoming SA, the client starts a new IKE negotiation to rekey
+   the tunnel.
+
+   Tunnel rekeying provides automatic recovery in cases of incoming SPI
+   collision or the third race condition discussed in the previous
+   section. The parameter maxidle should be set to a value less than
+   that used by VPN Masquerade to timeout established ESP items, Tei.
+   This prevents the fourth race condition discussed in the previous
+   section. Parameters pingtime and pingtries should obey:
+
+     pingtime >= Tout / Nout,
+
+   so that VPN Masquerade will not drop a ping retry while the
+   corresponding ESP item is outstanding, even if that item causes VPN
+   Masquerade to drop other tunnels' pings to the same server, and:
+
+     pingtime * pingtries / Tout > N,
+
+   where N is a reasonably large number, so that VPN Masquerade may
+   eventually forward a ping even if the ping successively collides
+   with N other tunnels' unanswered pings to the same server.
+
+   VMA's third modification is that, after a tunnel is rekeyed, each
+   peer continues to use the previous epoch's outgoing SA to send
+   packets (except for ping requests, as described above), until the
+   peer receives a packet through the new epoch's incoming SA, or until
+   the previous epoch's time (t0 + keylife - rekeymargin), whichever
+   occurs first. After that, the peer uses the new epoch's outgoing SA
+   to send packets. Client parameters should be set so that:
+
+     clientlead + rekeyfuzz * rekeymargin >
+                                  Tdrift + Tneg + pingtime * pingtries,
+
+   so that peers may receive a packet through the new epoch's incoming
+   SA before the previous epoch's time (t0 + keylife - rekeymargin).
+
+   This change prevents VPN Masquerade's first and second race
+   conditions discussed in the previous section. Additionally, this
+   change may prevent VPN Masquerade from dropping data sent from
+   client to server immediately after rekeying. Without VMA, VPN
+   Masquerade drops such data if the server has another client's ESP
+   item outstanding. With VMA, however, peers wait until the ping
+   request and reply establish the ESP item of a new epoch before using
+   that epoch's SAs to send data.
+
+   VMA's dovetailing of successive tunnel epochs and avoidance of VPN
+   Masquerade's established item timeouts may be disrupted if VPN
+   Masquerade crashes. When VPN Masquerade comes back up, it is
+
+Brustoloni            Expires: January 13, 2001                    10
+
+                     VPN Masquerade Assist (VMA)            July 2000
+
+
+   susceptible to SPI collisions and all race conditions discussed in
+   the previous section. However, regardless of the cause of failure,
+   VMA's periodic pings will detect the lack of connectivity and
+   promote automatic recovery by rekeying the involved tunnels.
+
+   VMA's fourth and final modification is that if a client repeatedly
+   attempts to rekey a tunnel and, during these attempts, does not
+   receive replies from the server, then the client drops the existing
+   IKE session and starts a new IKE session. This modification provides
+   end-to-end recovery in the case of multi-homing and fail-over to
+   another VPN Masquerade instance, discussed in the previous section.
+   The new IKE session and any ESP tunnels created by it will be routed
+   through the back-up VPN Masquerade instance, restoring connectivity.
+
+
+6. Backward compatibility
+
+   VMA's overhead consists simply of periodic pings. VMA's impact on
+   ESP performance is minimal, whether or not NAT is present on the
+   end-to-end path. On the other hand, VMA can greatly improve ESP's
+   robustness when NAT is indeed present on the path.
+
+   If a client without VMA establishes an ESP tunnel with a server with
+   VMA, the client does not initiate earlier rekeyings or ping
+   requests, and the server behaves just like a server without VMA. VMA
+   provides no gain or loss in performance or robustness in this case.
+
+   On the other hand, if a client with VMA establishes an ESP tunnel
+   with a server without VMA, the client does initiate VMA's pings.
+   Therefore, VMA's benefits of prevention of the fourth race condition
+   and automatic recovery from SPI collisions or other failures are
+   obtained even in this partial deployment scenario. VMA's automatic
+   pings also reduce the probability of the first two race conditions.
+   A server without VMA may not wait for reception of the ping (or
+   other packet) on the new epoch's incoming SA before using the new
+   epoch's outgoing SA. However, if the client has VMA, the interval
+   between the beginning of the epoch and the server's reception of the
+   first packet is very short.
+
+   Another alternative for interoperation of IPSec and NAT is to
+   encapsulate IPSec packets in UDP or TCP, as is currently done by
+   some commercial vendors. Unlike VMA, UDP or TCP encapsulation
+   modifies protocols in a nonstandard manner and doesn't work at all
+   if only the client implements it. Additionally, UDP or TCP
+   encapsulation provides no prevention of NAT timeouts or recovery
+   from NAT crashes. VMA's pings can add the latter benefits to UDP or
+   TCP encapsulation.
+
+
+
+
+
+
+
+Brustoloni            Expires: January 13, 2001                    11
+
+                     VPN Masquerade Assist (VMA)            July 2000
+
+
+7. Forward compatibility
+
+   RSIP is an alternative to NAT that is currently being proposed [12].
+   RSIP allows clients to lease from an RSIP server the initiator
+   cookies and incoming SPIs that the clients are going to use [15].
+   This prevents the SPI collisions and race conditions discussed in
+   Section 4. Compared to VMA, RSIP's strategy for dealing with
+   timeouts (expired leases) and crashes are still not as clearly
+   articulated, but this may change as the RSIP proposal evolves.
+   However, the process necessary to mature RSIP into a standard,
+   replace existing NATs by RSIP servers, and widely deploy RSIP among
+   clients (which requires an operating system upgrade) may take at
+   least several years. To support existing clients during transition,
+   RSIP servers are expected to include NAT functionality [12]. VMA can
+   fulfill clients' need for IPSec connectivity until such a transition
+   is complete, many years into the future.
+
+   IPv6 [13] makes IP addresses plentiful and could reduce the appeal
+   of NAT's ability to reuse IP addresses. However, if ISPs continue to
+   charge extra and limit the number of global IP addresses allocated
+   to each client, NAT (or RSIP) may continue to be used in homes and
+   small offices even after a transition to IPv6. IPv6 requires
+   changes in IPSec implementations and VPN Masquerade, but not in VMA
+   itself.
+
+
+8. Security Considerations
+
+   VMA always uses an ESP tunnel to send packets. The security of such
+   communication is as good as that of the ESP tunnel.
+
+   VPN Masquerade is susceptible to incoming SPI collisions and race
+   conditions that may cause it to deliver an ESP packet to a client
+   other than the intended recipient. Such a misdelivery does not
+   jeopardize IPSec security: Verification of packet authenticity and
+   decryption depend on keys that are not held by unintended
+   recipients. However, this susceptibility can be exploited in denial
+   of service attacks. VMA provides some defense against such attacks
+   because VMA automatically recovers from VPN Masquerade errors
+   (whether maliciously induced or not). However, this protection may
+   be weak against persistent attackers.
+
+   VPN Masquerade's management of hash table space is also vulnerable
+   to denial of service attacks. By starting, hijacking, or maintaining
+   a large number of sessions (perhaps with spoofed source addresses),
+   attackers may bump legitimate sessions off VPN Masquerade's table.
+   VPN Masquerade's timeouts and VMA's pings and automatic recovery
+   provide some protection against such attacks, but may be weak
+   against persistent attackers.
+
+
+
+
+
+Brustoloni            Expires: January 13, 2001                    12
+
+                     VPN Masquerade Assist (VMA)            July 2000
+
+
+9. References
+
+   [1] K. Egevang and P. Francis. "The IP Network Translator (NAT),"
+      IETF, RFC 1631, May 1994.
+
+   [2] P. Srisuresh and M. Holdrege. "IP Network Address Translator
+      (NAT) Technology and Considerations," IETF, RFC 2663, Aug. 1999.
+
+   [3] J. Hardin. "Linux VPN Masquerade." Homepage at
+       http://www.wolfenet.com/~jhardin/ip_masq_vpn.html.
+
+   [4] Y. Rekhter, B. Moskowitz, D. Karrenberg, G. J. de Groot and E.
+      Lear. "Address Allocation for Private Internets," IETF, RFC 1918,
+      Feb. 1996.
+
+   [5] S. Kent and R. Atkinson. "Security Architecture for the Internet
+      Protocol," IETF, RFC 2401, Nov. 1998.
+
+   [6] S. Kent and R. Atkinson. "IP Authentication Header," IETF, RFC
+      2402, Nov. 1998.
+
+   [7] S. Kent and R. Atkinson. "IP Encapsulating Security Payload
+      (ESP)," IETF, RFC 2406, Nov. 1998.
+
+   [8] D. Maughan, M. Schertler, M. Schneider and J. Turner. "Internet
+      Security Association and Key Management Protocol (ISAKMP)," IETF,
+      RFC 2408, Nov. 1998.
+
+   [9] D. Harkins and D. Carrel. "The Internet Key Exchange (IKE),"
+      IETF, RFC 2409, Nov. 1998.
+
+   [10] R. Glenn and S. Kent. "The NULL Encryption Algorithm and Its
+        Use With IPsec," IETF, RFC 2410, Nov. 1998.
+
+   [11] N. Ferguson and B. Schneier. "A Cryptographic Evaluation of
+        IPsec," Counterpane. Available at
+        http://www.counterpane.com/ipsec.pdf
+
+   [12] M. Borella, J. Lo, D. Grabelsky and G. Montenegro. "Realm
+        Specific IP: Framework," IETF, work in progress.
+
+   [13] S. Deering and R. Hinden. "Internet Protocol, Version 6 (IPv6)
+        Specification," IETF, RFC 2460, Dec. 1998.
+
+   [14] FreeS/WAN. Homepage at http://www.xs4all.nl/~freeswan/.
+
+   [15] G. Montenegro and M. Borella. "RSIP Support for End-to-end
+        IPsec," IETF, work in progress.
+
+
+
+
+
+
+Brustoloni            Expires: January 13, 2001                    13
+
+                     VPN Masquerade Assist (VMA)            July 2000
+
+
+10. Author's Address
+
+   Jose' Brustoloni
+   Bell Laboratories, Lucent Technologies
+   600 Mountain Avenue Room 2A-339
+   Murray Hill, NJ 07974 - USA
+   Phone: (908) 582-2792
+   Fax: (908) 582-1239
+   Email: jcb@research.bell-labs.com
+
+
+
+
+
+
+Full Copyright Statement
+
+   "Copyright (C) The Internet Society (date). All Rights Reserved.
+   This document and translations of it may be copied and furnished to
+   others, and derivative works that comment on or otherwise explain it
+   or assist in its implmentation may be prepared, copied, published
+   and distributed, in whole or in part, without restriction of any
+   kind, provided that the above copyright notice and this paragraph
+   are included on all such copies and derivative works. However, this
+   document itself may not be modified in any way, such as by removing
+   the copyright notice or references to the Internet Society or other
+   Internet organizations, except as needed for the purpose of
+   developing Internet standards in which case the procedures for
+   copyrights defined in the Internet Standards process must be
+   followed, or as required to translate it into languages other than
+   English.
+
+   The limited permissions granted above are perpetual and will not
+   be revoked by the Internet Society or its successors or assigns.
+
+   This document and the information contained herein is provided on an
+   "AS IS" basis and THE INTERNET SOCIETY AND THE INTERNET ENGINEERING
+   TASK FORCE DISCLAIMS ALL WARRANTIES, EXPRESS OR IMPLIED, INCLUDING
+   BUT NOT LIMITED TO ANY WARRANTY THAT THE USE OF THE  INFORMATION
+   HEREIN WILL NOT INFRINGE ANY RIGHTS OR ANY IMPLIED WARRANTIES OF
+   MERCHANTABILITY OR FITNESS FOR A PARTICULAR PURPOSE."
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Brustoloni            Expires: January 13, 2001                    14
+

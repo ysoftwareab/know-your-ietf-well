@@ -1,0 +1,336 @@
+
+
+
+
+HTTPbis                                                        M. Bishop
+Internet-Draft                                                    Akamai
+Intended status: Informational                             June 28, 2018
+Expires: December 30, 2018
+
+
+                      HTTP/2 Server Push Use Cases
+                   draft-bishop-httpbis-push-cases-00
+
+Abstract
+
+   HTTP/2 defines the wire mechanics of Server Push.  Though the
+   mechanics of how a pushed resource is delivered are well-specified,
+   the use cases that describe which resources can be pushed, in what
+   states, and for what purpose are not described in HTTP/2.  As a
+   result, support between implementations varies widely.
+
+   This document attempts to enumerate interesting scenarios, in hopes
+   that a more concrete taxonomy can assist the community in arriving at
+   a standard set of supported scenarios.
+
+Status of This Memo
+
+   This Internet-Draft is submitted in full conformance with the
+   provisions of BCP 78 and BCP 79.
+
+   Internet-Drafts are working documents of the Internet Engineering
+   Task Force (IETF).  Note that other groups may also distribute
+   working documents as Internet-Drafts.  The list of current Internet-
+   Drafts is at https://datatracker.ietf.org/drafts/current/.
+
+   Internet-Drafts are draft documents valid for a maximum of six months
+   and may be updated, replaced, or obsoleted by other documents at any
+   time.  It is inappropriate to use Internet-Drafts as reference
+   material or to cite them other than as "work in progress."
+
+   This Internet-Draft will expire on December 30, 2018.
+
+Copyright Notice
+
+   Copyright (c) 2018 IETF Trust and the persons identified as the
+   document authors.  All rights reserved.
+
+   This document is subject to BCP 78 and the IETF Trust's Legal
+   Provisions Relating to IETF Documents
+   (https://trustee.ietf.org/license-info) in effect on the date of
+   publication of this document.  Please review these documents
+   carefully, as they describe your rights and restrictions with respect
+
+
+
+Bishop                  Expires December 30, 2018               [Page 1]
+
+Internet-Draft               Push Use Cases                    June 2018
+
+
+   to this document.  Code Components extracted from this document must
+   include Simplified BSD License text as described in Section 4.e of
+   the Trust Legal Provisions and are provided without warranty as
+   described in the Simplified BSD License.
+
+Table of Contents
+
+   1.  Introduction  . . . . . . . . . . . . . . . . . . . . . . . .   2
+   2.  Types of Resources  . . . . . . . . . . . . . . . . . . . . .   3
+     2.1.  Browser Scenarios . . . . . . . . . . . . . . . . . . . .   3
+       2.1.1.  Static DOM contents . . . . . . . . . . . . . . . . .   3
+       2.1.2.  Updated DOM contents  . . . . . . . . . . . . . . . .   4
+       2.1.3.  Requests made by local script execution . . . . . . .   4
+     2.2.  Non-Browser Scenarios . . . . . . . . . . . . . . . . . .   4
+       2.2.1.  Subsequent API Requests . . . . . . . . . . . . . . .   4
+       2.2.2.  Streaming APIs  . . . . . . . . . . . . . . . . . . .   4
+   3.  Types of Pushes . . . . . . . . . . . . . . . . . . . . . . .   5
+     3.1.  Pre-Satisfying Requests . . . . . . . . . . . . . . . . .   5
+     3.2.  Cache Population  . . . . . . . . . . . . . . . . . . . .   5
+     3.3.  Cache Revalidation  . . . . . . . . . . . . . . . . . . .   5
+     3.4.  Cache Invalidation  . . . . . . . . . . . . . . . . . . .   6
+   4.  Security Considerations . . . . . . . . . . . . . . . . . . .   6
+   5.  Informative References  . . . . . . . . . . . . . . . . . . .   6
+   Author's Address  . . . . . . . . . . . . . . . . . . . . . . . .   6
+
+1.  Introduction
+
+   HTTP is fundamentally a request/response mechanism.  Each request
+   specifies some action (often content retrieval) which the user agent
+   wishes the server to perform on a resource and return the result of
+   the action.
+
+   However, when a response triggers a subsequent request, network and
+   processing delays cause this subsequent request not to begin
+   immediately.  The client must receive the initial response (0.5 RTT
+   network delay), parse it and identify the next request
+   (implementation- and page-dependent), then send the request back to
+   the server (0.5 RTT network delay) before the server can begin to
+   satisfy the request.
+
+   Some mechanisms attempt to reduce the client processing time by
+   enumerating important follow-up requests in HTTP headers or at the
+   beginning of the response payload.  However, these techniques still
+   incur at least 1 RTT of network delay before the server receives the
+   subsequent request.  Depending on the distance between client and
+   server, this delay might be significant.
+
+
+
+
+
+Bishop                  Expires December 30, 2018               [Page 2]
+
+Internet-Draft               Push Use Cases                    June 2018
+
+
+   HTTP/2 defines Server Push, a paradigm in which the server can also
+   return the results of actions the user agent did _not_ request.  In
+   order to preserve the request-response semantics of HTTP, the server
+   first "promises" something by supplying the request to which it will
+   later provide a response as if the user agent had made the supplied
+   request.  Push is also restricted to methods which are defined to be
+   safe and cacheable.  (Though the response itself need not be
+   cacheable.)
+
+   A push is always associated directly with a client-generated request.
+   No chaining is permitted (a push cannot be associated with another
+   push), nor can a push be promised after the client-initiated stream
+   has closed, though a promised push can be fulfilled at any subsequent
+   time.
+
+   This document is an attempt to enumerate categories of resources and
+   situations in which a server might choose to push a resource.
+
+2.  Types of Resources
+
+2.1.  Browser Scenarios
+
+   The most visible use case for HTTP is the web browser.  Because a web
+   page is composed of a large number of resources, often spread across
+   different domains, browsers issue a complex series of requests in the
+   course of rendering a page.  However, because browsers are generating
+   these requests based on the combination of server-supplied content
+   (the initial response) and local state (the contents of the cache, if
+   any), the server is able to partially predict the client's rendering
+   behavior.  Efforts to standardize the download process between
+   clients ([FETCH]) and to supply more information about the local
+   state to the server ([I-D.ietf-httpbis-cache-digest]) will improve
+   the server's ability to predict such subsequent requests.
+
+   However, web pages are increasingly dynamic, and this makes the
+   browser's job of determining what is logically connected with the
+   initial request more complex.
+
+2.1.1.  Static DOM contents
+
+   This is almost universally-supported among browsers.  If the resource
+   directly references another resource, either via Link headers
+   ([RFC5988]) or via the entity body, almost all browsers will accept a
+   match for this resource served as a push.
+
+   Such resources are typically CSS, JavaScript, images, or other
+   elements required for the rendering or functionality of the page.
+
+
+
+
+Bishop                  Expires December 30, 2018               [Page 3]
+
+Internet-Draft               Push Use Cases                    June 2018
+
+
+2.1.2.  Updated DOM contents
+
+   After the DOM is constructed, it can be locally modified.  Some web
+   sites consist of very sparse static content, then rely on the
+   execution of scripts locally to create DOM elements or update
+   existing elements to reference new target resources.
+
+2.1.3.  Requests made by local script execution
+
+   The locally executed script, rather than updating DOM elements, is
+   also able to directly generate new HTTP requests (typically so that
+   they can populate DOM elements by script).  Many sites have expressed
+   use-cases for pre-answering queries their script would generate in
+   response to user action.
+
+   For example, the page might contain a list of e-mails, with script
+   populating the contents of the e-mail once the user clicks a list
+   entry.  If a site author knows the user is likely to click one of the
+   first three unread e-mails, the contents of those e-mails are
+   reasonable candidates for Server Push.
+
+2.2.  Non-Browser Scenarios
+
+   Non-browser scenarios can typically be analyzed as an API.
+
+2.2.1.  Subsequent API Requests
+
+   There is substantial overlap between non-browser scenarios and the
+   in-browser script scenario described in Section 2.1.3.  In both
+   cases, the server is predicting subsequent API calls based on where
+   it believes the client is in the process of execution.
+
+   If the server can predict subsequent actions, it can pre-satisfy the
+   most likely cases in order to minimize latency.
+
+2.2.2.  Streaming APIs
+
+   Some APIs do not fit well with the request-response model of HTTP,
+   but are better understood as a subscription to an event or a data
+   stream.  Push can be used in this model, as in [RFC8030], by opening
+   a request which never completes and pushing new data to the client as
+   it becomes available.
+
+   Some implementations of push do not make incoming push streams
+   available to clients unless the client makes a request for the
+   corresponding URL.  As a result, clients and servers implementing
+   this pattern might wish to also use the original request to stream
+   back the resource identifiers which are being pushed.
+
+
+
+Bishop                  Expires December 30, 2018               [Page 4]
+
+Internet-Draft               Push Use Cases                    June 2018
+
+
+3.  Types of Pushes
+
+   In addition to pushing different resources, push can be delivered in
+   different ways and for different purposes.
+
+3.1.  Pre-Satisfying Requests
+
+   The most common and most widely supported variety of push simply
+   provides a request that the client is expected to make, along with a
+   successful (typically 200) response carrying the content.
+
+3.2.  Cache Population
+
+   Pushing resources into the client cache has been a subject of some
+   controversy.  Almost all browsers implement a separate and ephemeral
+   cache of pushed resources and do not allow pushed resources to write
+   directly into the HTTP cache, theoretically as a mitigation against
+   populating the cache with content that will never actually be needed.
+
+   However, mechanisms such as Link headers ([RFC5988]) with the
+   "rel=preload" attribute can cause the browser to request any
+   resource, and these headers are also under the server's control.  As
+   a result, any client that implements Section 3.1 will also enable
+   cache population with one additional step.
+
+3.3.  Cache Revalidation
+
+   While no user agents are known to support this, a server could
+   hypothetically pre-validate stale items in the client's cache by
+   pushing a conditional request (If-Not-Match or If-Not-Modified) for a
+   resource it believes is already in the cache and a 304 (Not Modified)
+   response.
+
+   Such a push could be consumed directly by the cache (updating the
+   validity of the cached object) or treated as a pre-satisfied request
+   should the cache attempt to revalidate an expired object.  The former
+   will tend to extend the lifetime of the cached object on each use,
+   while the latter will not affect the object unless it has expired.
+
+   A push which attempts to revalidate content which is no longer cached
+   could be treated equivalently to a preload link, a suggestion that
+   this content might soon be needed.  Triggering a follow-up request
+   for the full body might improve performance.
+
+
+
+
+
+
+
+
+Bishop                  Expires December 30, 2018               [Page 5]
+
+Internet-Draft               Push Use Cases                    June 2018
+
+
+3.4.  Cache Invalidation
+
+   Alternatively, the server could push an unconditional request for the
+   resource, but use the HEAD method instead of GET.  If interpreted
+   appropriately by a user agent, this could revalidate a matching item
+   in the cache, or invalidate an item even if the user agent currently
+   believes the item to be fresh.
+
+4.  Security Considerations
+
+   There probably are some.  The existing mitigations against gratuitous
+   pushes are largely ineffective (see Section 3.2), but clients MUST
+   verify that servers are authoritative for any resources they attempt
+   to push, regardless of the scenario being considered.
+
+5.  Informative References
+
+   [FETCH]    "Fetch Living Standard", n.d.,
+              <https://fetch.spec.whatwg.org>.
+
+   [I-D.ietf-httpbis-cache-digest]
+              Oku, K. and M. Nottingham, "Cache Digests for HTTP/2",
+              draft-ietf-httpbis-cache-digest-02 (work in progress), May
+              2017.
+
+   [RFC5988]  Nottingham, M., "Web Linking", RFC 5988,
+              DOI 10.17487/RFC5988, October 2010,
+              <https://www.rfc-editor.org/info/rfc5988>.
+
+   [RFC7540]  Belshe, M., Peon, R., and M. Thomson, Ed., "Hypertext
+              Transfer Protocol Version 2 (HTTP/2)", RFC 7540,
+              DOI 10.17487/RFC7540, May 2015,
+              <https://www.rfc-editor.org/info/rfc7540>.
+
+   [RFC8030]  Thomson, M., Damaggio, E., and B. Raymor, Ed., "Generic
+              Event Delivery Using HTTP Push", RFC 8030,
+              DOI 10.17487/RFC8030, December 2016,
+              <https://www.rfc-editor.org/info/rfc8030>.
+
+Author's Address
+
+   Mike Bishop
+   Akamai
+
+   Email: mbishop@evequefou.be
+
+
+
+
+
+
+Bishop                  Expires December 30, 2018               [Page 6]

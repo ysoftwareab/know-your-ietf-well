@@ -1,0 +1,840 @@
+
+
+
+
+Network Working Group                                         M. Bagnulo
+Internet-Draft                                        A. Garcia-Martinez
+Intended status: Experimental                                       UC3M
+Expires: January 9, 2020                                   G. Montenegro
+                                                      P. Balasubramanian
+                                                               Microsoft
+                                                            July 8, 2019
+
+
+ rLEDBAT: receiver-driven Low Extra Delay Background Transport for TCP
+                   draft-bagnulo-iccrg-rledbat-00.txt
+
+Abstract
+
+   This document specifies the rLEDBAT, a receiver-driven, less-than-
+   best-effort congestion control algorithm for TCP.
+
+Status of This Memo
+
+   This Internet-Draft is submitted in full conformance with the
+   provisions of BCP 78 and BCP 79.
+
+   Internet-Drafts are working documents of the Internet Engineering
+   Task Force (IETF).  Note that other groups may also distribute
+   working documents as Internet-Drafts.  The list of current Internet-
+   Drafts is at https://datatracker.ietf.org/drafts/current/.
+
+   Internet-Drafts are draft documents valid for a maximum of six months
+   and may be updated, replaced, or obsoleted by other documents at any
+   time.  It is inappropriate to use Internet-Drafts as reference
+   material or to cite them other than as "work in progress."
+
+   This Internet-Draft will expire on January 9, 2020.
+
+Copyright Notice
+
+   Copyright (c) 2019 IETF Trust and the persons identified as the
+   document authors.  All rights reserved.
+
+   This document is subject to BCP 78 and the IETF Trust's Legal
+   Provisions Relating to IETF Documents
+   (https://trustee.ietf.org/license-info) in effect on the date of
+   publication of this document.  Please review these documents
+   carefully, as they describe your rights and restrictions with respect
+   to this document.  Code Components extracted from this document must
+   include Simplified BSD License text as described in Section 4.e of
+   the Trust Legal Provisions and are provided without warranty as
+   described in the Simplified BSD License.
+
+
+
+Bagnulo, et al.          Expires January 9, 2020                [Page 1]
+
+Internet-Draft                   rLEDBAT                       July 2019
+
+
+Table of Contents
+
+   1.  Introduction  . . . . . . . . . . . . . . . . . . . . . . . .   2
+   2.  Motivations for rLEDBAT . . . . . . . . . . . . . . . . . . .   3
+   3.  rLEDBAT overview  . . . . . . . . . . . . . . . . . . . . . .   4
+   4.  rLEDBAT design rationale  . . . . . . . . . . . . . . . . . .   5
+     4.1.  Controlling the receive window  . . . . . . . . . . . . .   5
+       4.1.1.  Avoiding window shrinking . . . . . . . . . . . . . .   6
+       4.1.2.  Window Scale Option . . . . . . . . . . . . . . . . .   6
+     4.2.  Using the RTT to estimate the queueing delay  . . . . . .   7
+     4.3.  Inter-rLEDBAT fairness  . . . . . . . . . . . . . . . . .   9
+     4.4.  Reacting to packet loss . . . . . . . . . . . . . . . . .   9
+     4.5.  Bootstrapping . . . . . . . . . . . . . . . . . . . . . .  10
+     4.6.  Reaction to path changes  . . . . . . . . . . . . . . . .  11
+   5.  rLEDBAT algorithm . . . . . . . . . . . . . . . . . . . . . .  11
+     5.1.  Data structures . . . . . . . . . . . . . . . . . . . . .  11
+     5.2.  Algorithm . . . . . . . . . . . . . . . . . . . . . . . .  12
+     5.3.  rLEDBAT parameters  . . . . . . . . . . . . . . . . . . .  13
+   6.  Security Considerations . . . . . . . . . . . . . . . . . . .  13
+   7.  IANA Considerations . . . . . . . . . . . . . . . . . . . . .  13
+   8.  Acknowledgements  . . . . . . . . . . . . . . . . . . . . . .  14
+   9.  Informative References  . . . . . . . . . . . . . . . . . . .  14
+   Authors' Addresses  . . . . . . . . . . . . . . . . . . . . . . .  14
+
+1.  Introduction
+
+   LEDBAT (Low Extra Delay Background Transport) [RFC6817] is a
+   congestion-control algorithm that implements a less-than-best-effort
+   (LBE) traffic class.
+
+   When LEDBAT traffic shares a bottleneck with one or more TCP
+   connections using standard congestion control algorithms such as
+   Cubic [RFC8312] (hereafter standard-TCP for short), it reduces its
+   sending rate earlier and more aggressively than standard-TCP
+   congestion control, allowing standard-TCP traffic to use more of the
+   available capacity.  In the absence of competing standard-TCP
+   traffic, LEDBAT aims to make an efficient use of the available
+   capacity, while keeping the queuing delay within predefined bounds.
+
+   LEDBAT reacts both to packet loss and to variations in delay.
+   Regarding to packet loss, LEDBAT reacts with a multiplicative
+   decrease, similar to most TCP congestion controllers.  Regarding
+   delay, LEDBAT aims for a target queueing delay.  When the measured
+   current queueing delay is below the target, LEDBAT increases the
+   sending rate and when the delay is above the target, it reduces the
+   sending rate.  LEDBAT estimates the queuing delay by subtracting the
+   measured current one-way delay from the estimated base one-way delay
+   (i.e. the one way delay in the absence of queues).
+
+
+
+Bagnulo, et al.          Expires January 9, 2020                [Page 2]
+
+Internet-Draft                   rLEDBAT                       July 2019
+
+
+   The LEDBAT specification [RFC6817] defines the LEDBAT congestion-
+   control algorithm, implemented in the sender to control its sending
+   rate.  LEDBAT is specified in a protocol and layer agnostic manner.
+
+   In this document, we describe rLEDBAT, a receiver-based, less-than-
+   best-effort congestion control algorithm. rLEDBAT is inspired in
+   LEDBAT but with the following differences:
+
+      rLEDBAT is implemented in the TCP receiver and controls the
+      sending rate of the sender through the TCP Receiver Window.
+
+      rLEDBAT uses the round-trip-time (RTT) to estimate the queuing
+      delay.
+
+      rLEDBAT uses an Additive Increase/Multiplicative Decrease
+      algorithm to achieve inter-(r)LEDBAT fairness and avoid the late-
+      comer advantage observed in LEDBAT.
+
+2.  Motivations for rLEDBAT
+
+   rLEDBAT enables new use cases and new deployment models, fostering
+   the use of LBE traffic and benefitting the global Internet by
+   improving overall allocation of resources.  The following scenarios
+   are enabled by rLEDBAT:
+
+      Content Delivery Networks and more sophisticated file distribution
+      scenarios: Consider the case where the source of a file to be
+      distributed (e.g., a software developer that wishes to distribute
+      a software update) would prefer to use LEDBAT and it enables
+      LEDBAT in the servers containing the source file.  However,
+      because the file is being distributed through a CDN which
+      surrogates do not support LEDBAT, the result is that the file
+      transfers, originated from CDN surrogates will not be using
+      LEDBAT.  Interestingly enough, in the case of the software update,
+      the developer also controls the software performing the download
+      in the client, the receiver of the file, but because current
+      LEDBAT is a sender-based algorithm, controlling the client is not
+      enough to enable LEDBAT in the communication. rLEDBAT would enable
+      the use of LBE traffic class for file distribution in this setup.
+
+      Interference from proxies and other middleboxes: Proxies and other
+      middleboxes are a commonplace in the Internet.  For instance, in
+      the case of mobile networks, proxies are frequently used.  In the
+      case of enterprise networks, it is common to deploy corporate
+      proxies for filtering and firewalling.  In the case of satellite
+      links, Performance Enhancement Proxies (PEPs) are deployed to
+      mitigate the effect of the long delay in TCP connection.  These
+      proxies terminate the TCP connection on both ends and prevent the
+
+
+
+Bagnulo, et al.          Expires January 9, 2020                [Page 3]
+
+Internet-Draft                   rLEDBAT                       July 2019
+
+
+      use of LEDBAT in the segment between the proxy and the sink of the
+      content, the client.  By enabling rLEDBAT, clients would be able
+      to enable LBE traffic between them and the proxy.
+
+      Receiver-defined preferences.  It is frequent that the bottleneck
+      of the communication is the access link.  This is particularly
+      true in the case of mobile devices.  It is then especially
+      relevant for mobile devices to properly manage the capacity of the
+      access link.  With current technologies, it is possible for the
+      mobile device to use different congestion control algorithms
+      expressing different preferences for the traffic.  For instance, a
+      device can choose to use standard-TCP for some traffic and to use
+      LEDBAT for other traffic.  However, this would only affect the
+      outgoing traffic since both standard-TCP and LEDBAT are sender-
+      driven.  The mobile device has no means to manage the traffic in
+      the down-link, which is in most cases, the most critical hop for a
+      typical eye-ball end-user. rLEDBAT enables the mobile device to
+      selectively use LBE traffic class for some of the incoming
+      traffic.  For instance, by using rLEDBAT, a user can use regular
+      standard-TCP/UDP for video stream (e.g., Youtube) and use rLEDBAT
+      for other background file download.
+
+3.  rLEDBAT overview
+
+   rLEDBAT is a congestion control mechanism implemented at the
+   receiver-end of a TCP connection.  The rLEDBAT receiver controls the
+   sender's rate through the Receive Window announced to the receiver in
+   the TCP header.
+
+   rLEDBAT implements an Additive Increase/Multiplicative decrease that
+   reacts to both delay and packet loss.  Similarly to LEDBAT, rLEDBAT
+   limits the queueing delay in the path to a target delay T. rLEDBAT
+   uses the RTT to estimate the queueing delay.  The rLEDBAT receiver
+   uses the TCP TimeStamp option to measure the RTT. rLEDBAT estimates
+   the Base RTT (i.e. the RTT when there is no queuing delay) as the
+   minimum observed RTT in the last n minutes. rLEDBAT estimation of the
+   queuing delay (qd) is obtained subtracting the Base RTT from latest
+   sample(s) of the RTT.
+
+   The rLEDBAT algorithm at the receiver calculates a window value
+   (rl.WND) which is then conveyed to the sender though the RECEIVE
+   WINDOW field of the TCP header.  We describe next how rl.WND value is
+   calculated.
+
+   Suppose that the rl.WND was last updated at time t0 and its current
+   value is then rl.WND(t0) and at time t1 a packet is received.  The
+   rLEDBAT receiver updates rl.WND as follows:
+
+
+
+
+Bagnulo, et al.          Expires January 9, 2020                [Page 4]
+
+Internet-Draft                   rLEDBAT                       July 2019
+
+
+   if qd < T, then rl.WND(t1) = rl.WND(t0) + alpha*MSS/rl.WND(t0)
+
+   if qd > T, then rl.WND(t1) = rl.WND(t0)*betad
+
+   with MSS being the Maximum Segment Size of the TCP connection, and
+   alpha and betad being the additive increase and multiplicative
+   decrease parameters respectively.  This base algorithm results that
+   while the queueing delay is below the target T, the congestion window
+   increases by alpha * MSS$ per RTT, (with alpha > 1) while if the
+   queueing delay is above the target T, the congestion control window
+   is multiplied by betad, with 0 < betad < 1.  The multiplicative
+   reduction is applied at most one per RTT.
+
+   rLEDBAT also performs a multiplicative decrease (with parameter
+   betal) in case there is packet loss.  Packet loss are detected at the
+   receiver through the observation of retransmitted packets.
+   Retransmissions of the sender are detected at the receiver by
+   observing the sequence number of the segment and the timestamp value,
+   as we describe later on.
+
+4.  rLEDBAT design rationale
+
+4.1.  Controlling the receive window
+
+   rLEDBAT uses the Receive Window (RCV.WND) of TCP to enable the
+   receiver to control the sender's rate.  [I-D.ietf-tcpm-rfc793bis]
+   defines that the RCV.WND is used to announce the available receive
+   buffer to the sender for flow control purposes.  In order to avoid
+   confusion, we will call fc.WND the value that a standard RFC793bis
+   TCP receiver calculates to set in the receive window for flow control
+   purposes.  We call rl.WND the window value calculated by rLEDBAT
+   algorithm and we call RCV.WND the value actually included in the
+   Receive Window field of the TCP header.  For a RFC793bis receiver,
+   RCV.WND == fc.WND.
+
+   In the case of rLEDBAT receiver, the rLEDBAT receiver sets the
+   RCV.WND to the minimum of rl.WND and fc.WND, honoring both.
+
+   When using rLEDBAT, two congestion controllers are in action in the
+   flow of data from the sender to the receiver, namely, the congestion
+   control algorithm of TCP in the sender side and the rLEDBAT
+   congestion control algorithm executed in the receiver and conveyed to
+   the sender through the RCV.WND.  In the normal TCP operation, the
+   sender uses the minimum of the congestion window cwnd and the
+   receiver window RCV.WND to calculate the sender's window SND.WND.
+   This is also true for rLEDBAT, as the sender is a regular TCP sender.
+   Because rLEDBAT is designed to react earlier and more aggressively to
+   congestion than regular TCP congestion control, the rl.WND contained
+
+
+
+Bagnulo, et al.          Expires January 9, 2020                [Page 5]
+
+Internet-Draft                   rLEDBAT                       July 2019
+
+
+   in the RCV.WND field of TCP will be in general smaller than the
+   congestion window calculated by the TCP sender, implying that the
+   rLEDBAT congestion control algorithm will be effectively controlling
+   the sender's window.  Moreover, this also guarantees that even if the
+   queuing delay is mis-estimated, the flow will never transmit more
+   aggressively than a TCP flow, as the sender's congestion window
+   limits the sending rate.
+
+   In summary, the sender's window is: SND.WND = min(cwnd, rl.WND,
+   fc.WND)
+
+4.1.1.  Avoiding window shrinking
+
+   The rLEDBAT algorithm increases or decreases the rl.WND according to
+   congestion signals (variations on the estimations of the queueing
+   delay and packet loss).  If the new congestion window is smaller than
+   the current one and there is the possibility that directly announcing
+   it in the RCV.WND may result in shrinking the window, i.e., moving
+   the right window edge to the left.  Shrinking the window is
+   discouraged as per [I-D.ietf-tcpm-rfc793bis], as it may cause
+   unnecessary packet loss and performance penalty.
+
+   In order to avoid window shrinking, upon the reception of a data
+   packet, the announced window can be reduced in the number of bytes
+   contained in the packet at most.  This may not always be enough to
+   honor the new calculated value of the rl.WND.  So, in order to reduce
+   the window as dictated by the rLEDBAT algorithm, the receiver will
+   progressively reduce the advertised RCV.WND, always honoring that the
+   reduction is less or equal than the received bytes, until the target
+   window determined by the rLEDBAT algorithm is reached.  Because the
+   rLEDBAT algorithm only allows to perform at most one multiplicative
+   decrease per RTT, this allows the receiver to drain enough packets
+   from the packets in-flight to reach the reduced window resulting form
+   the rLEDBAT algorithm without need for resorting to shrinking the
+   receiver window.
+
+4.1.2.  Window Scale Option
+
+   The Window Scale (WS) option [RFC7323] is a mean to increase the
+   maximum window size permitted by the Receive Window.  The use of the
+   WS option implies that the changes in the window are expressed in the
+   units resulting of the WS option used in the TCP connection.  This
+   means that the rLEDBAT client will have to accumulate the increases
+   resulting from the different received packets, and only convey a
+   change in the window when the accumulated sum of increases is equal
+   or higher than one unit used to express the receive window according
+   to the WS option in place for the TCP connection.
+
+
+
+
+Bagnulo, et al.          Expires January 9, 2020                [Page 6]
+
+Internet-Draft                   rLEDBAT                       July 2019
+
+
+   Changes in the receive window that are smaller than 1 MSS are
+   unlikely to have any immediate impact on the sender's rate, as usual
+   TCP segmentation practice results in sending full segments (i.e.,
+   segments of size equal to the MSS).  So, accumulating changes in the
+   receive window until completing a full MSS in the sender or in the
+   receiver makes little difference.
+
+   Current WS option specification [RFC7323] defines that allowed values
+   for the WS option are between 0 and 14.  Assuming a MSS around 1500
+   bytes, WS option values between 0 and 11 result in the receive window
+   being expressed in units that are about 1 MSS or smaller.  So, WS
+   option values between 0 and 11 have no impact in rLEDBAT.
+
+   WS option values higher than 11 can affect the dynamics of rLEDBAT,
+   since control may become too coarse (e.g., with WS of 14, a change in
+   one unit of the receive window implies a change of 10 MSS in the
+   effective window).
+
+   For the above reasons, we recommend that when rLEDBAT is used, the
+   rLEDBAT client should set WS option values lower than 12.  Additional
+   experimentation is required to explore the impact of larger WS values
+   in rLEDBAT dynamics.
+
+   Note that the recommendation for rLEDBAT to set the WS option value
+   to lower values does not precludes the communication with servers
+   that set the WS option values to larger values, since the WS option
+   value used is set independently for each direction of the TCP
+   connection.
+
+4.2.  Using the RTT to estimate the queueing delay
+
+   rLEDBAT uses the round trip time (RTT) instead of the one-way delay
+   to estimate the queueing delay.  In order to estimate the queueing
+   delay using the RTT, the rLEDBAT receiver estimates the base RTT
+   (i.e., the constant components of the RTT) and also measures the
+   current RTT.  By subtracting these two values, we obtain the queuing
+   delay to be used by the rLEDBAT controller.
+
+   rLEDBAT discovers the base RTT (RTTb) by taking the minimum value of
+   the measured RTTs over a period of time.  The current RTT (RTTc) is
+   estimated using a number of recent samples and applying a filter,
+   such as the minimum (or the mean) of the last k samples.  Using the
+   RTT to estimate the queueing delay has a number of shortcomings and
+   difficulties that we discuss next.
+
+   The queuing delay measured using the RTT includes also the queueing
+   delay experienced by the return packets in the direction from the
+   rLEDBAT receiver to the sender.  This is a fundamental limitation of
+
+
+
+Bagnulo, et al.          Expires January 9, 2020                [Page 7]
+
+Internet-Draft                   rLEDBAT                       July 2019
+
+
+   this approach.  The impact of this error is that the rLEDBAT
+   controller will also react to congestion in the reverse path
+   direction which results in an even more conservative mechanism.
+
+   In order to measure the RTT, rLEDBAT relies on the Time Stamp (TS)
+   option [RFC7323].  By matching the TSVal value carried in outgoing
+   packets with the TSecr value observed in incoming packets, it is
+   possible to measure the RTT.  This allows the rLEDBAT receiver to
+   measure the RTT even if it is acting as a pure receiver.  In a pure
+   receiver there is no data flowing from the rLEDBAT receiver to the
+   sender, making impossible to match data packets with acknowledgements
+   packets to measure the RTT, as it is usually done in TCP for other
+   purposes.
+
+   Several issues must be addressed when using this approach in order to
+   avoid an artificial increase of the observed RTT.  Consider a TCP
+   communication involving two hosts, host A, which is the legacy
+   server, and host B, the rLEDBAT client, which is a pure receiver i.e.
+   it has no data to send.  Following the proposed method for estimating
+   the RTT, host B will include a TSVal value in a TS option when
+   sending packets to A.  Since we are assuming that B has no data to
+   send, the TS option will be carried in pure Acknowledgment packets.
+   Upon the reception to the TS Option, host A will copy the value of
+   the TSVal into the TSecr field of the TS option and include that
+   option into the next data packet towards host B.  However, there are
+   two reasons why A may not send a packet immediately back to B,
+   artificially increasing the measured RTT.  The first reason is when A
+   has no data to send.  The second is when A has no available window to
+   put more packets in-flight.  We describe next how each of these cases
+   is addressed.
+
+   The case where the sender has no data to send when it receives the
+   pure Acknowledgement carrying the TSVal to be echoed is rare in the
+   expected rLEDBAT use cases.rLEDBAT will be used mostly for background
+   file transfers so the sender will have data to send throughout the
+   lifetime of the communication.  If the file is structured in blocks
+   of data, it may be the case that seldom, the sender will have to wait
+   until the next block is available to proceed with the data transfer.
+   We propose to address this situation by using a minimum filter of the
+   last k samples when measuring the current RTT to discard the (rare)
+   artificially bloated samples.
+
+   The limitation of available sender's window to send more packets can
+   come either from the congestion window in host A or from the
+   announced receive window from the rLEDBAT in host B.  Normally, the
+   receive window will be the one to limit the sender's transmission
+   rate, since rLEDBAT is designed to be more restrictive on the
+   sender's rate than standard-TCP.  In any case, if the limiting factor
+
+
+
+Bagnulo, et al.          Expires January 9, 2020                [Page 8]
+
+Internet-Draft                   rLEDBAT                       July 2019
+
+
+   is the congestion window in the sender, it is irrelevant if rLEDBAT
+   further reduces the receive window due to a bloated RTT measurement,
+   since the rLEDBAT is not actively controlling the sender's rate.  To
+   address the case in which the limiting factor is the receive window
+   announced by rLEDBAT, the receiver should discard the RTT
+   measurements done while reducing the window and avoid including
+   bloated samples in the queueing delay estimation.  The rLEDBAT
+   receiver is aware whether a given TSVal value was sent in a packet
+   where the window was reduced, and if so, it can discard the
+   corresponding RTT measurement.  In the proposed algorithm, the
+   affected samples are used for the current RTT estimation, but are not
+   used for updating the rl.WND, as rl.WND remain unchanged for one RTT
+   after a decrease episode.
+
+   Finally, depending on the frequency of the local clock used to
+   generate the values included in the TS option, several packets may
+   carry the same TSVal value.  If that happens, the rLEDBAT receiver
+   will be unable to match the different outgoing packets carrying the
+   same TSVal value with the different incoming packets carrying also
+   the same TSecr value.  However, it is not necessary for rLEDBAT to
+   use all packets to estimate the RTT and sampling a subset of in-
+   flight packets per RTT is enough to properly assess the queueing
+   delay. rLEDBAT mitigates this issue by using a minimum filter in the
+   last sampled RTT values to estimate the current RTT.
+
+4.3.  Inter-rLEDBAT fairness
+
+   The use of an additive increase/multiplicative decrease (AIMD)
+   algorithm provides inter-rLEDBAT fairness.  When using AIMD, the
+   congestion control algorithm causes the larger flow to reduce its
+   rate more aggressively and leave room for the new flow to grow,
+   resulting in the well-known AIMD fairness property.  Moreover, in the
+   case of LEDBAT, after a multiplicative decrease, the buffer is
+   drained and the base RTT can be more accurately estimated.
+
+   In rLEDBAT the congestion window is decreased by a multiplicative
+   factor betad when the measured queueing delay is larger than the
+   target T.
+
+4.4.  Reacting to packet loss
+
+   The rLEDBAT receiver is capable of detecting retransmitted packets in
+   the following way.  We call RCV.HGH the highest sequence number
+   correspondent to a received byte of data (not assuming that all bytes
+   with smaller sequence numbers have been received already, there may
+   be holes) and we call TSV.HGH the TSVal value corresponding to the
+   segment in which that byte was carried.  SEG.SEQ stands for the
+
+
+
+
+Bagnulo, et al.          Expires January 9, 2020                [Page 9]
+
+Internet-Draft                   rLEDBAT                       July 2019
+
+
+   sequence number of a newly received segment and we call TSV.SEQ the
+   TSVal value of the newly received segment.
+
+   If SEG.SEQ < RCV.HGH and TSV.SEQ > TSV.HGH then the newly received
+   segment is a retransmission.  This is so because the newly received
+   segment was generated later than another already received segment
+   which contained data with a larger sequence number.  This means that
+   this segment was lost and was retransmitted.
+
+   rLEDBAT reduces the rl.WND by a factor betal when detects a
+   retransmission. rLEDBAT reacts to retransmitted packets at most once
+   per RTT.
+
+   If the sender has detected the packet loss via a timeout, the
+   standard-TCP sender reduces its congestion window to 1 MSS and enters
+   in slow start/exponential increase mode.  During the exponential
+   growth, the connection rate will be determined by standard-TCP
+   congestion control at the sender, until the congestion window reaches
+   the receive window announced by rLEDBAT, at which point rLEDBAT takes
+   the control back from the TCP sender.
+
+   rLEDBAT has two different multiplicative decrease factors, betal and
+   betad. betad is the multiplicative decrease factor used for
+   decreasing the window when the measured queueing exceeds the target T
+   and betal is the one used when packet loss are detected.  These two
+   parameters may have different values.
+
+   The proposed mechanism to detect retransmissions at the receiver
+   fails when there are window tail drops.  If all packets in the tail
+   of the window are lost, the receiver will not be able to detect a
+   mismatch between the sequence numbers of the packets and the order of
+   the timestamps.  In this case, rLEDBAT will not react to losses but
+   the TCP congestion controller at the sender will, most likely
+   reducing its window to 1MSS and taking over the control of the
+   sending rate, until slow start ramps up and catches the current value
+   of the rLEDBAT window.
+
+4.5.  Bootstrapping
+
+   rLEDBAT uses a additive increase mechanism to grow the window.  While
+   this algorithm works well in steady-state, it performs poorly for
+   bootstrapping, as it takes significant time to increase the sending
+   rate.  In order to ramp-up to the available capacity faster, rLEDBAT
+   uses the initial window used by the flow control algorithm.
+
+   This implies that when a flow starts, the rLEDBAT algorithm starts
+   with a large window and the sending rate is in fact limited by the
+   slow start algorithm of the sender's TCP.  This means that while the
+
+
+
+Bagnulo, et al.          Expires January 9, 2020               [Page 10]
+
+Internet-Draft                   rLEDBAT                       July 2019
+
+
+   queueing delay is no larger than the target T, rLEDBAT increases its
+   sending rate in the same way as standard-TCP, but if the queueing
+   delay exceeds the target, rLEDBAT takes over.
+
+4.6.  Reaction to path changes
+
+   rLEDBAT adopts the mechanism defined by LEDBAT to deal with path
+   changes.  The LEDBAT algorithm [RFC6817] estimates the base delay by
+   calculating the minimum observed delay in a n minute window.  The
+   historical data older than n minutes is not taken into account to
+   estimate the base delay.  The reason for this is to react when path
+   changes occur.  If the new path has a larger base delay, LEDBAT will
+   keep on using the base delay of the former path and will impose a
+   queueing delay that is larger than the target T.  LEDBAT addresses
+   this issue by limiting historical data to n minutes.  If there is
+   path change, LEDBAT will use the outdated base delay estimation for a
+   maximum time of n minutes.  After that, all the historical data used
+   for the base delay estimation will be of the new path.
+
+5.  rLEDBAT algorithm
+
+5.1.  Data structures
+
+   Parameters:
+
+      T: Target delay
+
+      betal: multiplicative decrease factor in case of packet loss
+
+      betad: multiplicative decrease factor in case of RTT exceeds T
+
+      alpha: additive increase factor.
+
+   Variables:
+
+      current_RTTs is an array with the last k measured RTTs
+
+      base_RTTs is an array with the minimum observed RTTs in the last n
+      minutes
+
+      RCV.SEQ is the sequence number of the last byte that was received
+      and acknowledged
+
+      RCV.HGH is the highest sequence number of a received byte (which
+      may not have been acknowledged yet)
+
+      TSE.HGH is the TSecr value contained in the segment containing the
+      byte with sequence number RCV.HGH
+
+
+
+Bagnulo, et al.          Expires January 9, 2020               [Page 11]
+
+Internet-Draft                   rLEDBAT                       July 2019
+
+
+      SEG.SEQ is the sequence number of the incoming segment
+
+      SEG.TSE is the TSecr value of the incoming segment
+
+      SEG.time is the local time at which the incoming segment was
+      received
+
+      SEG.RTT is the latest sample of the RTT
+
+      QD latest estimation of the queueing delay
+
+      rl.WND window calculated by rLEDBAT without taking into account
+      the window shrinking avoidance constraints
+
+      rl.WND.WS window calculated by rLEDBAT after taking into account
+      the window shrinking avoidance constrains
+
+      DRAINED.BYTES number of bytes drained from the flight-size since
+      the last packet sent
+
+      fc.WND window calculated by standard TCP receiver
+
+      end.reduction.time auxiliary variable used to prevent rl.WND from
+      being updated after a window reduction
+
+5.2.  Algorithm
+
+   on initialization
+       DRAINED.BYTES = 0
+       base_RTTs set to maximum value
+       current_RTTs set to maximum value
+       rl.WND set to max value
+       end.reduction.time = 0
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Bagnulo, et al.          Expires January 9, 2020               [Page 12]
+
+Internet-Draft                   rLEDBAT                       July 2019
+
+
+on packet arrival
+    DRAINED.BYTES = DRAINED.BYTES + SEG.LEN
+    RTT calculation
+        SEG.RTT = SEG.Time - SEG.TSE (the new sample of the RTT is the time of
+        arrival of the segment minus the time at which the segment containing
+        the TSVal value was issued)
+        Update current_RTTs with SEG.RTT (substitute the oldest RTT sample in
+        the current_RTTs array by SEG.RTT)
+        Update base_RTTs with SEG.RTT (store SEG.RTT in the current current
+        minute position, if SEG.RTT is smaller than the value in that
+        position)
+
+    QD = min(current_RTTs) - min(base_RTTs)
+
+    If local.time > end.reduction.time then
+        If SEG.SEQ < RCV.HGH AND SEG.TSE > TSE.HGH then
+            rl.WND = max(rl.WND*betal, 1)
+            end.reduction.time = local.time + min(current_RTTs)
+        else
+            If QD < T, then rl.WND = rl.WND+ alpha*MSS/rl.WND
+            else QD > T, then rl.WND(t1) = max(rl.WND*beta1, 1)
+
+
+          on sending a packet
+      if rl.WND > rl.WND.WS or (rl.WND.WS - rl.WND) < DRAINED.BYTES then
+          rl.WND.WS = rl.WND
+      else
+          rl.WND.WS = rl.WND.WS - DRAINED.BYTES
+      DRAINED.BYTES = 0
+      RCV.WND = min(fc.WND, rl.WND.WS)
+
+   The presented algorithm assumes WS option is not being used.  The
+   algorithm also assumes that the precision of the clock used to
+   populate the TS option is fine grained enough for this purpose (e.g.
+   1 ms).  If this is not the case, then the receiver should store the
+   local time at which a packet carrying each TSVal value was issued and
+   at which time the same value was received int he TSecr and calculate
+   the RTT subtracting these two values.
+
+5.3.  rLEDBAT parameters
+
+6.  Security Considerations
+
+7.  IANA Considerations
+
+
+
+
+
+
+
+Bagnulo, et al.          Expires January 9, 2020               [Page 13]
+
+Internet-Draft                   rLEDBAT                       July 2019
+
+
+8.  Acknowledgements
+
+   This work was supported by the EU through the H2020 5G-RANGE project
+   and by the Spanish Ministry of Economy and Competitiveness through
+   the 5G-City project (TEC2016-76795-C6-3-R).
+
+9.  Informative References
+
+   [I-D.ietf-tcpm-rfc793bis]
+              Eddy, W., "Transmission Control Protocol Specification",
+              draft-ietf-tcpm-rfc793bis-13 (work in progress), June
+              2019.
+
+   [RFC6817]  Shalunov, S., Hazel, G., Iyengar, J., and M. Kuehlewind,
+              "Low Extra Delay Background Transport (LEDBAT)", RFC 6817,
+              DOI 10.17487/RFC6817, December 2012,
+              <https://www.rfc-editor.org/info/rfc6817>.
+
+   [RFC7323]  Borman, D., Braden, B., Jacobson, V., and R.
+              Scheffenegger, Ed., "TCP Extensions for High Performance",
+              RFC 7323, DOI 10.17487/RFC7323, September 2014,
+              <https://www.rfc-editor.org/info/rfc7323>.
+
+   [RFC8312]  Rhee, I., Xu, L., Ha, S., Zimmermann, A., Eggert, L., and
+              R. Scheffenegger, "CUBIC for Fast Long-Distance Networks",
+              RFC 8312, DOI 10.17487/RFC8312, February 2018,
+              <https://www.rfc-editor.org/info/rfc8312>.
+
+Authors' Addresses
+
+   Marcelo Bagnulo
+   UC3M
+
+   Email: marcelo@it.uc3m.es
+
+
+   Alberto Garcia-Martinez
+   UC3M
+
+   Email: alberto@it.uc3m.es
+
+
+   Gabriel Montenegro
+   Microsoft
+
+   Email: Gabriel.Montenegro@microsoft.com
+
+
+
+
+
+Bagnulo, et al.          Expires January 9, 2020               [Page 14]
+
+Internet-Draft                   rLEDBAT                       July 2019
+
+
+   Praveen Balasubramanian
+   Microsoft
+
+   Email: pravb@microsoft.com
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Bagnulo, et al.          Expires January 9, 2020               [Page 15]

@@ -1,0 +1,840 @@
+
+
+
+
+Internet Engineering Task Force                                 d. bider
+Internet-Draft                                           Bitvise Limited
+Intended status: Informational                               5 July 2020
+Expires: 6 January 2021
+
+
+            QUIC-based UDP Transport for Secure Shell (SSH)
+                        draft-bider-ssh-quic-00
+
+Abstract
+
+   The Secure Shell protocol (SSH) [RFC4251] is widely used for purposes
+   including secure remote administration, file transfer using SFTP and
+   SCP, and encrypted tunneling of TCP connections.  Because it is based
+   on TCP, SSH suffers similar problems as are motivating the HTTP
+   protocol to transition its transport to UDP-based QUIC [QUIC].  These
+   include: unauthenticated network intermediaries can trivially
+   disconnect SSH sessions; SSH connections are lost when mobile clients
+   change IP addresses; and performance limitations in OS-based TCP
+   stacks.  This memo leverages QUIC to provide a UDP-based transport to
+   SSH sessions with full backward compatibility, after completing the
+   initial SSH key exchange.
+
+Status of This Memo
+
+   This Internet-Draft is submitted in full conformance with the
+   provisions of BCP 78 and BCP 79.
+
+   Internet-Drafts are working documents of the Internet Engineering
+   Task Force (IETF).  Note that other groups may also distribute
+   working documents as Internet-Drafts.  The list of current Internet-
+   Drafts is at https://datatracker.ietf.org/drafts/current/.
+
+   Internet-Drafts are draft documents valid for a maximum of six months
+   and may be updated, replaced, or obsoleted by other documents at any
+   time.  It is inappropriate to use Internet-Drafts as reference
+   material or to cite them other than as "work in progress."
+
+   This Internet-Draft will expire on 6 January 2021.
+
+Copyright Notice
+
+   Copyright (c) 2020 IETF Trust and the persons identified as the
+   document authors.  All rights reserved.
+
+   This document is subject to BCP 78 and the IETF Trust's Legal
+   Provisions Relating to IETF Documents (https://trustee.ietf.org/
+   license-info) in effect on the date of publication of this document.
+
+
+
+bider                    Expires 6 January 2021                 [Page 1]
+
+Internet-Draft                  SSH/QUIC                       July 2020
+
+
+   Please review these documents carefully, as they describe your rights
+   and restrictions with respect to this document.  Code Components
+   extracted from this document must include Simplified BSD License text
+   as described in Section 4.e of the Trust Legal Provisions and are
+   provided without warranty as described in the Simplified BSD License.
+
+Table of Contents
+
+   1.  Introduction  . . . . . . . . . . . . . . . . . . . . . . . .   2
+     1.1.  Requirements Terminology  . . . . . . . . . . . . . . . .   3
+     1.2.  Wire Encoding Terminology . . . . . . . . . . . . . . . .   3
+   2.  New SSH/QUIC Encryption Algorithms  . . . . . . . . . . . . .   3
+     2.1.  SSH/QUIC Algorithm Negotiation  . . . . . . . . . . . . .   3
+     2.2.  Use of SSH Compression  . . . . . . . . . . . . . . . . .   5
+     2.3.  Use of SSH_MSG_EXT_INFO . . . . . . . . . . . . . . . . .   6
+   3.  UDP Routability Probe . . . . . . . . . . . . . . . . . . . .   6
+     3.1.  UDP Probe Acknowledgment  . . . . . . . . . . . . . . . .   8
+   4.  Transition Using SSH_MSG_NEWKEYS  . . . . . . . . . . . . . .   9
+   5.  QUIC Setup  . . . . . . . . . . . . . . . . . . . . . . . . .  11
+     5.1.  Shared Secrets  . . . . . . . . . . . . . . . . . . . . .  12
+   6.  SSH/QUIC Packet Format  . . . . . . . . . . . . . . . . . . .  12
+   7.  IANA Considerations . . . . . . . . . . . . . . . . . . . . .  13
+   8.  Security Considerations . . . . . . . . . . . . . . . . . . .  13
+   9.  References  . . . . . . . . . . . . . . . . . . . . . . . . .  13
+     9.1.  Normative References  . . . . . . . . . . . . . . . . . .  13
+     9.2.  Informative References  . . . . . . . . . . . . . . . . .  14
+   Author's Address  . . . . . . . . . . . . . . . . . . . . . . . .  14
+
+1.  Introduction
+
+   THIS DOCUMENT IS AN EARLY VERSION AND IS A WORK IN PROGRESS.
+
+   ANY IMPLEMENTATION AT THIS STAGE IS EXPERIMENTAL.
+
+   CONTACT THE AUTHOR IF YOU HAVE INTENT TO IMPLEMENT.
+
+   This memo leverages QUIC to provide a UDP-based transport to SSH by
+   replacing QUIC's use of TLS, including its TLS handshake, with pre-
+   initialized secrets derived from the initial SSH key exchange.  An
+   SSH/QUIC session begins as traditional TCP-based SSH.  A QUIC
+   encryption algorithm can be negotiated opportunistically in
+   SSH_MSG_KEXINIT.  If a QUIC algorithm can be negotiated, the client
+   probes the server for UDP routability while the SSH key exchange
+   takes place.  Upon successful key exchange, the client uses
+   SSH_MSG_NEWKEYS to either transition to QUIC, or continue with TCP-
+   based SSH.  Any QUIC connection uses the same server-side UDP port
+   number as the initial TCP connection.
+
+
+
+
+bider                    Expires 6 January 2021                 [Page 2]
+
+Internet-Draft                  SSH/QUIC                       July 2020
+
+
+   A transition to QUIC may occur only after the initial SSH key
+   exchange.  Once a transition to QUIC has occurred, no SSH key re-
+   exchange takes place.
+
+   This memo updates [RFC4253] to define new encryption algorithms for
+   QUIC; describe new semantics for opportunistic negotiation of
+   encryption algorithms, so the session may continue over TCP or QUIC;
+   and extend SSH_MSG_NEWKEYS to signal a transition to QUIC.
+
+1.1.  Requirements Terminology
+
+   The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT",
+   "SHOULD", "SHOULD NOT", "RECOMMENDED", "NOT RECOMMENDED", "MAY", and
+   "OPTIONAL" in this document are to be interpreted as described in
+   BCP 14 [RFC2119] [RFC8174] when, and only when, they appear in all
+   capitals, as shown here.
+
+1.2.  Wire Encoding Terminology
+
+   The wire encoding types in this document -- "byte", "uint32",
+   "mpint", "string", "name-list" -- have meanings as described in
+   [RFC4251].
+
+2.  New SSH/QUIC Encryption Algorithms
+
+   This memo adopts the style and conventions of [RFC4253] in specifying
+   how use of an encryption algorithm is indicated in SSH.
+
+   The following new encryption algorithms are defined:
+
+     quic:aes128-gcm-sha256         OPTIONAL  TLS_AES_128_GCM_SHA256
+     quic:aes256-gcm-sha384         OPTIONAL  TLS_AES_256_GCM_SHA384
+     quic:chacha20-poly1305-sha256  OPTIONAL  TLS_CHACHA20_POLY1305_SHA256
+     quic:aes128-ccm-sha256         OPTIONAL  TLS_AES_128_CCM_SHA256
+
+                                  Figure 1
+
+2.1.  SSH/QUIC Algorithm Negotiation
+
+   This memo reserves the use of SSH algorithm names beginning with
+   "quic:" (case sensitive) for use with opportunistic negotiation of
+   QUIC algorithms in SSH.  Implementations MUST NOT use algorithm names
+   of this form except in ways compliant with this section.
+
+
+
+
+
+
+
+
+bider                    Expires 6 January 2021                 [Page 3]
+
+Internet-Draft                  SSH/QUIC                       July 2020
+
+
+   A "quic:" prefix is used so that the format "quic:name@domain"
+   remains available for private extension.  Implementations MUST treat
+   all "quic:" algorithms as described in this section, whether they are
+   known or unknown, and whether they are standard ("quic:name") or
+   private ("quic:name@domain").
+
+   If an implementation advertises one or more "quic:" algorithms, it
+   MUST include them only in the SSH_MSG_KEXINIT field
+   "encryption_algorithms_client_to_server".  An implementation MUST NOT
+   include "quic:" algorithms in the field
+   "encryption_algorithms_server_to_client".  Implementations MUST
+   ignore "quic:" algorithms advertised by other parties in the field
+   "encryption_algorithms_server_to_client".
+
+   An implementation MAY advertise one or more "quic:" algorithms in the
+   first SSH key exchange.  An implementation MUST NOT advertise "quic:"
+   algorithms in a subsequent SSH key re-exchange.  Implementations MUST
+   ignore "quic:" algorithms advertised by other parties in subsequent
+   SSH key re-exchanges.
+
+   An implementation that advertises one or more "quic:" algorithms MUST
+   implement negotiation of "encryption_algorithms_client_to_server" as
+   follows:
+
+   1.   For the SSH_MSG_KEXINIT packet from each side, define a new
+        derived name-list, "encalgs_ssh_c2s".  Place into this name-list
+        all algorithm names sent by that side in the field
+        "encryption_algorithms_client_to_server", where the names DO NOT
+        begin with "quic:" (case sensitive).
+
+   2.   For the SSH_MSG_KEXINIT packet from each side, define a new
+        derived name-list, "encalgs_quic".  Place into this name-list
+        all algorithm names sent by that side in the field
+        "encryption_algorithms_client_to_server", where the names DO
+        begin with "quic:" (case sensitive).
+
+   3.   The derived name-lists "encalgs_ssh_c2s" and "encalgs_quic" are
+        NOT sent on the wire by this protocol.
+
+   4.   Define "neg_encalg_ssh_c2s" as the result of matching
+        "encalgs_ssh_c2s" name-lists of both sides, subject to normal
+        rules for matching encryption algorithms in [RFC4253], but
+        WITHOUT a requirement to disconnect if there is no match.
+
+   5.   Define "neg_encalg_quic" as the result of matching
+        "encalgs_quic" name-lists of both sides, subject to normal rules
+        for matching encryption algorithms in [RFC4253], but WITHOUT a
+        requirement to disconnect if there is no match.
+
+
+
+bider                    Expires 6 January 2021                 [Page 4]
+
+Internet-Draft                  SSH/QUIC                       July 2020
+
+
+   6.   If "neg_encalg_ssh_c2s" is non-empty, then the SSH session MAY
+        continue over TCP, in which case this algorithm will be used as
+        the SSH client-to-server encryption algorithm.
+
+   7.   If "neg_encalg_ssh_c2s" is empty, then the SSH session cannot
+        continue over TCP, but MAY continue over QUIC if
+        "neg_encalg_quic" is non-empty.
+
+   8.   If "neg_encalg_quic" is non-empty, then the SSH session MAY
+        continue over QUIC, in which case this algorithm will determine
+        the TLS cipher-suite for use by QUIC.
+
+   9.   If "neg_encalg_quic" is empty, then the SSH session cannot
+        continue over QUIC, but MAY continue over SSH if
+        "neg_encalg_ssh_c2s" is non-empty, and if other needed
+        algorithms for SSH over TCP are negotiated.
+
+   10.  If "neg_encalg_quic" is non-empty, then if the SSH session
+        continues over QUIC, the results of matching the following name-
+        lists will become irrelevant.  In this case, implementations
+        MUST NOT disconnect in advance simply if one or more of these
+        name-lists do not produce a match:
+
+         encryption_algorithms_server_to_client
+         mac_algorithms_client_to_server
+         mac_algorithms_server_to_client
+         compression_algorithms_client_to_server
+         compression_algorithms_server_to_client
+
+                                  Figure 2
+
+2.2.  Use of SSH Compression
+
+   If an SSH session transitions to QUIC, both sides MUST ignore the
+   results of MAC and compression negotiation in the SSH key exchange.
+   MAC functionality is replaced by the QUIC TLS cipher suite.  No
+   compression is used initially.
+
+   After transition to QUIC, clients and servers MAY send
+   SSH_MSG_EXT_INFO as defined in [RFC8308].  The "delay-compression"
+   extension MAY be negotiated.  If "delay-compression" is negotiated,
+   then compression takes effect as described in [RFC8308].
+
+   This simplifies future implementations that might only implement SSH/
+   QUIC, without SSH/TCP.  Such implementations can use compression
+   negotiation that's a more exact fit for purpose than methods in
+   current SSH.
+
+
+
+
+bider                    Expires 6 January 2021                 [Page 5]
+
+Internet-Draft                  SSH/QUIC                       July 2020
+
+
+2.3.  Use of SSH_MSG_EXT_INFO
+
+   This memo refers to interactions between SSH/QUIC and
+   SSH_MSG_EXT_INFO.  An implementation's support for SSH/QUIC does not
+   imply support for SSH_MSG_EXT_INFO.  Implementations still MUST NOT
+   send SSH_MSG_EXT_INFO to parties that did not advertise support for
+   it in SSH_MSG_KEXINIT, as described in [RFC8308].
+
+3.  UDP Routability Probe
+
+   When a client is connecting to a server which advertises in its
+   SSH_MSG_KEXINIT a "quic:" algorithm, the client MAY probe the server
+   to discover whether UDP is supported on the network route.  In this
+   case, the client MAY send to the server one or more SSH_QUIC_PROBE
+   packets with the following encoding:
+
+     byte         pseudo-header-form : MUST equal 0x80
+     byte[4]      pseudo-version     : MUST equal 0x00000000
+     byte         pseudo-dcid-len    : MUST equal 0xFF
+     byte         SSH_QUIC_PROBE     : MUST equal 0x70 ('p')
+     byte         probe-version      : MUST equal 0x00
+     byte[32]     probe-kexinit-id
+     byte         n = client-cid-len (valid values: 0..20)
+     byte[n]      client-cid
+     byte         i = nr-client-quic-versions (valid values: 1..49)
+     uint32[i]    client-quic-versions
+     byte[255]    FF-padding       : MUST equal 0xFFFFFF...FFFFFF
+
+                                  Figure 3
+
+   The client MUST send any SSH_QUIC_PROBE packets by UDP, to the same
+   server port number as the server-side TCP port for the initial SSH
+   connection.  The client SHOULD send any SSH_QUIC_PROBE packets
+   promptly after receipt of the server's SSH_MSG_KEXINIT, so the
+   server's SSH_QUIC_ACK can arrive before completion of SSH key
+   exchange.  Servers MUST NOT expect the client's IP address or UDP
+   port number to match the address or client-side port in the TCP
+   connection.
+
+   If a client sends multiple SSH_QUIC_PROBE packets for the same SSH
+   connection, the packets MUST be identical.  A server that receives
+   different SSH_QUIC_PROBE packets MAY treat any one as authoritative
+   and discard the rest.
+
+   The layout of SSH_QUIC_PROBE is crafted so the packet resembles a
+   clearly invalid QUIC Version Negotiation Packet [QUIC].  The packet
+   has byte values 255 at offsets corresponding to Version Negotiation
+   Packet fields "Destination Connection ID Length" and "Source
+
+
+
+bider                    Expires 6 January 2021                 [Page 6]
+
+Internet-Draft                  SSH/QUIC                       July 2020
+
+
+   Connection ID Length", and the packet is shorter than these values
+   require.  This allows SSH_QUIC_PROBE to be detected and handled
+   separately from QUIC packets received on the same UDP port.
+
+   Servers MUST verify that received SSH_QUIC_PROBE packets have the
+   expected length and that the fixed-value fields have their expected
+   values.  Packets with different lengths or values MUST be ignored, or
+   passed to the QUIC implementation if they could be valid QUIC
+   packets.
+
+   A server MUST ignore any SSH_QUIC_PROBE with an unrecognized value of
+   "probe-version".  Currently, 0 is the only valid value in this field.
+
+   The field "probe-kexinit-id" contains a SHA-256 hash of the following
+   data:
+
+     byte      0x70 ('p')
+     byte[16]  cookie field from server's SSH_MSG_KEXINIT
+
+                                  Figure 4
+
+   A server MUST verify that the field "probe-kexinit-id" matches a
+   recent server-side SSH_MSG_KEXINIT, sent by this server, during
+   initial key exchange, on an incoming SSH connection, where the
+   initial key exchange has not yet completed.  If a server cannot
+   verify this, it MUST ignore the SSH_QUIC_PROBE.
+
+   The field "client-cid-len" contains the length of the client's QUIC
+   connection ID.  This MUST be a value between 0 and 20, inclusive,
+   which is the current QUIC limit for the length of connection IDs.
+
+   The field "client-cid" contains the client's QUIC connection ID, if
+   any.  This will be used by the server as the Destination Connection
+   ID in its first QUIC packets sent to the client.
+
+   The field "quic-scid-len" always appears at the same offset from the
+   start of the packet.  Together with other fixed-value fields, it
+   helps detect that the packet is a valid SSH_QUIC_PROBE.
+
+   The field "nr-client-quic-versions" contains the number of QUIC
+   protocol versions for which the client advertises support.  The
+   number of versions MUST NOT exceed 48 so the packet is not
+   interpreted as a valid QUIC Version Negotiation Packet.
+
+   The field "client-quic-versions" enumerates the QUIC protocol
+   versions for which the client advertises support.
+
+
+
+
+
+bider                    Expires 6 January 2021                 [Page 7]
+
+Internet-Draft                  SSH/QUIC                       July 2020
+
+
+   The field "FF-padding" contains exactly 255 bytes which MUST all have
+   value 0xFF.  This field ensures that SSH_QUIC_PROBE is not a valid
+   QUIC Version Negotiation Packet, and that it is larger than
+   SSH_QUIC_ACK.  This helps prevent these packets being used in
+   Amplified Reflection DDoS.  Servers MUST ignore SSH_QUIC_PROBE
+   packets where the padding is of an incorrect length or contains
+   incorrect values.
+
+   There MUST NOT be any further packet data after the defined fields.
+   Servers MUST ignore SSH_QUIC_PROBE packets that contain unexpected
+   data.
+
+3.1.  UDP Probe Acknowledgment
+
+   For each SSH_QUIC_PROBE packet that passes the server's validation,
+   the server MUST respond with exactly one SSH_QUIC_ACK:
+
+     byte         quic-header-form : MUST equal 0x80
+     byte[4]      quic-version     : MUST equal 0x00000000
+     byte         quic-dcid-len    : MUST equal 0xFF
+     byte         SSH_QUIC_ACK     : MUST equal 0x61 ('a')
+     byte         ack-version      : MUST equal 0x00
+     byte[32]     ack-kexinit-id
+     byte         n = server-cid-len (valid values: 0..20)
+     byte[n]      server-cid
+     byte         i = nr-server-quic-versions (valid values: 1..49)
+     uint32[i]    server-quic-versions
+
+                                  Figure 5
+
+   This follows a similar construction as SSH_QUIC_PROBE, resembling a
+   clearly invalid QUIC Version Negotiation Packet [QUIC].  It is
+   shorter than SSH_QUIC_PROBE to help prevent its use in Amplified
+   Reflection DDoS.
+
+   If a server sends multiple SSH_QUIC_ACK packets for the same SSH
+   connection, the packets MUST be identical.  A client that receives
+   different SSH_QUIC_ACK packets MAY treat any one as authoritative and
+   discard the rest.
+
+   Clients MUST verify that received SSH_QUIC_ACK packets have the
+   expected length and that the fixed-value fields have their expected
+   values.  Packets with different lengths or values MUST be ignored, or
+   passed to the QUIC implementation if they could be valid QUIC
+   packets.
+
+   A client MUST ignore any SSH_QUIC_ACK with an unrecognized value of
+   "ack-version".  Currently, 0 is the only valid value in this field.
+
+
+
+bider                    Expires 6 January 2021                 [Page 8]
+
+Internet-Draft                  SSH/QUIC                       July 2020
+
+
+   The field "ack-kexinit-id" contains a SHA-256 hash of the following
+   data:
+
+     byte      0x61 ('a')
+     byte[16]  cookie field from server's SSH_MSG_KEXINIT
+
+                                  Figure 6
+
+   This field is ALSO calculated on the basis of the server's
+   SSH_MSG_KEXINIT.  This allows a server to respond to SSH_QUIC_PROBE
+   even if it arrives before the client's SSH_MSG_KEXINIT.
+
+   A client MUST verify that the fields "probe-id" and "ack-kexinit-id"
+   match a recent SSH_QUIC_PROBE for which this client is expecting an
+   SSH_QUIC_ACK.  If a client cannot verify this, it MUST ignore the
+   SSH_QUIC_ACK.
+
+   The field "server-cid-len" contains the length of the server's QUIC
+   connection ID.  This MUST be a value between 0 and 20, inclusive,
+   which is the current QUIC limit for the length of connection IDs.
+
+   The field "server-cid" contains the server's QUIC connection ID, if
+   any.  This will be used by the client as the Destination Connection
+   ID in its first QUIC packets sent to the server.
+
+   The field "nr-server-quic-versions" contains the number of QUIC
+   protocol versions for which the server advertises support.  The
+   number of versions MUST NOT exceed 48 so the packet is not
+   interpreted as a valid QUIC Version Negotiation Packet.
+
+   The field "server-quic-versions" enumerates the QUIC protocol
+   versions for which the server advertises support.
+
+   There MUST NOT be any further packet data after the defined fields.
+   Clients MUST ignore SSH_QUIC_ACK packets that contain unexpected
+   data.
+
+4.  Transition Using SSH_MSG_NEWKEYS
+
+   At the end of the first SSH key exchange, a client MAY transition the
+   session to QUIC if all of the following conditions are met:
+
+   *  The initial SSH key exchange produces a non-empty
+      "neg_encalg_quic" value.
+
+   *  The client received at least one valid SSH_QUIC_ACK in response to
+      its SSH_QUIC_PROBE.
+
+
+
+
+bider                    Expires 6 January 2021                 [Page 9]
+
+Internet-Draft                  SSH/QUIC                       July 2020
+
+
+   *  The client and the server advertised at least one mutually
+      supported QUIC version in their SSH_QUIC_PROBE and SSH_QUIC_ACK.
+
+   In these conditions, the client MAY transition to QUIC by sending an
+   extended SSH_MSG_NEWKEYS packet, referred to as QUIC-NEWKEYS.  The
+   client sends this packet at the usual point, when it completes its
+   first outgoing SSH key exchange:
+
+     byte      SSH_MSG_NEWKEYS
+     string    "quic"
+
+                                  Figure 7
+
+   A client MUST NOT send a QUIC-NEWKEYS in a non-first key exchange.  A
+   server MUST NOT send it - it MUST send the usual SSH_MSG_NEWKEYS.
+   Clients and servers that receive QUIC-NEWKEYS unexpectedly MAY
+   disconnect.
+
+   After sending QUIC-NEWKEYS, a client MUST NOT send any further
+   packets on the TCP connection.  A server MUST disconnect if it
+   receives any further packets from the client over TCP.
+
+   If a server receives an appropriate QUIC-NEWKEYS, then if the server
+   has not yet done so, it MUST send its first SSH_MSG_NEWKEYS.  This
+   MUST be the last packet sent by the server on the TCP connection.
+
+   The server MAY send its SSH_MSG_NEWKEYS before it has received the
+   client's SSH_MSG_NEWKEYS or QUIC-NEWKEYS.  In this case, the server
+   might also want to send SSH_MSG_EXT_INFO, but does not yet know if
+   the client will continue the connection over QUIC or TCP.  In this
+   case, the server MUST wait to send SSH_MSG_EXT_INFO until it receives
+   either SSH_MSG_NEWKEYS or QUIC-NEWKEYS.
+
+   If a client sent QUIC-NEWKEYS, it MUST disconnect if the server sends
+   any further packets over TCP after the server's SSH_MSG_NEWKEYS.
+
+   All subsequent SSH packets sent by the server and client are sent
+   over QUIC.  After the client sent QUIC-NEWKEYS, and the server sent
+   SSH_MSG_NEWKEYS, either side MAY disconnect the TCP connection.
+   However, a client that wants to continue the session MUST wait to
+   disconnect until it has received the server's SSH_MSG_NEWKEYS.  If a
+   server receives a TCP disconnect before it successfully sent
+   SSH_MSG_NEWKEYS, it MAY terminate the SSH connection.
+
+   In most cases, the first SSH packet the client sends over QUIC will
+   be SSH_MSG_SERVICE_REQUEST.  The server MAY send SSH_MSG_EXT_INFO as
+   its first QUIC packet, after receiving the client's QUIC-NEWKEYS.
+   Otherwise, the server's first QUIC packet will likely be
+
+
+
+bider                    Expires 6 January 2021                [Page 10]
+
+Internet-Draft                  SSH/QUIC                       July 2020
+
+
+   SSH_MSG_SERVICE_ACCEPT.  Either side MAY also send other packets
+   normally permitted in this SSH connection stage, including
+   SSH_MSG_IGNORE, SSH_MSG_UNIMPLEMENTED, SSH_MSG_DEBUG, or
+   SSH_MSG_DISCONNECT.
+
+   After an SSH session transitions to QUIC, implementations MUST NOT
+   send any further SSH packets with message numbers 20-49.  This
+   includes SSH_MSG_KEXINIT, SSH_MSG_NEWKEYS and key exchange packets.
+   If a client or server receives SSH packets with such message numbers
+   over QUIC, it MUST respond with SSH_MSG_UNIMPLEMENTED.
+
+   Due to network routing issues beyond the client's and server's
+   control, clients and servers MUST be prepared to receive the first
+   QUIC packets before the other party's QUIC-NEWKEYS or SSH_MSG_NEWKEYS
+   arrives over TCP.  A receiver SHOULD detect such UDP datagrams by
+   their QUIC Destination Connection ID, buffer them, and defer their
+   QUIC processing until the expected QUIC-NEWKEYS or SSH_MSG_NEWKEYS is
+   received.  A receiver SHOULD be prepared to buffer at least 100,000
+   bytes of such packets, measured as the sum of UDP datagram lengths.
+   To the extent the receiver cannot buffer such packets, it MUST drop
+   them, potentially causing the sender to resend.  If a server has
+   buffered such packets, but the client then sends a regular
+   SSH_MSG_NEWKEYS instead of QUIC-NEWKEYS, the server MUST drop the
+   buffered packets along with related QUIC session state and continue
+   the SSH session over TCP.
+
+5.  QUIC Setup
+
+   On transition to QUIC [QUIC] [QUIC-TLS], the QUIC session is set up
+   as follows:
+
+   *  The QUIC protocol version is set to the first version advertised
+      in the client's SSH_QUIC_PROBE which is also present in the
+      server's SSH_QUIC_ACK.
+
+   *  Session state is set as if a TLS handshake had just completed.
+
+   *  The TLS cipher suite is set as identified by "neg_encalg_quic".
+
+   *  The QUIC Key Phase bit is set to 0.
+
+   *  Shared secrets that would have been obtained from the TLS
+      handshake are generated from the SSH key exchange and the
+      SSH_QUIC_PROBE and SSH_QUIC_ACK packets.
+
+   Clients and servers always can, and therefore MUST, immediately begin
+   to use QUIC Short Header Packets.  Implementations MUST NOT send QUIC
+   Long Header Packets and MUST ignore them.
+
+
+
+bider                    Expires 6 January 2021                [Page 11]
+
+Internet-Draft                  SSH/QUIC                       July 2020
+
+
+5.1.  Shared Secrets
+
+   QUIC-TLS [QUIC-TLS] uses a client secret and a server secret from
+   which it generates an AEAD key, an IV, and a header protection key
+   for each sending direction.
+
+   An SSH key exchange produces a shared secret K, represented as an SSH
+   multi-precision integer, and an exchange digest H, represented as
+   binary data [RFC4253].  An SSH key exchange is parameterized with a
+   hash function we call HASH.  Note that HASH can be a different hash
+   function, producing a different hash length, than the hash function
+   used by the TLS cipher suite negotiated in "neg_encalg_quic".
+
+   To compute the initial QUIC client and server secrets, the client and
+   server encode the following binary data, which we call "secret_data":
+
+     secret_data:
+       mpint    K
+       string   H
+       string   UDP datagram content of SSH_QUIC_PROBE
+       string   UDP datagram content of SSH_QUIC_ACK
+
+                                  Figure 8
+
+   The client and server secrets are then calculated as follows:
+
+     client_secret = HMAC-HASH("ssh/quic client", secret_data)
+     server_secret = HMAC-HASH("ssh/quic server", secret_data)
+
+                                  Figure 9
+
+   The HMAC construct is as specified in [RFC2104], instantiated using
+   the SSH key exchange hash function, HASH.
+
+   QUIC keys and IVs are derived from these secrets using the regular
+   QUIC-TLS key derivation process [QUIC-TLS].  Keys generated from
+   these secrets are considered 1-RTT keys.
+
+   Clients and servers MUST implement QUIC key updates using the regular
+   QUIC-TLS key update process [QUIC-TLS], respecting the QUIC-TLS
+   minimum key update frequencies.
+
+6.  SSH/QUIC Packet Format
+
+   All SSH/QUIC packets are sent on QUIC stream 0.  No other QUIC
+   streams are used in SSH over QUIC.
+
+
+
+
+
+bider                    Expires 6 January 2021                [Page 12]
+
+Internet-Draft                  SSH/QUIC                       July 2020
+
+
+   Each side serializes its SSH packets for sending over QUIC as
+   follows:
+
+     uint32    n = payload-len
+     byte[n]   payload
+
+                                 Figure 10
+
+   Since security is provided by QUIC-TLS [QUIC-TLS], MAC and random
+   padding are omitted at this stage.
+
+   In SSH/QUIC, compression algorithms negotiated in the initial SSH key
+   exchange are ignored.  Such compression does NOT take effect.
+
+   Compression MAY be negotiated using the "delay-compression" extension
+   in [RFC8308].  If "delay-compression" is negotiated, and conditions
+   to enable compression are met, then the "payload" field is
+   compressed.
+
+   Otherwise, the "payload" field contains the same packet information
+   as the "payload" field in the Binary Packet Protocol defined in
+   [RFC4253].
+
+7.  IANA Considerations
+
+   IANA is requested to update the "Secure Shell (SSH) Protocol
+   Parameters" registry, established with [RFC4250], to add the
+   following entries to the table "Encryption Algorithm Names"
+   [IANA-EAN]:
+
+     Encryption Algorithm Name       Reference         Note
+     quic:aes128-gcm-sha256          [this document]
+     quic:aes256-gcm-sha384          [this document]
+     quic:chacha20-poly1305-sha256   [this document]
+     quic:aes128-ccm-sha256          [this document]
+
+                                 Figure 11
+
+8.  Security Considerations
+
+   The security considerations of [RFC4251] apply to this document.
+
+9.  References
+
+9.1.  Normative References
+
+
+
+
+
+
+bider                    Expires 6 January 2021                [Page 13]
+
+Internet-Draft                  SSH/QUIC                       July 2020
+
+
+   [QUIC]     Iyengar, J. and M. Thomson, "QUIC: A UDP-Based Multiplexed
+              and Secure Transport", 2020, <https://tools.ietf.org/html/
+              draft-ietf-quic-transport-29>.
+
+   [QUIC-TLS] Thomson, M. and S. Turner, "Using TLS to Secure QUIC",
+              2020,
+              <https://tools.ietf.org/html/draft-ietf-quic-tls-29>.
+
+   [RFC2104]  Krawczyk, H., Bellare, M., and R. Canetti, "HMAC: Keyed-
+              Hashing for Message Authentication", RFC 2104,
+              DOI 10.17487/RFC2104, February 1997,
+              <https://www.rfc-editor.org/info/rfc2104>.
+
+   [RFC2119]  Bradner, S., "Key words for use in RFCs to Indicate
+              Requirement Levels", BCP 14, RFC 2119,
+              DOI 10.17487/RFC2119, March 1997,
+              <https://www.rfc-editor.org/info/rfc2119>.
+
+   [RFC4251]  Ylonen, T. and C. Lonvick, Ed., "The Secure Shell (SSH)
+              Protocol Architecture", RFC 4251, DOI 10.17487/RFC4251,
+              January 2006, <https://www.rfc-editor.org/info/rfc4251>.
+
+   [RFC4253]  Ylonen, T. and C. Lonvick, Ed., "The Secure Shell (SSH)
+              Transport Layer Protocol", RFC 4253, DOI 10.17487/RFC4253,
+              January 2006, <https://www.rfc-editor.org/info/rfc4253>.
+
+   [RFC8174]  Leiba, B., "Ambiguity of Uppercase vs Lowercase in RFC
+              2119 Key Words", BCP 14, RFC 8174, DOI 10.17487/RFC8174,
+              May 2017, <https://www.rfc-editor.org/info/rfc8174>.
+
+   [RFC8308]  Bider, D., "Extension Negotiation in the Secure Shell
+              (SSH) Protocol", RFC 8308, DOI 10.17487/RFC8308, March
+              2018, <https://www.rfc-editor.org/info/rfc8308>.
+
+9.2.  Informative References
+
+   [IANA-EAN] IANA, "Secure Shell (SSH) Encryption Algorithm Names",
+              <https://www.iana.org/assignments/ssh-parameters/>.
+
+   [RFC4250]  Lehtinen, S. and C. Lonvick, Ed., "The Secure Shell (SSH)
+              Protocol Assigned Numbers", RFC 4250,
+              DOI 10.17487/RFC4250, January 2006,
+              <https://www.rfc-editor.org/info/rfc4250>.
+
+Author's Address
+
+
+
+
+
+
+bider                    Expires 6 January 2021                [Page 14]
+
+Internet-Draft                  SSH/QUIC                       July 2020
+
+
+   denis bider
+   Bitvise Limited
+   4105 Lombardy Ct
+   Colleyville, TX 76034
+   United States
+
+   Email: ietf-draft@denisbider.com
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+bider                    Expires 6 January 2021                [Page 15]
