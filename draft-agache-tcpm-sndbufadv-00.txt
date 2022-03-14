@@ -1,0 +1,392 @@
+
+
+
+
+Internet Engineering Task Force                                A. Agache
+Internet-Draft                                                 C. Raiciu
+Intended status: Experimental        University Politehnica of Bucharest
+Expires: January 21, 2016                                  July 20, 2015
+
+
+                       TCP Sendbuffer Advertising
+                     draft-agache-tcpm-sndbufadv-00
+
+Abstract
+
+   Network operators have difficulty in understanding the end-to-end
+   performance of TCP connections through their networks.  By observing
+   packets at different vantage points on their path and maintaining per
+   flow state, network operators can detect packet losses,
+   retransmission and estimate RTTs, among other metrics.  A key
+   information needed by networks is whether a connection is limited by
+   the network or by the application.  This information is very
+   difficult to accurately infer by passive measurements.
+
+   We propose to advertise sendbuffer occupancy in TCP: each segment
+   will carry the amount of backlogged data present in the sender's
+   buffer.  This information allows networks to discern between
+   application-limited, network-limited and flow-control limited flows,
+   creating new avenues of network optimization.
+
+Status of This Memo
+
+   This Internet-Draft is submitted in full conformance with the
+   provisions of BCP 78 and BCP 79.
+
+   Internet-Drafts are working documents of the Internet Engineering
+   Task Force (IETF).  Note that other groups may also distribute
+   working documents as Internet-Drafts.  The list of current Internet-
+   Drafts is at http://datatracker.ietf.org/drafts/current/.
+
+   Internet-Drafts are draft documents valid for a maximum of six months
+   and may be updated, replaced, or obsoleted by other documents at any
+   time.  It is inappropriate to use Internet-Drafts as reference
+   material or to cite them other than as "work in progress."
+
+   This Internet-Draft will expire on January 21, 2016.
+
+Copyright Notice
+
+   Copyright (c) 2015 IETF Trust and the persons identified as the
+   document authors.  All rights reserved.
+
+
+
+
+Agache & Raiciu         Expires January 21, 2016                [Page 1]
+
+Internet-Draft         TCP Sendbuffer Advertising              July 2015
+
+
+   This document is subject to BCP 78 and the IETF Trust's Legal
+   Provisions Relating to IETF Documents
+   (http://trustee.ietf.org/license-info) in effect on the date of
+   publication of this document.  Please review these documents
+   carefully, as they describe your rights and restrictions with respect
+   to this document.  Code Components extracted from this document must
+   include Simplified BSD License text as described in Section 4.e of
+   the Trust Legal Provisions and are provided without warranty as
+   described in the Simplified BSD License.
+
+Table of Contents
+
+   1.  Requirements Language . . . . . . . . . . . . . . . . . . . .   2
+   2.  Introduction  . . . . . . . . . . . . . . . . . . . . . . . .   2
+   3.  TCP Sendbuffer Structure  . . . . . . . . . . . . . . . . . .   3
+   4.  Negotiating sendbuffer advertising  . . . . . . . . . . . . .   4
+   5.  Encoding sendbuffer information . . . . . . . . . . . . . . .   5
+   6.  References  . . . . . . . . . . . . . . . . . . . . . . . . .   6
+     6.1.  Normative References  . . . . . . . . . . . . . . . . . .   6
+     6.2.  Informative References  . . . . . . . . . . . . . . . . .   6
+   Authors' Addresses  . . . . . . . . . . . . . . . . . . . . . . .   7
+
+1.  Requirements Language
+
+   The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT",
+   "SHOULD", "SHOULD NOT", "RECOMMENDED", "MAY", and "OPTIONAL" in this
+   document are to be interpreted as described in RFC 2119 [RFC2119].
+
+2.  Introduction
+
+   Aggregate link statistics, such as packet and loss counts, are easily
+   available in modern networks, but they convey a fairly limited
+   picture of network performance.  In many cases, the network needs
+   information about individual flows' demand for bandwidth to take the
+   appropriate resource allocation decisions.
+
+   One example is a mobile phone streaming audio or video over a WiFi
+   connection.  The default strategy is to always stick to WiFi when
+   available, despite the fact that performance may be terrible and
+   seriously impair user experience.  If the mobile network knew the
+   multimedia stream needs more bandwidth, it could fire-up the cellular
+   connection and migrate traffic over there by using mobile client
+   offloading software relying on Multipath TCP [NSDI-12] or Mobile IP
+   [RFC5944].
+
+   Another example is in datacenters with Clos topologies (such as the
+   popular FatTree topology [FatTree]), where elephant flows are
+   randomly placed on paths with flow-level Equal Cost Multipath
+
+
+
+Agache & Raiciu         Expires January 21, 2016                [Page 2]
+
+Internet-Draft         TCP Sendbuffer Advertising              July 2015
+
+
+   Routing; when one or more elephant flows are placed on the same link,
+   performance degrades despite existing capacity elsewhere in the
+   network.  The network can reroute such flows by using tunnels or
+   programmable switches (e.g.  Openflow) but the one thing missing is
+   the information regarding which flows could utilize more capacity if
+   given a better path.
+
+   Determining if a TCP connection is network limited or not is
+   difficult to do by passive monitoring.  The network needs to keep
+   per-flow state, to estimate the sender congestion window and to
+   accurately monitor flight-size.  When flight-size is smaller than the
+   congestion window and the receive window, the connection is limited
+   by the application and does not need more capacity.
+
+   We propose that each TCP segment should also encode the amount of
+   backlogged data in the TCP sendbuffer.  This information enables
+   network boxes and receivers to easily identify connections that need
+   more capacity.  Our goal is to have this extension "always on", and
+   it is therefore very important to reduce its overhead.  Next, we
+   discuss how to compute and report the amount of backlogged data.  We
+   follow with a discussion of signaling options for conveying
+   sendbuffer information.
+
+3.  TCP Sendbuffer Structure
+
+
+                        1          2
+               ---|----------|----------|--->
+               SND.UNA    SND.NXT   WRITE.SEQ
+
+
+           1 - sequence numbers of unacknowledged, in flight data
+           2 - sequence numbers of backlogged data.
+
+                    Anatomy of the TCP Sendbuffer
+
+   The figure above shows the anatomy of the TCP sendbuffer.  SND.UNA
+   represents the oldest sequence number sent but not yet acknowledged.
+   At the other end there is WRITE.SEQ, the tail sequence number of data
+   held in the sendbuffer.  Somewhere in-between we have SND.NXT, the
+   sequence number of the next byte to be sent.  From SND.NXT to
+   WRITE.SEQ we have backlogged data, written by the application but not
+   yet transmitted.
+
+   SND.NXT is constrained by both the receive window and the congestion
+   window as follows:
+
+           SND.NXT <= SND.UNA + min(SND.WND, SND.CWND)
+
+
+
+Agache & Raiciu         Expires January 21, 2016                [Page 3]
+
+Internet-Draft         TCP Sendbuffer Advertising              July 2015
+
+
+   As long as the receive window is not a bottleneck, and in the absence
+   of hardware issues or software bugs, having SND.NXT smaller than
+   WRITE.SEQ indicates that the congestion window is not large enough,
+   so the connection is network limited at that point in time.  The
+   easiest way to implement sendbuffer advertising is to simply copy the
+   amount of backlogged data (WRITE.SEQ-SND.NXT) into the segment when
+   it leaves the TCP stack.  However, this will result in non-zero
+   sendbuffer advertisement when the connection is application-limited
+   but the application writes bursts of a few packets.  These packets
+   will be sent out immediately on the wire, yet the first packets in
+   the burst will report that the application is backlogged, when in
+   fact it isn't.
+
+   To correctly implement sendbuffer advertisement, the sender MUST
+   advertise the amount of backlogged according to the formula below:
+
+           SEG.SNDBUF = WRITE.SEQ-SND.UNA - min(SND.WND, SND.CWND),
+                         if WRITE.SEQ > SND.UNA + min(SND.WND, SND.CWND)
+
+           SEG.SNDBUF = 0, otherwise
+
+   This formula ensures that if an application write fits in the current
+   receive and congestion windows, all the resulting segments will
+   advertise zero backlog data.
+
+4.  Negotiating sendbuffer advertising
+
+   The standard way to extend TCP is to negotiate the extension during
+   the three-way handshake.  The TCP option space, however, is already
+   very crowded in the SYN exchange.  Until solutions that extend the
+   TCP option space are standardized, negotiation in the SYN exchange
+   is, in our view, not a feasible option for sendbuffer advertising.
+
+   Fortunately, sendbuffer advertising is a sender-side only
+   modification to TCP, and the information it makes available can be
+   used anyone that understands it, be it the network or the receiver.
+   This implies that we can simply bypass the three way handshake as
+   long as the actual encoding of the sendbuffer information in TCP
+   segments does not have negative effects to legacy routers,
+   middleboxes and TCP receivers.  We discuss encoding in the next
+   section.
+
+   TCP sendbuffer advertising will therefore be a simple sender-only
+   enhancement to the TCP stack that can be enabled by using system-wide
+   configuration (e.g. sysctl in Linux).
+
+
+
+
+
+
+Agache & Raiciu         Expires January 21, 2016                [Page 4]
+
+Internet-Draft         TCP Sendbuffer Advertising              July 2015
+
+
+5.  Encoding sendbuffer information
+
+   In this section we discuss two encoding alternatives for sendbuffer
+   information: as new TCP options, in the acknowledgement field of data
+   segments and in the receive-window field.
+
+   The first solution is to simply encode sendbuffer information in a
+   new TCP option on every segment carrying data in a TCP connection,
+   without negotiating this extension in the three way handshake.  This
+   only adds 6B of overhead to each TCP segment.  This option is
+   feasible only when there is sufficient space in the TCP option field
+   of the corresponding data segment.
+
+   Avoding the option negotiation will work really well in datacenters
+   where it can be ensured out-of-band that all machines either know
+   sendbuffer advertising or are unaffected by segments carrying new
+   options.  In the Internet, before advertising sendbuffer information
+   in new TCP options we need to ensure that: a) existing TCP stacks are
+   robust to unknown options, simply ignoring them, and b) middleboxes
+   do not drop segments carrying unknown options.  Existing studies
+   [IMC-11] imply that the wide majority of network paths either allow
+   unknown options or drop the options, allowing the segments through.
+   Only a very small fraction of paths drop the segments with unknown
+   options.  To cope with such cases, the implementation MUST NOT
+   include sendbuffer information on retransmitted packets, to ensure
+   that the connection makes some progress even in the presence of such
+   middleboxes.
+
+   Our second solution is based on the observation that while TCP itself
+   is bidirectional, most connections in practice will transfer data
+   unidirectionally most times.  The endpoints can be either data
+   senders or receivers at different moments, but they rarely act as
+   both at the same time.  When traffic is unidirectional, the sender
+   sends the same value for the acknowledgement number and receive
+   window field over and over again.
+
+   We propose to reuse one or both of these fields to advertise
+   sendbuffer information instead when traffic is unidirectional.  To
+   detect unidirectional traffic, the sender will maintain a state
+   variable called SND.NUM_SEG that is initially set to zero, and is
+   zeroed whenever a segment with a valid ACK field is sent out.
+   SND.NUM_SEG will be incremented whenever a segment is received.  A
+   sendbuffer advertisment SHOULD be encoded in outgoing segments only
+   when SND.NUM_SEG = 0.
+
+   Sendbuffer advertising will encode the proper value in the ACK field
+   and NOT set the ACK flag.  This ensures the receiver and other on-
+   path hosts will ignore the field altogether.  We still need, however,
+
+
+
+Agache & Raiciu         Expires January 21, 2016                [Page 5]
+
+Internet-Draft         TCP Sendbuffer Advertising              July 2015
+
+
+   to inform parties interested in sendbuffer information they can use
+   the value of the ACK field.
+
+   In datacenters, we can simply define one of the reserved TCP flags as
+   the sendbuffer advertisement flag.  When this flag is set, the
+   sendbuffer value is encoded in the ACK field.  The sendbuffer
+   advertisement flag and the ACK flag CANNOT be set simultaneously.
+
+   In the Internet, redefining the meaning of one of the reserved flags
+   will simply not work through existing middleboxes; additionally,
+   certain middleboxes may zero the ACK field when the ACK flag is not
+   set.  In this context, we propose to use the receive window field in
+   segments carrying sendbuffer information to encode a checksum of this
+   information.  Interested parties will: a) scan for data segments with
+   the ACK flag not set, b) compute a 1's complement checksum of the ACK
+   field and check it against the receive window field.  In case of a
+   match, the sendbuffer information can be used.  To understand the
+   feasibility of this encoding, however, tests must to be conducted to
+   check the behaviour of middleboxes when the ACK flag is not set.
+
+6.  References
+
+6.1.  Normative References
+
+   [RFC2119]  Bradner, S., "Key words for use in RFCs to Indicate
+              Requirement Levels", BCP 14, RFC 2119, March 1997.
+
+6.2.  Informative References
+
+   [FatTree]  Al-Fares, M., Loukissas, A., and A. Vahdat, "A scalable,
+              commodity data center network architecture", 2008,
+              <http://doi.acm.org/10.1145/1402958.1402967>.
+
+   [IMC-11]   Honda, M., Nishida, Y., Raiciu, C., Greenhalgh, A.,
+              Handley, M., and H. Tokuda, "Is it still possible to
+              extend tcp?", 2011,
+              <http://doi.acm.org/10.1145/2068816.2068834>.
+
+   [NSDI-12]  Raiciu, C., Paasch, C., Barre, S., Ford, A., Honda, M.,
+              Duchene, F., Bonaventure, O., and M. Handley, "How hard
+              can it be? designing and implementing a deployable
+              multipath tcp", 2012,
+              <http://dl.acm.org/citation.cfm?id=2228298.2228338>.
+
+   [RFC5944]  Perkins, C., "IP Mobility Support for IPv4, Revised",
+              RFC 5944, November 2010.
+
+
+
+
+
+Agache & Raiciu         Expires January 21, 2016                [Page 6]
+
+Internet-Draft         TCP Sendbuffer Advertising              July 2015
+
+
+Authors' Addresses
+
+   Alexandru Agache
+   University Politehnica of Bucharest
+   Splaiul Independentei 313
+   Bucharest
+   Romania
+
+   Email: alexandru.agache@cs.pub.ro
+
+
+   Costin Raiciu
+   University Politehnica of Bucharest
+   Splaiul Independentei 313
+   Bucharest
+   Romania
+
+   Email: costin.raiciu@cs.pub.ro
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Agache & Raiciu         Expires January 21, 2016                [Page 7]

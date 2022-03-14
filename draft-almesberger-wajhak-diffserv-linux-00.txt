@@ -1,0 +1,951 @@
+
+
+
+INTERNET-DRAFT                                        Werner Almesberger
+                                                   EPFL ICA, Switzerland
+                                                        Jamal Hadi Salim
+                                                     CTL Nortel Networks
+                                                        Alexey Kuznetsov
+                                                              INR Moscow
+                                                           February 1999
+
+
+                    Differentiated Services on Linux
+             <draft-almesberger-wajhak-diffserv-linux-00.txt>
+
+
+Status of this Memo
+
+     This document is an Internet-Draft and is in full conformance
+     with all provisions of Section 10 of RFC2026.
+
+     Internet-Drafts are working documents of the Internet Engineering
+     Task Force (IETF), its areas, and its working groups.  Note that
+     other groups may also distribute working documents as
+     Internet-Drafts.
+
+     Internet-Drafts are draft documents valid for a maximum of six
+     months and may be updated, replaced, or obsoleted by other
+     documents at any time.  It is inappropriate to use Internet-
+     Drafts as reference material or to cite them other than as
+     "work in progress."
+
+     The list of current Internet-Drafts can be accessed at
+     http://www.ietf.org/ietf/1id-abstracts.txt
+
+     The list of Internet-Draft Shadow Directories can be accessed at
+     http://www.ietf.org/shadow.html.
+
+
+Abstract
+
+   Recent Linux kernels offer a wide variety of traffic control
+   functions, which can be combined in a modular way. We have designed
+   support for Differentiated Services based on the existing traffic
+   control elements, and we have implemented new components where
+   necessary. In this document we give a brief overview of the structure
+   of Linux traffic control, and we describe our prototype
+   implementation in more detail.
+
+
+1. Introduction
+
+   The Differentiated Services architecture (Diffserv) lays the
+   foundation for implementing service differentiation in the Internet
+   in an efficient, scalable way. We assume that readers are familiar
+
+
+Almesberger, Hadi & Kuznetsov           Expires 8/99            [Page 1]
+
+INTERNET-DRAFT     draft-wajhak-diffserv-linux-00.txt      February 1999
+
+
+   with the concepts and terminology defined in [1]. Furthermore, we
+   assume familiarity with the packet marking as described in [2].
+
+   We have developed a design to support basic classification and DS
+   field manipulation required by Diffserv nodes, and to configure the
+   first PHBs that are being defined in the Diffserv WG. We have
+   implemented a prototype of this design using the traffic control
+   framework available in recent Linux kernels. The source code and
+   related information can be obtained from
+   http://lrcwww.epfl.ch/linux-diffserv/
+
+   The main focus of our work is to allow a maximum of flexibility for
+   node configuration and for experiments with PHBs, while still
+   maintaining a design that does not unnecessarily sacrifice
+   performance.
+
+   This document is structured as follows. Section "Linux Traffic
+   Control" gives a brief overview of traffic control functions in
+   recent Linux kernels. Section "Diffserv extensions to Linux traffic
+   control" discusses where the existing model needed to be extended.
+   Section "New components" describes the new components in more detail.
+   We conclude with examples of configuration scripts in section
+   "Building sample configurations".
+
+
+2. Linux Traffic Control
+
+   Figure 1 shows roughly how the kernel processes data received from
+   the network, and how it generates new data to be sent on the network.
+
+                           +---------------+
+                     +---->| TCP, UDP, ... |
+                     |     +---------------+
+                     |             |            TRAFFIC CONTROL
+                     |             v                  |
+   +---------------------+   +------------+   +----------------+
+-->|Input de-multiplexing|-->| Forwarding |-->| Output queuing |-->
+   +---------------------+   +------------+   +----------------+
+
+
+    Figure 1: Processing of network data.
+
+   "Forwarding" includes the selection of the output interface, the
+   selection of the next hop, encapsulation, etc. Once all this is done,
+   packets are queued on the respective output interface. This is the
+   point where traffic control comes into play. Traffic control can,
+   among other things, decide if packets are queued or if they are
+   dropped (e.g. if the queue has reached some length limit, or if the
+   traffic exceeds some rate limit), it can decide in which order
+   packets are sent (e.g. to give priority to certain flows), it can
+   delay the sending of packets (e.g. to limit the rate of outbound
+   traffic), etc.
+
+
+Almesberger, Hadi & Kuznetsov           Expires 8/99            [Page 2]
+
+INTERNET-DRAFT     draft-wajhak-diffserv-linux-00.txt      February 1999
+
+
+   Once traffic control has released a packet for sending, the device
+   driver picks it up and emits it on the network.
+
+
+2.1 Components
+
+      The traffic control code in the Linux kernel consists of the
+      following major conceptual components:
+
+        - queuing disciplines
+        - classes (within a queuing discipline)
+        - filters
+        - policing
+
+      Each network device has a  queuing discipline associated with it,
+      which controls how packets enqueued on that device are treated. A
+      very simple queuing discipline may just consist of a single queue,
+      where all packets are stored in the order in which they have been
+      enqueued, and which is emptied as fast as the respective device
+      can send. See figure 2 for such a queuing discipline without
+      externally visible internal structure.
+
+    +--------------------+
+--->| Queuing discipline |--->
+    +--------------------+
+
+
+       Figure 2: A simple queuing discipline without classes.
+
+      More elaborate queuing disciplines may use  filters to distinguish
+      among different  classes of packets and process each class in a
+      specific way, e.g. by giving one class priority over other
+      classes.
+
+   +-+                 +-----+   +------------------+   +-+      +-+
+   | |     +------+    |     |-->|Queuing discipline|-->| |      | |
+   | |---->|Filter|--->|Class|   +------------------+   | |--+   | |
+   | |  |  +------+    |     +--------------------------+ |  |   | |
+   | |  |              +----------------------------------+  |   | |
+   | |  |  +------+                                          |   | |
+   | |  +->|Filter|-_  +-----+   +------------------+   +-+  |   | |
+-->| |  |  +------+  ->|     |-->|Queuing discipline|-->| |  |   | |-->
+   | |  |              |Class|   +------------------+   | |--+-->| |
+   | |  |  +------+ _->|     +--------------------------+ |      | |
+   | |  +->|Filter|-   +----------------------------------+      | |
+   | |     +------+                                              | |
+   | +-----------------------------------------------------------+ |
+   |  Queuing discipline                                           |
+   +---------------------------------------------------------------+
+
+
+       Figure 3: A simple queuing discipline with multiple classes.
+
+
+Almesberger, Hadi & Kuznetsov           Expires 8/99            [Page 3]
+
+INTERNET-DRAFT     draft-wajhak-diffserv-linux-00.txt      February 1999
+
+
+      Figure 3 shows an example of such a queuing discipline. Note that
+      multiple filters may map to the same class.
+
+      Queuing disciplines and classes are intimately tied together: the
+      presence of classes and their semantics are fundamental properties
+      of the queuing discipline. In contrast to that, filters can be
+      combined arbitrarily with queuing disciplines and classes as long
+      as the queuing discipline has classes at all. But flexibility
+      doesn't end yet - classes normally don't take care of storing
+      their packets themselves, but they use another queuing discipline
+      to take care of that. That queuing discipline can be arbitrarily
+      chosen from the set of available queuing disciplines, and it may
+      well have classes, which in turn use queuing disciplines, etc.
+
+   +-+                 +------+   +---------------+   +-+      +-+
+   | |     +------+    |      |-->|TBF, rate=1Mbps|-->| |      | |
+   | |--+->|Filter|--->|"high"|   +---------------+   | |--+   | |
+   | |  |  +------+    |      +-----------------------+ |  |   | |
+   | |  |              +--------------------------------+  |   | |
+   | |  |                                                  |   | |
+   | |  |              +------+   +---------------+   +-+  |   | |
+-->| |  |  Default     |      |-->| FIFO          |-->| |  |   | |-->
+   | |  +------------->|"low" |   +---------------+   | |--+-->| |
+   | |                 |      +-----------------------+ |      | |
+   | |                 +--------------------------------+      | |
+   | |                                                         | |
+   | +---------------------------------------------------------+ |
+   |  Queuing discipline with two delay priorities               |
+   +-------------------------------------------------------------+
+
+
+       Figure 4: Combination of priority, TBF, and FIFO queuing
+      disciplines.
+
+      Figure 4 shows an example of such a stack: first, there is a
+      queuing discipline with two delay priorities. Packets which are
+      selected by the filter go to the high-priority class, while all
+      other packets go to the low-priority class. Whenever there are
+      packets in the high-priority queue, they are sent before packets
+      in the low-priority queue (e.g. the sch_prio queuing discipline
+      works this way). In order to prevent high-priority traffic from
+      starving low-priority traffic, we use a  token bucket filter
+      (TBF), which enforces a rate of at most 1 Mbps. Finally, the
+      queuing of low-priority packets is done by a FIFO queuing
+      discipline. Note that there are better ways to accomplish what
+      we've done here, e.g. by using  class-based queuing (CBQ).
+
+      Packets are enqueued as follows: when the enqueue function of a
+      queuing discipline is called, it runs one filter after the other
+      until one of them indicates a match. It then queues the packet for
+      the corresponding class, which usually means to invoke the enqueue
+      function of the queuing discipline "owned" by that class. Packets
+
+
+Almesberger, Hadi & Kuznetsov           Expires 8/99            [Page 4]
+
+INTERNET-DRAFT     draft-wajhak-diffserv-linux-00.txt      February 1999
+
+
+      which do not match any of the filters are typically attributed to
+      some default class.
+
+      Typically, each class "owns" one queue, but it is in principle
+      also possible that several classes share the same queue or even
+      that a single queue is used by all classes of the respective
+      queuing discipline. Note however that packets do not carry any
+      explicit indication of which class they were attributed to.
+      Queuing disciplines that change per-class information when
+      dequeuing packets (e.g. CBQ) will therefore not work properly if
+      the "inner" queues are shared, unless they are able either to
+      repeat the classification or to pass the classification result
+      from enqueue to dequeue by some other means.
+
+      Usually when enqueuing packets, the corresponding flow(s) can be
+      policed, e.g. by discarding packets which exceed a certain rate.
+
+
+3. Diffserv extensions to Linux traffic control
+
+   The traffic control framework available in recent Linux kernels [3]
+   already offers most of the functionality required for implementing
+   Diffserv support. We therefore closely followed the existing design
+   and added new components where strictly necessary.
+
+
+3.1 Overview
+
+      Figure 5 shows the general structure of the forwarding path in a
+      Diffserv node.
+
+    +---------+    +-----+        +---------+
+    | Classi- |--->| +-----+      |         |
+--->| fier &  |----->| +-----+    | Marking |--->
+    |  Meter  |------->| PHB |--->|         |
+    +---------+        +-----+    +---------+
+
+
+       Figure 5: General Diffserv forwarding path.
+
+      Depending on the implementation, marking may also occur at
+      different places, possibly even several times.
+
+      The classification result may be used several times in the
+      Diffserv processing path, and it may also depend on external
+      factors (e.g. time), so reproducing the classification result may
+      not even be expensive, but actually impossible.
+
+      We therefore added a new field tc_index to the packet buffer
+      descriptor (struct sk_buff), where we store the result of the
+      initial classification. In order to avoid confusing tc_index with
+      the classifier cls_tcindex, we will call the former skb->tc_index
+
+
+Almesberger, Hadi & Kuznetsov           Expires 8/99            [Page 5]
+
+INTERNET-DRAFT     draft-wajhak-diffserv-linux-00.txt      February 1999
+
+
+      throughout this document.
+
+      skb->tc_index is set using the sch_dsmark queuing discipline,
+      which is also responsible for initially retrieving the DSCP, and
+      for setting the DS field in packets before they are sent on the
+      network. sch_dsmark provides the framework for all other
+      operations.
+
+      The cls_tcindex classifier reads all or part of skb->tc_index
+      field and uses this to select classes.
+
+      Finally, we need a queuing discipline to support multiple drop
+      priorities as required for Assured Forwarding. For this, we
+      designed GRED, a generalized RED. sch_gred provides a configurable
+      number of drop priorities which are selected by the lower bits of
+      skb->tc_index.
+
+
+3.2 Classification and marking
+
+      The classifiers cls_rsvp and cls_u32 can handle all micro-flow
+      classification tasks. In principle, behavior aggregate
+      classification could also be done using cls_u32, but since we
+      usually already have sch_dsmark at the top level, we use the
+      simpler cls_tcindex and retrieve the DSCP using sch_dsmark, which
+      then puts it into skb->tc_index.
+
+      When using sch_dsmark, the class number returned by the classifier
+      is stored in skb->tc_index. This way, the result can be re-used
+      during later processing steps.
+
+      Nodes in multiple DS domains must also be able to distinguish
+      packets by the inbound interface in order to translate the DSCP to
+      the correct PHB. This can be done using the route classifier, in
+      combination with ip rule.
+
+      Marking is done when a packet is dequeued from sch_dsmark.
+      sch_dsmark uses skb->tc_index as an index to a table in which the
+      outbound DSCP is stored and puts this value into the packet's DS
+      field.
+
+                         skb->ihp->tos
+- - - - - - - - - - - - - - - - - - - - - - - - - - - - ->
+                         Initial DS field marking -- ^
+        Initial value of tc_index                    |
+   +-+    +------+ |  +---+-+               +-+    +-|-+
+   | |    | cls_ |--->|   | |-->  . . .  -->| |    | | |
+   | |--->| rsvp |--->|   | |               | |--->| | |
+   | |    |      |--->| | | +---------------+ |    | v |
+-->| |    +------+    +-|-+-------^-----------+    | O |-->
+   | |                  |         |                | ^ |
+   | +------------------|---------|----------------+ | |
+
+
+Almesberger, Hadi & Kuznetsov           Expires 8/99            [Page 6]
+
+INTERNET-DRAFT     draft-wajhak-diffserv-linux-00.txt      February 1999
+
+
+   | sch_dsmark         |         |                  | |
+   +--------------------|---------|------------------|-+
+                        |         | -- tc_index may  |
+                        v         v    change        |
+- - - - - - - - - - - - - - - - - - - - - - - - - - - - ->
+                         skb->tc_index
+
+
+       Figure 6: Micro-flow classifier.
+
+      Figure 6 shows the use of sch_dsmark and skb->tc_index in a
+      micro-flow classifier based on cls_rsvp. Figure 7 shows a behavior
+      aggregate classifier using cls_tcindex.
+
+                         skb->ihp->tos
+- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - ->
+     | -- DS field is used        May change DS field -- ^
+     |    for classification                             |
+   +-|-+      +------+    +---+-+               +-+    +-|-+
+   | | |      | cls_ |--->|   | |-->  . . .  -->| |    | | |
+   | | |----->| tc   |--->|   | |               | |--->| | |
+   | | |      |index |--->| | | +---------------+ |    | v |
+-->| O |      +------+    +-|-+--------------^----+    | O |-->
+   | | |          ^         |                |         | ^ |
+   | | +----------|---------|----------------|---------+ | |
+   | | sch_dsmark |         |                |           | |
+   +-|------------|---------|----------------|-----------|-+
+     |            |         | -- tc_index -- |           |
+     v            |         v    may change  v           |
+- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - ->
+                         skb->tc_index
+
+
+       Figure 7: Behaviour aggregate classifier.
+
+
+3.3 Cascaded classifiers
+
+      Linux traffic control supports a limited form of cascading of
+      classifiers: if multiple classifiers are specified for the same
+      class, they are invoked in sequence until one of them does not
+      return a "no match" code.
+
+      This can also be used to configure multiple meters, e.g. for
+      "low", "high", and "excess" traffic. We have added the possibility
+      for a metering decision to yield "no match" to this end.
+
+      Note that cascading classifiers in this way is not sufficiently
+      flexible for more demanding classification schemes. We are
+      currently examining approaches for further generalizing
+      classification.
+
+
+
+Almesberger, Hadi & Kuznetsov           Expires 8/99            [Page 7]
+
+INTERNET-DRAFT     draft-wajhak-diffserv-linux-00.txt      February 1999
+
+
+3.4 Implementing PHBs
+
+      PHBs based only on delay priorities, e.g. Expedited Forwarding
+      [4], can be built using CBQ [5] or the more simple sch_prio. (See
+      section "Building sample configurations".)
+
+      Besides four delay priorities, which can again be implemented with
+      already existing components, Assured Forwarding [6] also needs
+      three drop priorities, which is more than the current
+      implementation of RED supports. We therefore added a new queuing
+      discipline which we call "generalized RED" (GRED). GRED uses the
+      lower bits of skb->tc_index to select the drop class and hence the
+      corresponding set of RED parameters.
+
+
+3.5 Shaping
+
+      The so-called Token Bucket Filter (sch_tbf) can be used for
+      shaping at edge nodes. Unfortunately, this highest rate which
+      sch_tbf can shape it limited by the system timer, which normally
+      ticks at 100 Hz, but can be accelerated to 1 kHz or more.
+
+      Higher rates can be shaped when using hardware-based solutions,
+      such as ATM.
+
+
+4. New components
+
+   The prototype implementation of diffserv support requires the
+   addition of three new traffic control elements to the kernel: (1) the
+   queuing discipline sch_dsmark to extract and to set the DSCP, (2) the
+   classifier cls_tcindex which uses this information, and (3) the
+   queuing discipline sch_gred which supports multiple drop priorities.
+
+   Only the queueing discipline to extract and set the DSCP is truly
+   specific to the differentiated services architecture. The other two
+   elements can also be used in other contexts.
+
+   Figure 6 shows the use of sch_dsmark for the initial packet marking
+   when entering a diffserv domain. The classification and rate control
+   is performed by a micro-flow classifier, e.g. cls_rsvp, which is
+   designed to identify RSVP flows.
+
+   This classifier determines the initial TC index which is then stored
+   in skb->tc_index. Afterwards, further processing is performed by an
+   inner queuing discipline. Note that this queuing discipline may read
+   and even change skb->tc_index.
+
+   When a packet leaves sch_dsmark, skb->tc_index is examined and the
+   diffserv field of the packet is set accordingly.
+
+   Figure 7 shows the use of sch_dsmark and cls_tcindex in a node which
+
+
+Almesberger, Hadi & Kuznetsov           Expires 8/99            [Page 8]
+
+INTERNET-DRAFT     draft-wajhak-diffserv-linux-00.txt      February 1999
+
+
+   works on a behavior aggregate, i.e. on packets with the diffserv
+   field already set. The procedure is quite similar to the previous
+   scenario, with the exception that cls_tcindex takes over the role of
+   cls_rsvp and that the DS field of the incoming packet is copied to
+   tc_index before invoking the classifier.
+
+   Note that the value of the outbound DS field can be changed in three
+   ways: (1) by establishing a mapping from tcindex to the DS field that
+   is different from the mapping that was used during classification,
+   (2) by mapping the DS field of inbound packets to tc_index values
+   that will be translated to different DS field values on output, and
+   (3) by changing tc_index in the inner queuing discipline.
+
+   Because the mapping in case (1) is more efficient than the mapping in
+   case (3), any numbering scheme should try to use the DS field values
+   of incoming packets also for tc_index.
+
+
+4.1 sch_dsmark
+
+      As illustrated in figure 8, the sch_dsmark queuing discipline
+      performs three actions:
+
+        - If set_tc_index is set, it retrieves the content of the DS
+          field and stores it in skb->tc_index.
+        - It invokes a classifier and stores the class ID returned in
+          skb->tc_index. If the classifier finds no match, default_index
+          is used instead.
+        - After sending the packet through its inner queuing discipline,
+          it uses the resulting value of skb->tc_index as an index into
+          a table of (mask,value) pairs. The original value of the DS
+          field is then replaced using the following formula:
+           ds_field = (ds_field & mask) | value
+
+                                skb->ihp->tos
+- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - ->
+     | -- Optional: DS field is copied to tc_index            |   ^
+     |                                                        |   |
+   +-|-+    +---------+           tc_index is translated +----|---|---+
+   | | |-+->|Filter   |_                   to new DSCP  \|    |   |   |
+   | | | |  +-------^-+ -_ -- res.classid contains       \    v   |   |
+   | | | |          |     -_  new tc_index               |\  (&)>(or) |
+   | | | |  +-------|-+     -->+-------+-------------+   |    ^   ^   |
+   | v | +->|Filter | |------->|classid|Queuing disc.|-->|    |   |   |
+-->| O | |  +-------^-+    _-->+-------+-------------+   |    |___|   |-->
+   | | | | Default  |    _-        |                     |   [__|__]  |
+   | | | +----------|----          |                     | +>[__|__]  |
+   | | |            |  default_index provides tc_index   | | [__|__]  |
+   | | +------------|--------------|---------------------+ |Mask Value|
+   | | sch_dsmark   |              |                       |          |
+   +-|--------------|--------------|-----------------------|----------+
+     |              | -- classifier|may use                |
+
+
+Almesberger, Hadi & Kuznetsov           Expires 8/99            [Page 9]
+
+INTERNET-DRAFT     draft-wajhak-diffserv-linux-00.txt      February 1999
+
+
+     v              |    tc_index  v                       |
+- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - ->
+                               skb->tc_index
+
+
+       Figure 8: The dsmark queuing discipline.
+
+      Table 1 lists the parameters that can be configured in the dsmark
+      queuing discipline. The upper part of the table shows parameters
+      of the queuing discipline itself. The lower part shows parameters
+      of each class.
+
+      ---------------------------------------------------------
+      | Variable name / tc keyword |     Value      | Default |
+      ---------------------------------------------------------
+      |          indices           |      2^n       |  none   |
+      |       default_index        | 0... indices-1 |    0    |
+      |        set_tc_index        |  none (flag)   | absent  |
+      ---------------------------------------------------------
+      |            mask            |    0...0xff    |  0xff   |
+      |           value            |    0...0xff    |    0    |
+      ---------------------------------------------------------
+
+       Table 1: Configuration parameters of sch_dsmark.
+
+      indices is the size of the table of (mask,value) pairs.
+
+
+4.2 cls_tcindex
+
+      As shown in figure 9, the cls_tcindex classifier uses
+      skb->tc_index to select classes. It first calculates the lookup
+      key using the algorithm
+       key = (skb->tc_index >> shift) & mask
+       Then it looks for an entry with this handle. If an entry is
+      found, it may call a meter (if configured), and it will return the
+      class IDs of the corresponding class.
+
+      If no entry is found, the result depends on fall_through. If it is
+      set, it constructs a class ID from the lookup key. Otherwise, it
+      returns a "not found" indication. We call construction of the
+      class ID a "algorithmic mapping". This can be used to avoid
+      setting up a large number of classifier elements if there is a
+      sufficiently simple relation between values of skb->tc_index and
+      class IDs.
+
+                +-----------------+
+                | shift      mask |
+                |   |         |   |
+skb->tc_index ---->(>>) ---->(&)  |
+                |             |   |
+                +-------------|---+
+
+
+Almesberger, Hadi & Kuznetsov           Expires 8/99           [Page 10]
+
+INTERNET-DRAFT     draft-wajhak-diffserv-linux-00.txt      February 1999
+
+
+                              |
+          +-------------------+
+          |       Key
+          v
+       +------------------------+
+       | key  class(id)  police |
+       +------------------------+
+       | key  class(id)  police |
+       +------------------------+
+          |      |         |
+          :      |         +--------> Profile
+          :      |
+          :      +------------------> Class
+          |
+          +-----------------> *:Key
+        if fall_through
+
+
+       Figure 9: The tcindex classifier.
+
+      Table 2 shows the parameters that can be configured in the tcindex
+      classifier. The upper part of the table shows parameters of the
+      classifier itself. The lower part shows parameters of each
+      element.
+
+      -------------------------------------------------------------
+      |   Variable   |  tc keyword   |    Value    |   Default    |
+      -------------------------------------------------------------
+      |     mask     |     mask      | 0...0xffff  |    0xffff    |
+      |    shift     |     shift     |   0...15    |      0       |
+      | fall_through | fall_through/ |    flag     | fall_through |
+      |              |    pass_on    |             |              |
+      -------------------------------------------------------------
+      |     res      |    classid    | major:minor |     none     |
+      |    police    |    police     |   Profile   |     none     |
+      -------------------------------------------------------------
+
+       Table 2: Configuration parameters of cls_tcindex.
+
+      Note that the keyword used by tc (the command-line tool used to
+      manually configure traffic control elements) does not always
+      correspond to the variable internally used by cls_tcindex.
+
+
+4.3 sch_gred
+
+    +-  --  --  --  --  --  --  --  --  --  --  --  --  --  -+
+       Class Virtual   Virtual Q RED
+    |  Queue Selector  Parameters                            |
+
+    |  +-----------+    +---------+                          |
+       | Virtual Q |    |         |
+
+
+Almesberger, Hadi & Kuznetsov           Expires 8/99           [Page 11]
+
+INTERNET-DRAFT     draft-wajhak-diffserv-linux-00.txt      February 1999
+
+
+    |  | Table     |    | [ VQ0 ] |           Class Physical |
+       |  _______  |    |         |   Queue   Queue
+    |  | [_______] |    | [ VQ1 ] |   packet     --------+   |
+-------->[_______]----->|         |----+---------> | | | |------->
+    |  | [_______] |    |   ...   |    |         --------+   |
+       | [_______] |    |         |    | Drop
+    |  | [_______] |    | [ VQn ] |    | packet              |
+       |           |    |         |    X
+    |  +-----------+    +---------+                          |
+
+    +-  --  --  --  --  --  --  --  --  --  --  --  --  --  -+
+
+
+       Figure 10: Generic RED and the use of skb->tc_index
+
+      Figure 10 shows how sch_gred uses skb->tc_index for the selection
+      of the right virtual queue (within a physical queue). What makes
+      sch_gred different from other Multi-RED implementations is the
+      fact that it is decoupled from any one specific classification or
+      even to a classifier per-se. For example, CISCO's WRED is tied to
+      mapping virtual queue selection based on the precedence bits
+      classification. On the other hand, RIO is tied to the IN/OUT
+      levels for the selection of the virtual queue. Any classifier,
+      meter or policer along the data path can affect the selection of
+      the virtual queue by setting the appropriate value of
+      skb->tc_index.
+
+      GRED also differs from the two mentioned multiple RED mechanisms
+      in that it is not limited to a specific number of virtual queues.
+      The number of virtual queues is configurable for each class queue.
+      GRED does not assume certain drop precedences (or priorities). It
+      depends on the configuration parameters passed on by the user. In
+      essence, WRED and RIO are special cases of GRED.
+
+      Currently, the number of virtual queues is limited to 16 (the
+      least significant 4 bits of skb->tc_index). There is a one to one
+      mapping between the values of skb->tc_index and the virtual queue
+      number in a class.
+
+
+5. Building sample configurations
+
+   Given the flexibility of the code, there are many ways to reach the
+   same end goal. Depending on the requirement, one could script the
+   same PHB using a different combinations of qdiscs; e.g. one could
+   build a core EF capable router using either CBQ to rate limit it and
+   prioritise its traffic or instead use the PRIO qdisc with a Token
+   Bucket attached to rate limit it. It is hoped that users of Linux
+   DiffServ will be able to script their own flavored configurations.
+   The examples below are simplistic, in the sense that they only assume
+   one interface per node. The lines are numbered for clarity of the
+   description below.
+
+
+Almesberger, Hadi & Kuznetsov           Expires 8/99           [Page 12]
+
+INTERNET-DRAFT     draft-wajhak-diffserv-linux-00.txt      February 1999
+
+
+   The normal recipe for creating a configuration script is:
+
+     - attach a classful qdisc to a device.
+     - define your classes
+     - identify which packets go to which classes.
+
+
+5.1 Edge device: Packet re-marking
+
+      1. tc qdisc add dev eth0 handle 1:0 root dsmark indices 64
+      2. tc class change dev eth0 classid 1:2 dsmark mask 0xc0 \
+              value 0x2e
+      3. tc class change dev eth0 classid 1:3 dsmark mask 0xc0 \
+              value 0x18
+      4. tc class change dev eth0 classid 1:4 dsmark mask 0xc0 \
+              value 0x1a
+      5. tc filter add dev eth0 parent 1:0 protocol ip prio 5 \
+              handle 1: u32 divisor 256
+      6. tc filter add dev eth0 parent 1:0 prio 4 u32 ht 1:6: \
+              match ip src 10.0.0.1\
+              flowid 1:2
+      7. tc filter add dev eth0 parent 1:0 prio 4 u32 ht 1:7: \
+              police rate 1000kbit burst 1000 action -1 \
+              match ip src 11.0.0.1\
+              flowid 1:3
+      8. tc filter add dev eth0 parent 1:0 prio 5 u32 ht 1:8: \
+              match ip src 11.0.0.1 \
+              flowid 1:4
+      9. tc filter add dev eth0 parent 1:0 prio 5 handle ::1 \
+              u32 ht 800:: \
+              match ip nofrag \
+              offset mask 0x0F00 shift 6 \
+              hashkey mask 0x00ff0000 at 8 \
+              link 1:
+
+      The first line attaches a dsmarker to the interface eth0 on the
+      root node. The dsmarker is capable of setting skb->tc_index by
+      copying the DS field into it. The second line instructs the
+      dsmarker remark the DSCP of classid 1:2 to 0x2e (which happens to
+      be the DSCP fpr EF). Similarly, the third line instructs the
+      dsmarker to remark the DSCP of classid 1:3 to 0x18 (DSCP for
+      AF21). The fourth line adds a remarking the class 1:4 DSCPs to
+      0x1a (DSCP for AF22). These three lines in effect are also
+      registering the classes 1:2, 1:3 and 1:4.
+
+      Line 5 adds a u32 classifier with 256 hash buckets. Line 6 maps
+      all packets with a source IP address of 10.0.0.1 to class 1:2.
+      Line 7 and 8 show how one can attach a meter to a classifier and
+      the reaction to an exceeding of the rate. Basically, the trick is
+      to define two filters matching the same headers with a higher
+      priority one attached with a mater and policing action. -1 stands
+      for fall through. Line 7 matches all packets whose source IP
+
+
+Almesberger, Hadi & Kuznetsov           Expires 8/99           [Page 13]
+
+INTERNET-DRAFT     draft-wajhak-diffserv-linux-00.txt      February 1999
+
+
+      address is 11.0.0.1 up to a certain rate. If the rate exceeds
+      1000kbps (burst rate of 1000 bits), the action is to continue
+      searching for the next filter. In this case the next lower filter
+      with the same match is the one on line 7 which redirects the
+      packet to class 1:4.
+
+      The overall effect is: all packets coming in from source IP
+      address 10.0.0.1 will get their packets marked with a DSCP of
+      0x2e(EF class). All packets from source IP address 11.0.0.1 will
+      get their packets marked as 0x18 for AF class AF21. When the meter
+      starts reporting that the flows from 11.0.0.1 exceed their
+      metering rate, they get remarked to AF22 (DSCP 0x1a).
+
+
+5.2 Core device: EF using CBQ
+
+      The script below is the output of the EF perl script on the Linux
+      DiffServ website.
+
+      1. tc qdisc add dev eth0 handle 1:0 root dsmark indices 64 \
+                 set_tc_index
+      2. tc filter add dev eth0 parent 1:0 protocol ip prio 1 \
+                 tcindex mask 0xfc shift 2
+      3. tc qdisc add dev eth0 parent 1:0 handle 2:0 cbq \
+                 bandwidth 10Mbit allot 1514 cell 8 avpkt 1000 mpu 64
+      4. tc class add dev eth0 parent 2:0 classid 2:1 cbq \
+                 bandwidth 10Mbit \
+                 rate 1500Kbit avpkt 1000 prio 1 bounded isolated \
+                 allot 1514 weight 1 maxburst 10 defmap 1
+      5. tc qdisc add dev eth0 parent 2:1 pfifo limit 5
+      6. tc filter add dev eth0 parent 2:0 protocol ip prio 1 \
+                 handle 0x2e tcindex classid 2:1 pass_on
+      7. tc class add dev eth0 parent 2:0 classid 2:2 cbq \
+                 bandwidth 10Mbit rate 5Mbit avpkt 1000 prio 7 \
+                 allot 1514 weight 1 maxburst 21 borrow
+      8. tc qdisc add dev eth0 parent 2:2 red limit 60KB min 15KB \
+                 max 45KB burst 20 avpkt 1000 bandwidth 10Mbit \
+                 probability 0.4
+      9. tc filter add dev eth0 parent 2:0 protocol ip prio 2 \
+                 handle 0 tcindex mask 0 classid 2:2 pass_on
+
+      Line 1 attaches to the root node on interface eth0 a dsmarker
+      which copies the TOS byte into skb->tc_index. Line 2 adds a filter
+      to the root node which exists merely to mask out the ECN bits and
+      extract the DSCP field by shifting to the right by two bits. A
+      classful qdisc using CBQ is attached to node 2:0 (2:0 is the child
+      of the root node 1:0) - this is in line 3. Two child classes are
+      defined out of the 2:0 node. 2:1 is of type CBQ which is bound to
+      a rate of 1.5 Mbps (line 4). A packet counting FIFO qdisc (pfifo)
+      with a maximum queue size of 5 packets is attached to the CBQ
+      class as the buffer management scheme (line 5). Line 6 adds a
+      tcindex classifier which will redirect all packets with a
+
+
+Almesberger, Hadi & Kuznetsov           Expires 8/99           [Page 14]
+
+INTERNET-DRAFT     draft-wajhak-diffserv-linux-00.txt      February 1999
+
+
+      skb->tc_index 0x2e (the DSCP for EF) to classid 2:1 - non 0x2e are
+      allowed to fall through so they can be matched by another filter.
+      Line 7 defines another CBQ class, 2:1, emanating out of node 2:0 -
+      this is intended to be the Best Effort class. The rate is limited
+      to 5 Mbps; however, the class is allowed to borrow extra bandwidth
+      if it is not being used (via the operator borrow). Since the EF
+      class does not lend its bandwidth (operator isolated line 4), the
+      BE can only borrow up to a maximum of an extra 3.5Mbps. Note that
+      in scenarios where there is no congestion on the wire, this might
+      not be a very smart provisioning scheme since the BE traffic will
+      probably get equivalent traffic performance as EF. The major
+      differentiator in that case will be the priorities. The EF class'
+      traffic will always be served first as long as there is something
+      on the queue (prio 1 is higher than prio 8 in comparing line 4 and
+      7). Line 8 attaches RED as the buffer management scheme to be used
+      by the BE class. Line 9 then maps the rest of the packets (without
+      DSCP of 0x2e) to the classid 2:2. The description of the RED and
+      CBQ parameters are beyond the scope of this document.
+
+
+6. Conclusion
+
+   We have given a brief introduction to the elements of Linux traffic
+   control in general, and then we have explained how the existing
+   infrastructure can be extended in order to support Diffserv. We have
+   then shown how we implemented support for the Diffserv architecture
+   in Linux, using the traffic control framework of recent kernels. We
+   have also described how nodes can be configured using our work.
+
+   Our implementation provides a very flexible platform for experiments
+   with PHBs already under standardization as well as experiments with
+   new PHBs. It can also serve as a platform for work in other areas of
+   Diffserv, such as edge configuration management.
+
+   Future work will focus on the elimination of a few restrictions that
+   still exist in our architecture, and also in the simplification of
+   the configuration procedures.
+
+
+7. References
+
+     [1]  RFC2475; Blake, Steven; Black, David; Carlson, Mark; Davies,
+       Elwyn; Wang, Zheng; Weiss, Walter.  An Architecture for
+       Differentiated Services, IETF, December 1998.
+     [2]  RFC2474; Nichols, Kathleen; Blake, Steven; Baker, Fred; Black,
+       David.  Definition of the Differentiated Services Field (DS
+       Field) in the IPv4 and IPv6 Headers, IETF, December 1998.
+     [3]  Almesberger, Werner.  Linux Traffic Control - Implementation
+       Overview,
+       ftp://lrcftp.epfl.ch/pub/people/almesber/pub/tcio-current.ps.gz,
+       Technical Report SSC/1998/037, EPFL, November 1998.
+     [4]  Jacobson, Van; Nichols, Kathleen; Poduri, Kedarnath.  An
+
+
+Almesberger, Hadi & Kuznetsov           Expires 8/99           [Page 15]
+
+INTERNET-DRAFT     draft-wajhak-diffserv-linux-00.txt      February 1999
+
+
+       Expedited Forwarding PHB (work in progress), Internet Draft
+       draft-ietf-diffserv-phb-ef-02.txt, February 1999.
+     [5]  Floyd, Sally; Jacobson, Van.  Link-sharing and Resource
+       Management Models for Packet Networks, IEEE/ACM Transactions on
+       Networking, Vol. 3 No. 4, pp. 365-386, August 1995.
+     [6]  Heinanen, Juha; Baker, Fred; Weiss, Walter; Wroclawski, John.
+       Assured Forwarding PHB Group (work in progress), Internet Draft
+       draft-ietf-diffserv-af-06.txt, February 1999.
+
+
+
+
+8. Author's address
+
+   Werner Almesberger
+   Institute for computer Communications and Applications
+   Swiss Federal Institute of Technology (EPFL)
+   CH-1015 Lausanne
+   Switzerland
+   email: Werner.Almesberger@epfl.ch
+
+   Jamal Hadi Salim
+   CTL Nortel Networks
+   email: hadi@nortelnetworks.com
+
+   Alexey Kuznetsov
+   INR Moscow
+   email: kuznet@ms2.inr.ac.ru
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Almesberger, Hadi & Kuznetsov           Expires 8/99           [Page 16]
+
+
+cheers,
+jamal
+
+Computing Technology Labs (CTL), Nortel
+
+
