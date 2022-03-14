@@ -1,0 +1,392 @@
+
+
+
+
+v6ops                                                          M. Byerly
+Internet-Draft                                                   M. Hite
+Intended status: Informational                                J. Jaeggli
+Expires: December 4, 2014                                         Fastly
+                                                            June 2, 2014
+
+
+ Close encounters of the ICMP type 2 kind (near misses with ICMPv6 PTB)
+               draft-jaeggli-v6ops-pmtud-ecmp-problem-00
+
+Abstract
+
+   This document calls attention to the problem of delivering ICMPv6
+   type 2 "Packet Too Big" (PTB) messages to intended destinations in
+   ECMP load balanced, anycast network architectures.  It discusses
+   operational mitigations that can address this class of failure.
+
+Status of This Memo
+
+   This Internet-Draft is submitted in full conformance with the
+   provisions of BCP 78 and BCP 79.
+
+   Internet-Drafts are working documents of the Internet Engineering
+   Task Force (IETF).  Note that other groups may also distribute
+   working documents as Internet-Drafts.  The list of current Internet-
+   Drafts is at http://datatracker.ietf.org/drafts/current/.
+
+   Internet-Drafts are draft documents valid for a maximum of six months
+   and may be updated, replaced, or obsoleted by other documents at any
+   time.  It is inappropriate to use Internet-Drafts as reference
+   material or to cite them other than as "work in progress."
+
+   This Internet-Draft will expire on December 4, 2014.
+
+Copyright Notice
+
+   Copyright (c) 2014 IETF Trust and the persons identified as the
+   document authors.  All rights reserved.
+
+   This document is subject to BCP 78 and the IETF Trust's Legal
+   Provisions Relating to IETF Documents
+   (http://trustee.ietf.org/license-info) in effect on the date of
+   publication of this document.  Please review these documents
+   carefully, as they describe your rights and restrictions with respect
+   to this document.  Code Components extracted from this document must
+   include Simplified BSD License text as described in Section 4.e of
+   the Trust Legal Provisions and are provided without warranty as
+   described in the Simplified BSD License.
+
+
+
+Byerly, et al.          Expires December 4, 2014                [Page 1]
+
+Internet-Draft           misses with ICMPv6 PTB                June 2014
+
+
+Table of Contents
+
+   1.  Introduction  . . . . . . . . . . . . . . . . . . . . . . . .   2
+   2.  Problem . . . . . . . . . . . . . . . . . . . . . . . . . . .   2
+   3.  Mitigation  . . . . . . . . . . . . . . . . . . . . . . . . .   4
+     3.1.  Alternatives  . . . . . . . . . . . . . . . . . . . . . .   4
+     3.2.  Implementation  . . . . . . . . . . . . . . . . . . . . .   4
+   4.  Improvements  . . . . . . . . . . . . . . . . . . . . . . . .   5
+   5.  Acknowledgements  . . . . . . . . . . . . . . . . . . . . . .   6
+   6.  IANA Considerations . . . . . . . . . . . . . . . . . . . . .   6
+   7.  Security Considerations . . . . . . . . . . . . . . . . . . .   6
+   8.  Informative References  . . . . . . . . . . . . . . . . . . .   6
+   Authors' Addresses  . . . . . . . . . . . . . . . . . . . . . . .   6
+
+1.  Introduction
+
+   Operators of popular Internet services face unique challenges
+   associated with scaling their infrastructure.  One approach is to
+   utilize equal-cost multi-path (ECMP) routing to perform stateless
+   distribution of incoming TCP or UDP sessions to multiple servers or
+   middle boxes such as load balancers.  However, distribution of
+   traffic in this manner presents a problem when dealing with ICMP
+   signaling.  Specifically, an ICMP error is not guaranteed to hash via
+   ECMP to the same destination as its corresponding TCP or UDP session.
+   A case that is particularly problematic operationally is path MTU
+   discovery (PMTUD).
+
+2.  Problem
+
+   A common application for stateless load balancing of TCP or UDP flows
+   is to perform an initial subdivision of flows in front of a stateful
+   load balancer tier or multiple servers such that the workload is
+   divided into manageable chunks.  The division is performed using ECMP
+   forwarding and a stateless but sticky algorithm for hashing the flows
+   across the available paths.  This is a constrained form of anycast
+   distribution where all anycast destinations are equidistant
+   topologically from the upstream router responsible for making the
+   last next-hop forwarding decision.  In this approach, the hash is
+   performed across available protocol headers.  Typically, these
+   headers may include flow-label, ingress interface, IP-source, IP-
+   destination, protocol, source-port, and destination-port.
+
+   A problem common to the approach of distribution through hashing is
+   its impact on path MTU discovery.  An ICMPv6 type 2 PTB message
+   generated on the path between a client and an ECMP load balanced
+   server will have the anycast address as the destination and will be
+   statelessly load balanced to one of the anycast servers.  While the
+   ICMPv6 PTB message contains as much of the packet that could not be
+
+
+
+Byerly, et al.          Expires December 4, 2014                [Page 2]
+
+Internet-Draft           misses with ICMPv6 PTB                June 2014
+
+
+   forwarded as possible, the payload headers do not factor into the
+   forwarding decision and are ignored.  Because of this, the results of
+   the ICMPv6 ECMP hash do not match that of the corresponding TCP or
+   UDP ECMP hash.
+
+   An example packet flow and topology follow.
+
+
+   ptb -> router ecmp -> nexthop L4/L7 load balancer -> destination
+
+     router --> load balancer 1 --->
+          \\--> load balancer 2 ---> load-balanced service
+           \--> load balancer N --->
+
+
+                                 Figure 1
+
+   The router ECMP decision is used because it is part of the forwarding
+   architecture, can be performed at line rate, and does not depend on
+   shared state or coordination across a distributed forwarding
+   architecture which may include multiple routers.  The ECMP routing
+   decision is deterministic with respect to packets having the same
+   computed hash.
+
+   The typical case where ICMPv6 PTB messages are received at the load
+   balancer is where the path MTU from the client to the load balancer
+   is limited by a tunnel in which the client itself is not aware of.
+   In particular, in the case of a TCP connection where TLS is employed,
+   the first packet that is likely to exceed a tunnel MTU lower than
+   that specified by the MSS on the client and the load balancer/server
+   is the TLS ServerHello and certificate.
+
+   Direct experience says that the frequency of PTB messages is small
+   compared to total flows.  This says a lot about native vs. tunneled
+   IPv6 deployment and the relative maturity of production IPv6
+   deployment.  Techniques such as happy-eyeballs may actually
+   contribute some amelioration to the IPv6 client experience.  Still,
+   the expectation is that PMTUD should work and that unnecessary
+   breakage of client traffic should be avoided.
+
+   Some final observations are that it is typically not possible even if
+   potentially desirable to be able to independently set the TCP MSS for
+   different address families on end-systems.
+
+   The problem as described does also impact IPv4; however, the ability
+   to fragment on wire and the relative rarity of sub-1500 byte MTUs
+   that are not coupled to changes in client behavior (for example,
+   endpoint VPN clients set the tunnel interface MTU accordingly for
+
+
+
+Byerly, et al.          Expires December 4, 2014                [Page 3]
+
+Internet-Draft           misses with ICMPv6 PTB                June 2014
+
+
+   performance reasons) makes the problem sufficiently rare that some
+   deployments simply choose to ignore it.
+
+3.  Mitigation
+
+   Mitigation of the described issue involves ensuring that an ICMPv6
+   error message is distributed to the same anycast server responsible
+   for the flow for which the error is generated.  Mitigation could be
+   done by looking into the payload of the ICMPv6 message (to determine
+   which TCP flow it was associated with) before making a forwarding
+   decision.
+
+   Alternative mitigation is predicated upon distributing the PTB
+   message to all anycast servers under the assumption that the one that
+   needs it will be able to match it to a flow and the others can update
+   their route cache with the new MTU.  Such distribution has
+   significant implications for resource consumption and the potential
+   for self-inflicted denial-of-service if not carefully employed.
+   Fortunately, the number of flows for which this problem occurs is
+   relatively small (10 or fewer pps on 1Gb/s or more worth of https
+   traffic) and sensible ingress rate limits can protect the anycast
+   server tiers with potential fallout only under circumstances of
+   deliberate duress.
+
+3.1.  Alternatives
+
+   As an alternative it is assumed to be appropriate to lower the TCP
+   MSS to 1220 in order to accommodate 1280 byte MTU.  We consider this
+   undesirable as hosts may not be able to independently set TCP MSS by
+   address-family, or alternatively that it relies on a middle-box to
+   clamp the MSS independently from the end-systems.
+
+3.2.  Implementation
+
+   1.  Filter-based-forwarding matches next-header ICMPv6 type-2 and
+       matches a next-hop on a particular subnet directly attached to
+       both border routers.  (Filter is policed to reasonable limits, we
+       chose 1000pps)
+
+   2.  Filter is applied on input side of all external interfaces
+
+   3.  A proxy located at the next hop forwards ICMPv6 type-2 packets
+       received at the next-hop to an Ethernet broadcast address
+       (example ff:ff:ff:ff:ff:ff) on all specified subnets.  This was
+       necessitated by the routers inability (in IPv6) to forward the
+       same packet to multiple next-hops.
+
+
+
+
+
+Byerly, et al.          Expires December 4, 2014                [Page 4]
+
+Internet-Draft           misses with ICMPv6 PTB                June 2014
+
+
+   4.  Anycast servers receive the PTB error and process packet as
+       needed
+
+   A simple Python scapy script can be used to perform the ICMPv6 proxy
+   reflection.
+
+      #!/usr/bin/python
+
+      from scapy.all import *
+
+      IFACE_OUT = ["p2p1", "p2p2"]
+
+      def icmp6_callback(pkt):
+          if pkt.haslayer(IPv6) and (ICMPv6PacketTooBig in pkt) and pkt[Ether].dst != 'ff:ff:ff:ff:ff:ff':
+              del(pkt[Ether].src)
+              pkt[Ether].dst = 'ff:ff:ff:ff:ff:ff'
+              pkt.show()
+              for iface in IFACE_OUT:
+                  sendp(pkt, iface=iface)
+
+      def main():
+          sniff(prn=icmp6_callback, filter="icmp6 and (ip6[40+0] == 2)", store=0)
+
+      if __name__ == '__main__':
+          main()
+
+   This example script listens on all interfaces for IPv6 PTB errors
+   being forwarded using filter-based-forwarding.  It removes the
+   existing Ethernet source and rewrites a new Ethernet destination of
+   the Ethernet broadcast address.  It then sends the resulting frame
+   out the p2p1 and p2p2 interfaces where our anycast servers reside.
+
+4.  Improvements
+
+   There are several ways to imagine that improvements could be made to
+   the situation with respect to ECMP load balancing of ICMPv6 PTB.
+
+   1.  Routers with sufficient capacity within the lookup process could
+       parse all the way through the L3 or L4 header in the ICMPv6
+       payload beginning at bit offset 32 of the ICMP header.  By
+       reordering the elements of the hash to match the inward direction
+       of the flow, the PTB error could be directed to the same next-hop
+       as the incoming packets in the flow.
+
+   2.  The FIB could be programmed with a multicast distribution tree
+       that included all of the necessary next-hops.
+
+
+
+
+
+Byerly, et al.          Expires December 4, 2014                [Page 5]
+
+Internet-Draft           misses with ICMPv6 PTB                June 2014
+
+
+   3.  Ubiquitous implementation of RFC 4821 [RFC4821] Packetization
+       Layer Path MTU Discovery would probably go a long way towards
+       reducing dependence on ICMPv6 PTB.
+
+5.  Acknowledgements
+
+   The authors would like to thank Ray Hunter for review.
+
+6.  IANA Considerations
+
+   This memo includes no request to IANA.
+
+7.  Security Considerations
+
+   The employed mitigation has the potential to greatly amplify the
+   impact of a deliberately malicious sending of ICMPv6 PTB messages.
+   Sensible ingress rate limiting can reduce the potential for impact;
+   however, legitimate traffic may be lost in the process.
+
+   The proxy replication results in devices not associated with the flow
+   that generated the PTB being recipients of an ICMPv6 message which
+   contains a fragment of a packet.  This could arguably result in
+   information disclosure.  Recipient machines should be in a common
+   administrative domain.
+
+8.  Informative References
+
+   [RFC4821]  Mathis, M. and J. Heffner, "Packetization Layer Path MTU
+              Discovery", RFC 4821, March 2007.
+
+Authors' Addresses
+
+   Matt Byerly
+   Fastly
+   Kapolei, HI
+   US
+
+   Email: mbyerly@zynga.com
+
+
+   Matt Hite
+   Fastly
+   Redwood City, CA
+   US
+
+   Email: mhite@hotmail.com
+
+
+
+
+
+Byerly, et al.          Expires December 4, 2014                [Page 6]
+
+Internet-Draft           misses with ICMPv6 PTB                June 2014
+
+
+   Joel Jaeggli
+   Fastly
+   Mountain View, CA
+   US
+
+   Email: joelja@gmail.com
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Byerly, et al.          Expires December 4, 2014                [Page 7]

@@ -1,0 +1,448 @@
+
+
+
+
+Internet Engineering Task Force                                J. Durand
+Internet-Draft                                                     CISCO
+Intended status: Standards Track                             D. Freedman
+Expires: September 10, 2015                                     Claranet
+                                                           March 9, 2015
+
+
+           Path validation toward BGP next-hop with AUTO-BFD
+                     draft-jdurand-auto-bfd-00.txt
+
+Abstract
+
+   This document describes a solution called AUTO-BFD, that
+   automatically initiates BFD sessions for BGP next-hops.  This makes
+   it possible to avoid blackholing scenarios when a BGP peer is not the
+   BGP next-hop, especially on Internet eXchange Points (IXPs) when BGP
+   Route-Servers are deployed.  When they are configured with this
+   mechanism, routers can automatically try to establish a new adjacency
+   for every new BGP next-hop.  BGP routes are then checked against the
+   state of the BFD session for the corresponding next-hop.
+
+Foreword
+
+   A placeholder to list general observations about this document.
+
+Requirements Language
+
+   The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT",
+   "SHOULD", "SHOULD NOT", "RECOMMENDED", "MAY", and "OPTIONAL" in this
+   document are to be interpreted as described in RFC 2119 [1].
+
+Status of This Memo
+
+   This Internet-Draft is submitted in full conformance with the
+   provisions of BCP 78 and BCP 79.
+
+   Internet-Drafts are working documents of the Internet Engineering
+   Task Force (IETF).  Note that other groups may also distribute
+   working documents as Internet-Drafts.  The list of current Internet-
+   Drafts is at http://datatracker.ietf.org/drafts/current/.
+
+   Internet-Drafts are draft documents valid for a maximum of six months
+   and may be updated, replaced, or obsoleted by other documents at any
+   time.  It is inappropriate to use Internet-Drafts as reference
+   material or to cite them other than as "work in progress."
+
+   This Internet-Draft will expire on September 10, 2015.
+
+
+
+
+Durand & Freedman      Expires September 10, 2015               [Page 1]
+
+Internet-Draft                  AUTO-BFD                      March 2015
+
+
+Copyright Notice
+
+   Copyright (c) 2015 IETF Trust and the persons identified as the
+   document authors.  All rights reserved.
+
+   This document is subject to BCP 78 and the IETF Trust's Legal
+   Provisions Relating to IETF Documents
+   (http://trustee.ietf.org/license-info) in effect on the date of
+   publication of this document.  Please review these documents
+   carefully, as they describe your rights and restrictions with respect
+   to this document.  Code Components extracted from this document must
+   include Simplified BSD License text as described in Section 4.e of
+   the Trust Legal Provisions and are provided without warranty as
+   described in the Simplified BSD License.
+
+Table of Contents
+
+   1.  Introduction  . . . . . . . . . . . . . . . . . . . . . . . .   2
+   2.  Definitions and Accronyms . . . . . . . . . . . . . . . . . .   3
+   3.  Solution Requirements . . . . . . . . . . . . . . . . . . . .   3
+   4.  Solution Overview . . . . . . . . . . . . . . . . . . . . . .   4
+   5.  BFD Session Ageing  . . . . . . . . . . . . . . . . . . . . .   5
+   6.  Possible other use cases  . . . . . . . . . . . . . . . . . .   6
+   7.  Future Work . . . . . . . . . . . . . . . . . . . . . . . . .   6
+   8.  Acknowledgements  . . . . . . . . . . . . . . . . . . . . . .   7
+   9.  IANA Considerations . . . . . . . . . . . . . . . . . . . . .   7
+   10. Security Considerations . . . . . . . . . . . . . . . . . . .   7
+   11. References  . . . . . . . . . . . . . . . . . . . . . . . . .   7
+     11.1.  Normative References . . . . . . . . . . . . . . . . . .   7
+     11.2.  Informative References . . . . . . . . . . . . . . . . .   7
+   Appendix A.  Configuration  . . . . . . . . . . . . . . . . . . .   7
+   Authors' Addresses  . . . . . . . . . . . . . . . . . . . . . . .   8
+
+1.  Introduction
+
+   Internet eXchange Points (IXPs) implement BGP Route-Servers (RS) [5]
+   so that connected members do not need to configure BGP peerings with
+   every other member to exchange routes.  Through a single peering with
+   the RS, a member can receive routes of all the other members peering
+   with the RS.  The RS redistributes routes and could simply be
+   described as a Route-Reflector for eBGP peerings.
+
+   Usually, deployed RS do not modify the BGP next-hop of exchanged
+   routes so traffic exchanged between IXP members does not pass through
+   the RS, which keeps only a control-plane role, exactly as for a BGP
+   RR.  The drawback is that it may happen that a peering stays up
+   between members and route-server while there is no connectivity
+   between members.  This results in black holes for members with no
+
+
+
+Durand & Freedman      Expires September 10, 2015               [Page 2]
+
+Internet-Draft                  AUTO-BFD                      March 2015
+
+
+   easy troubleshooting: usually upon such problem a member just shuts
+   its connectivity to the IXP.  This situation has happened several
+   times on many different IXPs and many members do not want to peer
+   with route-servers for this reason.
+
+
+
+                       EBGP UP---->  RS <-------EBGP UP
+                           |              |               |
+                       |              |               |
+                  ----------------IXP LAN---------------------
+                       |   |                       |  |
+                       V   |                       |  V
+                     Member 1 <================> Member 2
+                                     BROKEN
+                                  CONNECTIVITY
+
+
+                                 Figure 1
+
+   This proposal intends to solve this situation with the automation of
+   BFD adjacency creation when new BGP next-hops are discovered.  When
+   configured with this solution, routers can automatically try to
+   establish a new adjacency for every new BGP next-hop.  BGP routes are
+   then checked against the BFD session states for the corresponding
+   next-hop.
+
+2.  Definitions and Accronyms
+
+   o  BFD: Bidirectional Forwarding Detection protocol [3][4]
+
+   o  BGP: Border Gateway Protocol [2]
+
+   o  IXP: Internet eXchange Point
+
+   o  RR: Route Reflector (BGP Route-Reflector)
+
+   o  RS: Route Server (BGP Route-Server) [5]
+
+3.  Solution Requirements
+
+   The following requirements apply to the solution described in this
+   document:
+
+   o  The solution MUST be independent of the BGP route-server's
+      configuration.  In other words IXP members SHOULD be able to check
+      each other's liveliness without anything configured on the route-
+      server.
+
+
+
+Durand & Freedman      Expires September 10, 2015               [Page 3]
+
+Internet-Draft                  AUTO-BFD                      March 2015
+
+
+   o  Solution MUST NOT imply a configuration per IXP member.  Each IXP
+      member SHOULD automatically discover other members and
+      automatically start probing when this is possible.
+
+   o  The solution MUST accept situations when not all the IXP members
+      do not implement it.  In other words the implementation of this
+      mechanism on one of the IXP member MUST NOT impact the other
+      members.
+
+   o  The solution SHOULD rely on a widely adopted host liveliness
+      verification protocol in the context of BGP peerings.  The used
+      host liveliness mechanism MUST be negotiated between members to
+      avoid false positives.
+
+   o  The solution SHOULD be as simple as possible and SHOULD NOT
+      require the design of a new protocol.
+
+   Based on these requirements, the following is suggested:
+
+   o  BFD [3] (Bidirectional Forwarding Detection) is an appropriate
+      liveliness verification mechanism that IXP members can use to
+      check their mutual status.  It is widely adopted in the Internet
+      community for this use and its scalability on modern routers makes
+      it suitable for IXPs.  Also BFD integrates an initial negotiation
+      phase that makes it appropriate to interdomain scenarios, when all
+      routers are not configured with the same options.
+
+   o  IXP members cannot easily rely on an existing protocol to announce
+      their mutual capability to support a host liveliness protocol.
+      Since IXP members using BGP RS do not directly establish BGP
+      peerings between them, any use of BGP to announce BFD capability
+      would require solution support on the BGP RS which would prevent
+      any usage on an IXP not implementing it.  Solutions based on
+      optional transitive BGP attribute have been studied [6] and showed
+      some complexity and privacy challenges as it could force every
+      member to disclose topology information globally to the
+      downstreams of other IXP members.
+
+4.  Solution Overview
+
+   The solution proposed in this document, named AUTO-BFD, is
+   straightforward and relies on existing mechanisms.  It works as
+   follows:
+
+   o  AUTO-BFD is configured on the BGP peering to the BGP RS.
+
+   o  Every time a new BGP next-hop is received from this peering, AUTO-
+      BFD triggers a new BFD session with this next-hop (or reinstates
+
+
+
+Durand & Freedman      Expires September 10, 2015               [Page 4]
+
+Internet-Draft                  AUTO-BFD                      March 2015
+
+
+      an existing session, see Section 5).  The operation mode for this
+      BFD session MUST be asynchronous.  Timers can be locally
+      configured.  Optional security configuration can limit the number
+      of authorized adjacencies or trigger BFD only for next-hops in a
+      given prefix.  Other optional configuration can define the BFD
+      timers.
+
+   o  Routes coming from the AUTO-BFD enabled BGP neighbor are then
+      checked based on the BGP next-hop and its BFD session state.
+      Acceptance of routes is then subject to the administrative policy
+      based on BFD session state.  An example of such a policy can be
+      found in appendix Appendix A
+
+5.  BFD Session Ageing
+
+   In order to maintain the relevance of AUTO-BFD sessions, it is
+   required to prune sessions when they are not needed anymore.  A
+   router X may not simply prune BFD session toward Y when there are no
+   more routes with corresponding next-hop Y as the BFD session may
+   still be needed by the Y to accept route from X.
+
+   The following solution makes it possible to prune BFD sessions only
+   when it is sure the remote end does not need it anymore.  A per-
+   session timer (bfd.AutoAge) is defined to determine an interval.
+   This timer MAY derive its configuration from a global value in an
+   implementation.  The timer counts down until it expires, at which
+   point, the relevant AUTO-BFD session is checked against next-hop
+   information received from the AUTO-BFD configured BGP session to
+   determine if there are still next hops received which relate to the
+   session.  Based on the information, the following occurs:
+
+   o  If next-hops for the remote system are still being received,
+      bfd.LocalDiag should be set to XX, which will set the appropriate
+      diagnostic code "XX - Continuing AUTO-BFD" (to be assigned by
+      IANA) in the outgoing control packet, to indicate that the next
+      hop continues to be seen and used by this system.  At this point,
+      the timer is reset and no further action is taken until it expires
+      next.
+
+   o  If next-hops for the remote system are no longer being received,
+      the following occurs:
+
+      *  If the session is still up (bfd.Sessionstate is UP) and a
+         control packet arrives which would not change the state, but
+         with the flag "XX - Continuing AUTO-BFD" set, this indicates
+         that the remote system is still receiving routes with the local
+         system as the next hop.  In this case, the session MUST remain
+
+
+
+
+Durand & Freedman      Expires September 10, 2015               [Page 5]
+
+Internet-Draft                  AUTO-BFD                      March 2015
+
+
+         up, the timer is reset and no further action is taken until it
+         expires next.
+
+      *  If the session is still up (bfd.Sessionstate is UP) and a
+         control packet arrives which would not change the state, but
+         does not set the "XX - Continuing AUTO-BFD" diagnostic flag,
+         then we must consider that the remote system is no longer
+         receiving routes with the local system as next hop.  In this
+         case, the bfd.LocalState should be set to 'AdminDown' and the
+         session should be placed in an Administrative Down state.
+
+   When a session is first established (or indeed re-established as per
+   Section 4), it is important that the bfd.LocalDiag should be set to
+   XX to ensure that control packets start to signal this state to the
+   remote system.
+
+6.  Possible other use cases
+
+   While the primary focus of the authors is to solve the issue met with
+   BGP route-servers on IXPs described in section Section 1, the
+   proposed solution may also apply to the following use cases:
+
+   o  IBGP Route-Reflector (RR): the scenario described for BGP RS could
+      also apply for IBGP RR.  The solution described in this draft
+      could be used to validate received IBGP routes against real
+      reachability of BGP next-hop (a router in same AS in case next-hop
+      self is used, or the EBGP next-hop announcing the route.
+
+   o  Any EBGP peering: the proposed solution would enable automatic BFD
+      auto-deployment on every EBGP peering.  AUTO-BFD would
+      automatically "harden" the peering without the need of any
+      additional configuration.
+
+7.  Future Work
+
+   Following points may need to be documented further in next versions
+   of this document based on comments received by the community:
+
+   o  AUTO-BFD interoperability with manual BFD sessions.
+
+   o  S-BFD integration
+
+   o  Security considerations
+
+
+
+
+
+
+
+
+Durand & Freedman      Expires September 10, 2015               [Page 6]
+
+Internet-Draft                  AUTO-BFD                      March 2015
+
+
+8.  Acknowledgements
+
+   The authors would like to thank the following people for their
+   comments and support: [TBD].
+
+9.  IANA Considerations
+
+   This memo requests a code point from the registry for BFD diagnostic
+   codes [3]: XX -- Continuing Auto-BFD
+
+10.  Security Considerations
+
+   TBD
+
+11.  References
+
+11.1.  Normative References
+
+   [1]        Bradner, S., "Key words for use in RFCs to Indicate
+              Requirement Levels", BCP 14, RFC 2119, March 1997.
+
+   [2]        Rekhter, Y., Li, T., and S. Hares, "A Border Gateway
+              Protocol 4 (BGP-4)", RFC 4271, January 2006.
+
+   [3]        Katz, D. and D. Ward, "Bidirectional Forwarding Detection
+              (BFD)", RFC 5880, June 2010.
+
+   [4]        Katz, D. and D. Ward, "Bidirectional Forwarding Detection
+              (BFD) for IPv4 and IPv6 (Single Hop)", RFC 5881, June
+              2010.
+
+   [5]        "Internet Exchange Route Server",
+              <http://tools.ietf.org/id/
+              draft-ietf-idr-ix-bgp-route-server-06.txt>.
+
+11.2.  Informative References
+
+   [6]        "Path validation toward BGP next-hop",
+              <https://tools.ietf.org/id/draft-jdurand-idr-next-hop-
+              liveliness-00.txt>.
+
+Appendix A.  Configuration
+
+   This configuration in classic Cisco IOS style will help reader
+   understand the way AUTO-BFD can be integrated in current deployments.
+
+
+
+
+
+
+Durand & Freedman      Expires September 10, 2015               [Page 7]
+
+Internet-Draft                  AUTO-BFD                      March 2015
+
+
+   router bgp 65001
+    neighbor 192.0.2.102 remote-as 65102
+    !
+    address-family ipv4 unicast
+     neighbor 192.0.2.102 activate
+     neighbor 192.0.2.102 auto-bfd
+     neighbor 192.0.2.102 route-map FROM-RS in
+   !
+   route-map FROM-RS permit 10
+    match next-hop bfd-session-state Up
+    set local-pref 120
+   route-map FROM-RS deny 20
+    match next-hop bfd-session-state Down Init
+   route-map FROM-RS permit 30
+    match next-hop bfd-session-state AdminDown
+    set local-pref 50
+
+                                 Figure 2
+
+Authors' Addresses
+
+   Jerome Durand
+   CISCO Systems, Inc.
+   11 rue Camille Desmoulins
+   Issy-les-Moulineaux  92782 CEDEX
+   FR
+
+   Email: jerduran@cisco.com
+
+
+   David Freedman
+   Claranet
+   21 Southampton Row, Holborn
+   London  WC1B 5HA
+   UK
+
+   Email: david.freedman@uk.clara.net
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Durand & Freedman      Expires September 10, 2015               [Page 8]
