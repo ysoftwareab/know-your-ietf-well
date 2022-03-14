@@ -1,0 +1,1135 @@
+
+   DNSIND Working Group                              Paul Vixie (Ed.) (ISC)
+   INTERNET-DRAFT                                  Susan Thomson (Bellcore)
+   <draft-ietf-dnsind-dynDNS-05.txt>                  Yakov Rekhter (Cisco)
+                                                            Jim Bound (DEC)
+                                                              November 1995
+
+
+               Dynamic Updates in the Domain Name System (DNS)
+
+
+   Status of this Memo
+
+      This document is a submission to the dnsind Working Group of the
+      Internet Engineering Task Force (IETF). Comments should be submitted
+      to the namedroppers@internic.net mailing list.
+
+      This document is an Internet Draft.  Internet Drafts are working doc-
+      uments of the Internet Engineering Task Force (IETF), its Areas, and
+      its Working Groups. Note that other groups may also distribute work-
+      ing documents as Internet Drafts.
+
+      Internet Drafts are draft documents valid for a maximum of six
+      months.  Internet Drafts may be updated, replaced, or obsoleted by
+      other documents at any time.  It is not appropriate to use Internet
+      Drafts as reference material or to cite them other than as a "working
+      draft" or "work in progress."
+
+      To learn the current status of any Internet Draft.  please check the
+      1id-abstracts.txt listing contained in the Internet Drafts Shadow
+      Directories on ds.internic.net, nic.nordu.net, ftp.nisc.sri.com or
+      munnari.oz.au.
+
+
+   Abstract
+
+      The Domain Name System was originally designed to support queries of
+      a statically configured database.  While the data was expected to
+      change, the frequency of those changes was expected to be fairly low,
+      and all updates were made as external edits to a zone's Master File.
+
+      This document describes extensions to the Domain Name System that
+      allow zone changes to be made dynamically by clients.  The extensions
+      provide support for adding and deleting names and associated resource
+      records.
+
+
+
+
+   Expires June, 1996                                             [Page 1]
+
+
+
+
+
+   INTERNET-DRAFT                 DNS UPDATE                 November 1995
+
+
+   1.0 - Definitions
+
+   This document intentionally gives more definition to the roles of "Mas-
+   ter," "Slave", and "Primary Master" servers, and their enumeration in NS
+   RRs, and the SOA MNAME field.  In that sense, the following server type
+   definitions can be considered an addendum to [RFC1035], and are intended
+   to be consistent with [NOTIFY]:
+
+      Slave           an authoritative server which uses zone transfer to
+                      retrieve the zone.  All slave servers are named in
+                      the NS RRs for the zone.
+
+      Master          any authoritative server configured to be the source
+                      of zone transfer for one or more slave servers.  All
+                      slave servers are named in the NS RRs for the zone.
+
+      Primary Master  master server at the root of the zone transfer depen-
+                      dency graph.  The primary master is named in the
+                      zone's SOA MNAME field and optionally by an NS RR.
+                      There is by definition only one primary master server
+                      per zone.
+
+   A domain name identifies a node within the domain name space tree struc-
+   ture.  Each node has a set (possibly empty) of Resource Records (RRs)
+   called a Resource Record Set (RRset.)
+
+   An update request is an atomic transaction consisting of a sequence of
+   operations on a set of names and RRs in a zone.  There are four types of
+   update operations:
+
+      ADDNAMENEW    Add a new name and a set of RRs to a zone.
+
+                    This operation is only successful if the name does not
+                    already exist.  The effect of the operation is to cre-
+                    ate a new node in the name space and add records to
+                    this node.  The existence rules are described in more
+                    detail below.
+
+      ADDNAMEEXIST  Add new RRs to an existing name in a zone.
+
+                    This operation is only successful if the name already
+                    exists.  The effect of the operation is to add to the
+                    RRset of a previously existing node in the name space.
+
+
+
+
+
+   Expires June, 1996                                             [Page 2]
+
+
+
+
+
+   INTERNET-DRAFT                 DNS UPDATE                 November 1995
+
+
+      ADD           Add RRs to a possibly new name in a zone.
+
+                    If the name already exists, then the semantics of this
+                    operation are the same as ADDNAMEEXIST.  If the name
+                    does not exist, then the semantics of this operation
+                    are the same as ADDNAMENEW.
+
+      DELETE        Delete records from zone.
+
+                    This operation is only successful if the specified
+                    records exist.  It is also possible to specify a wild-
+                    card such that all resource records denoted by a
+                    {name,class,type} can be deleted without specifying
+                    each and every one of them.
+
+   For simplicity, the above definitions have been written as if an opera-
+   tion can only be applied to a single node at a time.  While this may be
+   the way the mechanisms are used intuitively, this mode of operation is
+   not mandatory.  Each operation may be applied to a set of records with
+   different names and types.  However, the records must all be of the same
+   class and zone (see below).
+
+   UPDATE transactions have the following properties:
+
+      Atomicity  The effect of an update request is to perform all of the
+                 operations in the transaction, if all can be performed
+                 successfully, or none at all.  However, the effects of a
+                 previous operation on a particular record in an update
+                 request are visible to subsequent operations on records in
+                 that request, i.e. the zone is updated incrementally,
+                 albeit tentatively, as the update is processed.  An excep-
+                 tion is made in the case of the ADDNAMENEW operation: it
+                 is permissible to add multiple records associated with a
+                 new name using this operation.  (See the Name Server
+                 Behavior and Example sections for further clarification.)
+
+      Stability  A successful update means that no errors were detected and
+                 that the update has been applied to the zone by the pri-
+                 mary master server, and has been committed to stable stor-
+                 age.  Updates are applied to slave servers asynchronously
+                 (see Section 3.)
+
+      Scope      All records updated in a request must be contained within
+                 a single zone, and hence all must have the same class.
+
+
+
+
+   Expires June, 1996                                             [Page 3]
+
+
+
+
+
+   INTERNET-DRAFT                 DNS UPDATE                 November 1995
+
+
+      Coherence  The zone serial number is updated as a side effect of an
+                 update request (unless explicitly updated as part of the
+                 request), but this may be done either at the time of the
+                 update or asynchronously, at the discretion of the primary
+                 master server (see Section 3.)  This does not change cache
+                 coherence, which depends on the TTL field of cached
+                 records, but it does guarantee a direct mapping between
+                 authority zone contents and zone serial numbers.
+
+
+   1.1 - Resource Record Comparison Rules
+
+   The four types of update operations depend on comparing for equality an
+   existing record with a record included in an update.  For example, the
+   DELETE operation requires that the record exist before it is deleted,
+   and ADD* operations must be idempotent.
+
+   Two RRs are considered equal if their name, type, data length and data
+   value are the same, with exceptions as noted below.  Note that the time-
+   to-live (TTL) field is explicitly excluded from the comparison.
+
+   The following RR types cannot be checked for identity by simply compar-
+   ing their data length and data values; instead, the fields within their
+   data must be compared as follows:
+
+      SOA  compare only name and type (SOA) -- it is not possible to have
+           more than one SOA per zone, even if the data fields differ.
+
+      SIG  compare only name, type, type covered, signer's name, key, and
+           algorithm -- ignore differences (if any) in the signature data
+           itself.
+
+      WKS  compare only name, type, address, and protocol -- only one WKS
+           RR is possible for this tuple, ignoring differences in the ser-
+           vices mask.
+
+   The rules for comparison of character strings in names and in data
+   fields are specified in [RFC1035].  For two names to match, they must
+   match label by label.  Wildcarding is one-way: a wildcard in an update
+   record will match any zone label, but a wildcard in the zone matches
+   only a wildcard in the update.
+
+
+
+
+
+
+
+   Expires June, 1996                                             [Page 4]
+
+
+
+
+
+   INTERNET-DRAFT                 DNS UPDATE                 November 1995
+
+
+   1.2 - Wildcard Data Resource Record
+
+   In a DELETE operation, it is sometimes convenient to specify that all
+   records associated with a certain name that are of a given class and
+   type be deleted, without specifying all existing records explicitly.  In
+   DELETE operations, therefore, a record with a wildcard time-to-live
+   (TTL) of * (see below for encoding) and a zero (0) length data field is
+   considered a match for any records of the same name, class and type.
+   For the purpose of determining whether a DELETE operation was success-
+   ful, the wildcard also matches the empty set.
+
+   The wildcard TTL field is encoded as follows:
+
+         *         (2^32) - 1       wildcard TTL field used in DELETE
+                                    operation to delete all records
+                                    of the same name, class and type.
+
+   An exception is made for SIG RRs since their identifying tuple includes
+   their "type signed" field.  Therefore, an update record with a TTL of *,
+   a type of SIG, and data length of zero (0) will not match any zone
+   records.  To specify a wildcard for SIG RR deletion, use a TTL of *, a
+   type of SIG, a data length of two (2), and a data field containing only
+   the "type signed."
+
+   A wildcard resource record is only useful in a DELETE request; the
+   record is not valid in a zone or in any other type of update request.
+
+
+   2.0 - Update Message Format
+
+   An update message has a header and optionally a body.  Update requests
+   have both a header and a body; update responses contain just the header.
+
+   The message header has a similar format to that of QUERY [RFC1035].  The
+   message body consists of a variable number of sections, defined below.
+
+   This document defines the following section types:
+
+     ZONEAUTHORITY   Supplies the SOA RR of the zone to be updated.
+     DELETE          Specifies records to be deleted.
+     ADDNAMENEW      Supplies records (with new names) to be added.
+     ADDNAMEEXIST    Supplies records (with existing names) to be added.
+     ADD             Supplies records (with new or existing names) to be
+                     added.
+
+
+
+
+   Expires June, 1996                                             [Page 5]
+
+
+
+
+
+   INTERNET-DRAFT                 DNS UPDATE                 November 1995
+
+
+   If an update request contains a ZONEAUTHORITY section, this section must
+   appear first in the message body, and a maximum of one (1) such section
+   is allowed.  The other section types can be used in any order and can be
+   used any number of times.  Not all section types need be used in every
+   update message.
+
+
+   2.1 - Transport Issues
+
+   An update transaction may be carried in UDP datagrams, if the request
+   fits, or in a TCP connection (at the discretion of the requestor.)  When
+   TCP is used, the message is in the format described in [RFC1035] (Sec-
+   tion 4.2.2):
+
+      The message is prefixed with a two byte length field which gives the
+      message length, excluding the two byte length field.  This length
+      field allows the low-level processing to assemble a complete message
+      before beginning to parse it.
+
+   The management policies in [ibid] are recommended here, as well.
+
+   It is not recommended that more than one transaction be performed over a
+   single TCP connection, since [ibid] did not define this case and no
+   known server implements it for QUERY messages.  After completing each
+   UPDATE transaction, the TCP connection should be closed.
+   2.2 - Header Format
+
+                                             1  1  1  1  1  1
+               0  1  2  3  4  5  6  7  8  9  0  1  2  3  4  5
+             +--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+
+             |                      ID                       |
+             +--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+
+             |QR|   Opcode  |         Z          |   RCODE   |
+             +--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+
+
+
+   The update header is smaller and simpler than the QUERY header described
+   in [RFC1035] (Section 4.1.1.)  There are no section count fields in the
+   message header, since the sections in the message body are self-encoded.
+   However, the Opcode field is in the same location as for QUERY [ibid]
+   since this is the field used to demultiplex the message's type and
+   thereby interpret its format.
+
+
+
+
+
+
+   Expires June, 1996                                             [Page 6]
+
+
+
+
+
+   INTERNET-DRAFT                 DNS UPDATE                 November 1995
+
+
+   The fields are set as follows in update requests and responses:
+
+      ID      A 16-bit identifier assigned by the entity that generates any
+              kind of request.  This identifier is copied in the corre-
+              sponding reply and can be used by the requestor to match up
+              replies to outstanding requests.
+
+      QR      A one bit field that specifies whether this message is a
+              request (0), or a response (1).
+
+      Opcode  A four bit field that specifies the kind of request in this
+              message.  This value is set by the originator of a request
+              and copied into the response.  The Opcode value that identi-
+              fies an UPDATE message is five (5).
+
+      Z       Reserved for future use.  Must be zero in all requests and
+              responses.  A non-zero Z field should be treated as a format
+              error.
+
+      RCODE   Response code - this four bit field is undefined in requests
+              and set in responses.  The values and semantics of this field
+              within responses is as follows:
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+   Expires June, 1996                                             [Page 7]
+
+
+
+
+
+   INTERNET-DRAFT                 DNS UPDATE                 November 1995
+
+
+      0 (No Error)
+         No error condition.
+
+      1 (Format Error)
+         The name server was unable to interpret the request.
+
+      2 (Server Failure)
+         The name server encountered an internal failure while processing
+         this request, for example an operating system error or a forward-
+         ing timeout.
+
+      3 (Name Error)
+         This code indicates that a domain name does not exist.  This
+         return code is only meaningful from a server in response to a
+         ADDNAMEEXIST or DELETE operation.
+
+      4 (Not Implemented)
+         The name server does not support the specified Opcode.
+
+      5 (Refused)
+         The name server refuses to perform the specified operation for
+         policy or security reasons.
+
+      6 (Alias Error)
+         This code indicates that a domain name specified in an update is
+         an alias.
+
+      7 (Name Exists Error)
+         The name specified by an ADDNAMENEW operation already exists.
+
+      8 (Record Error)
+         The record specified by a DELETE operation does not exist.
+
+      9 (Zone Error)
+         The name specified by an update operation is not in any of the
+         server's authority zones, or is in more than one authority zone
+         (i.e., at a zone cut) and no disambiguating ZONEAUTHORITY section
+         is present.
+
+      10 (Ordering Error)
+         The new SOA SERIAL would be lower than the old one, or the zone's
+         SOA RR is being deleted without a new one being added as its
+         replacement.
+
+
+
+
+
+   Expires June, 1996                                             [Page 8]
+
+
+
+
+
+   INTERNET-DRAFT                 DNS UPDATE                 November 1995
+
+
+   2.3 - Section Format
+
+   Each section contains a type code (range: 0-15), followed by a count
+   field (range: 0-4095, in units of RRs), followed by that number of RRs.
+
+                                             1  1  1  1  1  1
+               0  1  2  3  4  5  6  7  8  9  0  1  2  3  4  5
+             +--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+
+             | Type Code |               Count               |
+             +--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+
+             //                                             //
+             //                 "Count" RRs                 //
+             //                                             //
+             +--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+
+
+   This document defines the following section type codes:
+
+      1   DELETE
+      2   ADDNAMENEW
+      3   ADDNAMEEXIST
+      4   ADD
+      5   ZONEAUTHORITY
+
+   The Count field is a 12-bit unsigned integer in network byte order con-
+   taining the number of RRs in the section.  For the ZONEAUTHORITY section
+   the only legal value of the Count field is one (1).
+
+
+   3.0 - Name Server Behavior
+
+   On receiving an update request, a name server checks to see whether the
+   UPDATE opcode is implemented.  If not the name server returns Not Imple-
+   mented and terminates the transaction.
+
+   Note:
+      This describes the behaviour of all correct implementations of prior
+      specifications, since the Not Implemented encoding (its value and its
+      placement within the response packet) is the same as for QUERY.
+
+   If a ZONEAUTHORITY section was included in the request, and any nodes to
+   be updated (as specified in the other sections) are not within the zone
+   or at a ``zone cut'' (see [RFC1034] section 4.2) of the zone specified
+   by the ZONEAUTHORITY section's SOA RR, or if the ZONEAUTHORITY section's
+   SOA RR names a zone for which the server is not authoritative, then the
+   server returns a Zone Error.
+
+
+
+   Expires June, 1996                                             [Page 9]
+
+
+
+
+
+   INTERNET-DRAFT                 DNS UPDATE                 November 1995
+
+
+   If no ZONEAUTHORITY section was included in the request, and the collec-
+   tion of nodes intended to be updated by the other sections fails to lie
+   completely and unambiguously within a single zone for which the server
+   is authoritative, then the server returns a Zone Error.
+
+   Discussion:
+      Zone cuts present an ambiguous location for the purposes of UPDATE,
+      since a server that is authoritative for both the parent and child
+      zones around a cut would not know which zone to apply the updates to.
+      The ZONEAUTHORITY section is used to resolve the ambiguity, and
+      should be specified whenever the records to be updated might be
+      located on a zone cut.  It is also acceptable to simply include a
+      ZONEAUTHORITY section with all update requests.
+
+   If the server is a slave for the zone containing the nodes to be
+   updated, then the server forwards the request to the master server from
+   which it most recently fetched (via AXFR or IXFR) the zone, and awaits a
+   response.  If no response is received within an administrator config-
+   urable period, then the server returns Server Failure.  If a response is
+   received, then the server forwards this response back to the request's
+   initiator.
+
+   Discussion:
+      Only the primary master server can apply updates since only that
+      server has access to the zone's master file or other external data
+      source.  The rest of the authoritative servers for the updated zone
+      will receive the update in the form of an AXFR or IXFR, perhaps aided
+      by a NOTIFY.
+
+   Note:
+      If a request is received via TCP and must be forwarded, then the ini-
+      tiating server's TCP connection will be open for the entire period of
+      the forwarding operation (or until a timeout occurs.)  To prevent
+      resource starvation in the host operating system, it is recommended
+      that the timeout period's default be on the order of 10 seconds.
+
+   If the server is the primary master for the zone containing the nodes to
+   be updated, then processing continues as follows:  For each record in
+   the update request start matching down on the record name (RRNAME),
+   label by label, right to left.  For each label, test for the following
+   cases:
+
+
+
+
+
+
+
+   Expires June, 1996                                            [Page 10]
+
+
+
+
+
+   INTERNET-DRAFT                 DNS UPDATE                 November 1995
+
+
+   1. If the whole name is matched, we have found the node to be updated:
+
+      If the record at the node is an alias (CNAME), and the type of the
+      update record (RRTYPE) is not CNAME, abort the transaction and return
+      a response indicating an Alias Error.
+
+      If the operation is DELETE, check if the specified record exists in
+      the zone using the rules in Section 1.1.  If not, abort the transac-
+      tion and return a response indicating a Record Error.
+
+      If the operation is ADDNAMENEW, and the name existed before this
+      transaction was begun, abort the transaction and return a response
+      indicating a Name Exists Error.  If the name exists only because of
+      this transaction, treat this ADDNAMENEW as an ADDNAMEEXIST.
+
+      If the operation is ADDNAMEEXIST or ADD, check if the specified
+      record already exists using the rules in Section 1.1.  If the record
+      is a duplicate, ignore, unless the record is an SOA, SIG or WKS
+      record, in which case replace the existing RR with this update RR.
+
+      Perform the update operation tentatively.
+
+   2. If at some label, a match is impossible (i.e. the label does not
+      exist), and the operation is ADDNAMEEXIST or DELETE, abort the trans-
+      action and return a response indicating a Name Error.
+
+      If the operation is ADDNAMENEW or ADD, perform the update operation
+      tentatively.
+
+   Note:
+      The existence checks are applied to the state of the zone as modified
+      by this update request so far, with the exception of ADDNAMENEW as
+      specified above.
+
+   If the zone's SOA RR was replaced by this transaction and the new value
+   is lower than the old one (using 32 bit unsigned modulo arithmetic with
+   a maximum increment of 2^31), abort the tentative update operation and
+   return a response indicating an Ordering Error.
+
+   If no errors have been found, the name server commits the transaction.
+   If the zone serial number has not been explicitly updated as part of the
+   transaction, the zone serial number may or may not be updated at this
+   time (see Section 3.1).  The name server returns a successful response.
+
+
+
+
+
+   Expires June, 1996                                            [Page 11]
+
+
+
+
+
+   INTERNET-DRAFT                 DNS UPDATE                 November 1995
+
+
+   Note:
+      At the start of a transaction, the primary master server must lock
+      the zone to prevent concurrent interleaving of query and update
+      requests.  The zone is unlocked at the end of a (successful or unsuc-
+      cessful) transaction.  Aborting a transaction requires that any
+      changes made so far must be rolled back.  For the purpose of this
+      document committing a transaction means that the changes are made
+      persistent (e.g. written out to stable storage), and are visible to
+      subsequent queries to the primary master.
+
+
+   3.1 - Incrementing the Zone Serial Number
+
+   If the zone serial number is not explicitly updated in a request, a pri-
+   mary master server may update the zone serial number when committing
+   each transaction, or periodically, after some amount of update activity
+   or time has passed, depending on policy as defined below.
+
+   Discussion:
+      Updating the serial number periodically makes it possible to slow
+      incrementing of the serial number in situations where many updates
+      occur close together in time.
+
+   Note:
+      This document imposes a limit on how slowly the zone serial number
+      can be updated.
+
+   Each primary name server should be configured with the following parame-
+   ters, whose names as shown below are examples for the use of this docu-
+   ment:
+
+      IncrTime (default: 300 seconds)
+         The time in seconds by which the zone serial number must be
+         updated after an update has been committed.  The value must be
+         less than a third of the zone refresh time.
+
+      DeferUpdCnt (default: 100)
+         The maximum number of update requests that could be processed
+         before updating the zone serial number.
+
+   If changes have been made to a zone since the zone serial number was
+   last updated, the primary must update the zone serial number on the fol-
+   lowing events:
+
+
+
+
+
+   Expires June, 1996                                            [Page 12]
+
+
+
+
+
+   INTERNET-DRAFT                 DNS UPDATE                 November 1995
+
+
+      1. Before any QUERY response containing the zone's SOA RR is sent.
+
+      2. When the timer associated with IncrTime expires.
+
+      3. When DeferUpdCnt update requests have been processed.
+
+
+   3.2 - Maintaining Zone Consistency
+
+   Zone consistency between masters and slaves is achieved through zone
+   transfers.  Once the primary master has updated its master file (the
+   zone's external data source), either AXFR or IXFR (see [IXFR]) can be
+   used to distribute these changes to the slaves.  NOTIFY (see [NOTIFY])
+   can be used to shorten the delay before an AXFR or IXFR is begun.
+
+
+   4.0 - Client Behavior
+
+   From a client's point of view, any authoritative server for the zone can
+   appear to be able to process update requests, even though only the pri-
+   mary master server is actually able to modify the zone's master file.
+   Clients are expected to know the name of the zone they intend to update
+   and to know the name servers for that zone.
+
+   Note:
+      There is no provision for recursion or referral of update requests,
+      as this would require all caching servers on the Internet to support
+      dynamic updates before any zone could begin using it.  Dynamic
+      updates depend on QUERY or on a priori knowledge to locate the zone's
+      name servers.
+
+   If the client has reasonable cause to believe that all of a zone's
+   servers will be equally reachable, then it should arrange to try the
+   primary master server (as named in the SOA MNAME field) first to avoid
+   unnecessary forwarding inside the slave servers.  Note that the primary
+   master will in many cases not be reachable by all clients, due to fire-
+   walls or network partitioning.
+
+
+
+
+
+
+
+
+
+
+
+   Expires June, 1996                                            [Page 13]
+
+
+
+
+
+   INTERNET-DRAFT                 DNS UPDATE                 November 1995
+
+
+   Discussion:
+      One way to acquire a node's zone name and server list is to use the
+      QUERY opcode, asking for the SOA RR of each successive parent domain,
+      moving to the next parent if a {NOERROR, ANCOUNT=0} response is
+      received, abandoning the search if an NXDOMAIN reply is received, or
+      declaring success if a {NOERROR, ANCOUNT=1} response is received with
+      an SOA RR in the answer section.  For example, if updating the
+      GW.HOME.VIX.COM node inside the VIX.COM zone, the following transac-
+      tions might occur:
+
+                 Query                  Response
+                 ------------------------------------------------
+                 GW.HOME.VIX.COM SOA?   RCODE=NOERROR, ANCOUNT=0
+                 HOME.VIX.COM SOA?      RCODE=NOERROR, ANCOUNT=0
+                 VIX.COM SOA?           RCODE=NOERROR, ANCOUNT=1
+
+      This relies on two obscure facts about QUERY: (1) that a query of a
+      node which has no records at all (HOME.VIX.COM in our example)
+      returns NOERROR rather than the more intuitive NXDOMAIN; and (2) that
+      a response containing an SOA RR answer should have the NS RR list for
+      that SOA's zone in the authority section.
+
+      Note that a robust implementation should be prepared for a response
+      that fails to satisfy either or both of the above assumptions.
+      Therefore it is recommended that the search continue all the way to
+      the root domain even in the face of an NXDOMAIN -- which will address
+      the potential for a server to answer with NXDOMAIN for an empty non-
+      terminal (see section 7); and also, if an SOA response is received
+      with no authority section, the implementation should be prepared to
+      query for the NS RR list of the returned SOA RR's zone.
+
+   If update ordering is desired, the client will need to know the value of
+   the existing SOA RR.  Clients who update the SOA RR must take care to
+   update the SOA SERIAL field in a positive direction and to preserve the
+   other fields unless the explicit intent is to change them.
+
+   Once a set of name servers authoritative for the zone have been found, a
+   resolver sends an update request to one of them.  If the resolver
+   receives a response, and the response has an RCODE other than Server
+   Failure or Not Implemented, then the resolver returns an appropriate
+   response to the client.
+
+   If a response is received whose RCODE is Server Failure or Not Imple-
+   mented, or if no response is received within a locally specified timeout
+   period, or if an ICMP error is received indicating that the server's
+
+
+
+   Expires June, 1996                                            [Page 14]
+
+
+
+
+
+   INTERNET-DRAFT                 DNS UPDATE                 November 1995
+
+
+   net, host or port is unreachable, then the resolver will delete the
+   unusable server from its internal NS RR list and try the next one,
+   repeating until the NS RR list is empty.  If the resolver runs out of
+   servers to try, an appropriate error will be returned to the client.
+
+   Implementation Note:
+      The resolver may cache information about a zone's authoritative
+      servers, such as whether a server implements the UPDATE opcode or how
+      long the server takes to complete an UPDATE transaction.  If such
+      information is cached, it should be purged according to the NS RRs'
+      TTL field.
+
+
+   5.0 - Duplicate Detection, Ordering and Mutual Exclusion
+
+   For correct operation, mechanisms are needed to detect duplicate
+   requests, order update requests and provide mutual exclusion.  Duplicate
+   requests may arise when a resolver or client resends an update request
+   due to some error, or even maliciously.
+
+   Misordering can occur if the network misorders or duplicates packets, or
+   if a client sends update requests to multiple slave servers (on the way
+   to the primary master).  In many cases, it is required that the earlier
+   update not be applied after the later update, and that each update be
+   applied only once.
+
+   A client can ensure transaction idempotence by using an explicit (that
+   is, non-wildcard) DELETE of some known previous RR and then an ADD* of
+   some new and different value for that RR.  If the request is duplicated
+   by a network error, all duplicate requests will fail since only the
+   first will find the original ``marker RR'' present and having its known
+   previous value.
+
+   In most cases where idempotence matters at all, the RRs being updated
+   serve adequately as identity markers.  In the case of an ``A->B->A''
+   update sequence where the initial conditions could reoccur, it is recom-
+   mended that a ``read-modify-write'' sequence be performed, using an
+   explicit increment of the zone's SOA SERIAL as a way to ensure that the
+   transaction is applied exactly once and that the ``initial conditions''
+   cannot reoccur.
+
+   In addition to the SOA ordering mechanism described above, this document
+   does not preclude the use of other ordering (serialization) mechanisms.
+   Details of such mechanisms are outside the scope of this document.
+
+
+
+
+   Expires June, 1996                                            [Page 15]
+
+
+
+
+
+   INTERNET-DRAFT                 DNS UPDATE                 November 1995
+
+
+   Discussion:
+      It is expected that many UPDATE transactions will not specify any
+      kind of ordering.  Such updates will succeed or fail based on the
+      presence and/or absence of the records supplied by the update.  This
+      is dangerous if the possibility of circular updates (e.g., A becomes
+      B becomes A) exists, since duplicate or out of order UPDATE request
+      packets could leave the zone in an undefined state.
+
+
+   6.0 - Security Considerations
+
+   Without DNS Security, the protocol described by this document makes it
+   possible for anyone who can reach one of your authoritative servers to
+   update (i.e., add, change, or delete) the contents of your zones.  This
+   strongly indicates a need for out of band access control such as static
+   access control lists enforced by the server, or firewall techniques, or
+   both.
+
+   The SIG RRs defined in [DNSSEC] must be used to ensure that each set of
+   records of a particular {name,class,type} are updated only by entities
+   that have the appropriate authority.  The SIG RR is updated as part of
+   an update transaction.  As specified in [DNSSEC], the SIG RR must sign
+   all records associated with a {name,class,type}, not only those updated
+   in the request.
+
+   Note:
+      The SIG RR only covers records of a particular {name,class,type}.
+      Thus, while the integrity of each signed RR set updated in a transac-
+      tion can be assured, the integrity of a set of update records with
+      different names or types is not.  To ensure integrity of the entire
+      message, a network layer security protocol should be used if avail-
+      able.  Alternatively, one or more SIG RRs signing the entire message
+      can be placed at the end of the last section of a message as
+      explained in [DNSSEC].
+
+   Note:
+      A SIG RR is not only used to authenticate an update request, but is
+      stored along with the authenticated data in DNS to authenticate sub-
+      sequent queries for the data.
+
+   Detailed specification of the update security mechanism is outside the
+   scope of this document.
+
+
+
+
+
+
+   Expires June, 1996                                            [Page 16]
+
+
+
+
+
+   INTERNET-DRAFT                 DNS UPDATE                 November 1995
+
+
+   7.0 - DNS Corner Cases
+
+   Some of the features and side effects upon which this specification
+   rests are not well specified by [RFC1034] and [RFC1034], including at
+   least:
+
+   TTL Equivalence
+      All RRs in an RRset denoted by a given {name,class,type} will be
+      treated by name servers as having a time-to-live (TTL) equal to the
+      smallest actual TTL used in that set, for cache coherency purposes.
+      It is advised that all TTLs among each {name,class,type} RRset in the
+      master file be equal, and it is further advised that all dynamic
+      updates take care to preserve this condition.
+
+   Existence of Names
+      A name possessing no RRs but having at least one child cannot be said
+      to either exist or not exist.  These names are called ``empty nonter-
+      minals'' and they present some important corner cases:
+
+      QUERY
+         The QUERY opcode will report {RCODE=NOERROR, ANCOUNT=0} if applied
+         to an empty nonterminal, regardless of QTYPE.
+
+      ADDNAMENEW
+         An UPDATE operation with an ADDNAMENEW section will succeed if
+         applied to an empty nonterminal, even though the name could be
+         considered to ``already exist'' by some standards.
+
+      ADDNAMEEXIST
+         An UPDATE operation with an ADDNAMEEXIST section will succeed if
+         applied to an empty nonterminal, even though the name could be
+         considered to ``not exist'' by some standards.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+   Expires June, 1996                                            [Page 17]
+
+
+
+
+
+   INTERNET-DRAFT                 DNS UPDATE                 November 1995
+
+
+   Appendix A
+
+   A wide range of update functions can be achieved using a combination of
+   the four update operations.  To illustrate this, we use a simple zone
+   consisting of the following records:
+
+              XYZ.COM.          SOA     ns.xyz.com sysadm.xyz.com ( ... )
+                                NS      ns.xyz.com.
+
+              NS.XYZ.COM.       SIG     A 12345755
+                                A       128.96.33.22
+
+              FOO.XYZ.COM.      SIG     A 12345900
+                                A       128.96.33.33
+                                A       128.96.34.34
+
+
+   Example 1:
+      One of the A records belonging to FOO.XYZ.COM can be modified by
+      first deleting it and adding a new one.
+
+      DELETE  FOO.XYZ.COM.      SIG     A *
+                                A       128.96.33.33
+
+      ADD     FOO.XYZ.COM.      SIG     A 12346000
+                                A       128.96.44.44
+
+
+      In this case, the A RR to be deleted is specified explicitly since we
+      only want to delete one of the records, not both, before the replace-
+      ment is added.  To ensure ordering, the associated SIG record is also
+      replaced.  In the example, we use the wildcard SIG RR to delete the
+      SIG RR since it is more efficient than deleting the SIG RR explic-
+      itly.  It is generally possible to delete SIGs using this method as
+      there is typically only one per {name,class,type}, and even if not,
+      all SIG RRs must be replaced when the associated (``signed'') data is
+      updated.  A SIG RR would only need to be deleted explicitly if it is
+      being used to implement mutual exclusion over a read-modify-write
+      cycle as explained in Section 5.
+
+      Note that ADDNAMEEXIST would also work in the above example to add
+      the replacement record since the name associated with the records
+      still exists after removal of the SIG and A record.  However, there
+      is not much point to doing ADDNAMEEXIST since the atomicity property
+      of the transaction ensures that the name FOO.XYZ.COM exists.
+
+
+
+   Expires June, 1996                                            [Page 18]
+
+
+
+
+
+   INTERNET-DRAFT                 DNS UPDATE                 November 1995
+
+
+   Example 2:
+      The canonical name of a host can be changed from FOO to BAR and the
+      old name FOO made an alias, by sending an update transaction contain-
+      ing the following three operations:
+
+      DELETE      FOO.XYZ.COM.      SIG     A *
+                  FOO.XYZ.COM.      A       *
+
+      ADD         FOO.XYZ.COM.      SIG     CNAME 12347000
+                  FOO.XYZ.COM.      CNAME   BAR.XYZ.COM.
+
+      ADDNAMENEW  BAR.XYZ.COM.      SIG     A 12347000
+                                    A       128.61.44.33
+
+
+   In this example, we use wildcard records to delete all records associ-
+   ated with FOO.  Note that if FOO is a terminal node (that is, has no
+   children), then the DELETE operation removes the node name FOO from the
+   database, since records are no longer associated with it.  Thus, we
+   could have used ADDNAMENEW to add the new records associated with FOO
+   instead of ADD.  Again, there is no point to this since the atomic
+   transaction ensures that the name is unique.  However, there is a use
+   for ADDNAMENEW in the case of the records associated with BAR.  To
+   ensure that BAR is indeed a new name, ADDNAMENEW must be used.
+
+
+   Acknowledgements
+
+   We would like to thank the IETF DNSIND working group for their input and
+   assistance, in particular, Rob Austein, Randy Bush, Donald Eastlake, and
+   Masataka Ohta.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+   Expires June, 1996                                            [Page 19]
+
+
+
+
+
+   INTERNET-DRAFT                 DNS UPDATE                 November 1995
+
+
+   References
+
+   [RFC1034]
+      P. Mockapetris, "Domain Names - Concepts and Facilities", RFC 1034,
+      USC/Information Sciences Institute, November 1987.
+
+   [RFC1035]
+      P. Mockapetris, "Domain Names - Implementation and Specification",
+      RFC 1035, USC/Information Sciences Institute, November 1987.
+
+   [DNSSEC]
+      Donald E. Eastlake and Charles W. Kaufman, "Domain Name System Proto-
+      col Security Extensions", Internet Draft, March 1994, <draft-ietf-
+      dnssec-secext-03.txt>.
+
+   [IXFR]
+      M. Ohta, "Incremental Zone Transfer", Internet Draft, July 1995,
+      <draft-ietf-dnsind-ixfr-02.txt>.
+
+   [NOTIFY]
+      P. Vixie, "Notify: a mechanism for prompt notification of authority
+      zone changes", Internet Draft, March 1995, <draft-ietf-dnsind-
+      notify-01.txt>.
+
+
+   Authors' Addresses
+
+         Yakov Rekhter                   Susan Thomson
+            Cisco Systems                   Bellcore
+            170 West Tasman Drive           445 South Street
+            San Jose, CA 95134-1706         Morristown, NJ 07960
+            +1 914 528 0090                 +1 201 829 4514
+            <yakov@cisco.com>               <set@thumper.bellcore.com>
+
+         Jim Bound                       Paul Vixie
+            Digital Equipment Corp.         Internet Software Consortium
+            110 Spitbrook Rd ZK3-3/U14      Star Route Box 159A
+            Nashua, NH 03062-2698           Woodside, CA 94062
+            +1 603 881 0400                 +1 415 747 0204
+            <bound@zk3.dec.com>             <paul@vix.com>
+
+
+
+
+
+
+
+
+   Expires June, 1996                                            [Page 20]
+
+
