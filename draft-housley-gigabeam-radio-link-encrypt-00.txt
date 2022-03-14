@@ -1,0 +1,616 @@
+
+
+
+
+INTERNET DRAFT                               R. Housley (Vigil Security)
+Informational                                        A. Corry (GigaBeam)
+Expires October 2006                                          April 2006
+
+
+               GigaBeam High-Speed Radio Link Encryption
+           <draft-housley-gigabeam-radio-link-encrypt-00.txt>
+
+
+Status of this Memo
+
+   Internet-Drafts are working documents of the Internet Engineering
+   Task Force (IETF), its areas, and its working groups.  Note that
+   other groups may also distribute working documents as Internet-
+   Drafts.
+
+   By submitting this Internet-Draft, each author represents that any
+   applicable patent or other IPR claims of which he or she is aware
+   have been or will be disclosed, and any of which he or she becomes
+   aware will be disclosed, in accordance with Section 6 of BCP 79.
+
+   This document may not be modified, and derivative works of it may not
+   be created, except to publish it as an RFC and to translate it into
+   languages other than English.
+
+   Internet-Drafts are draft documents valid for a maximum of six months
+   and may be updated, replaced, or obsoleted by other documents at any
+   time.  It is inappropriate to use Internet-Drafts as reference
+   material or to cite them other than a "work in progress."
+
+   The list of current Internet-Drafts can be accessed at
+   http://www.ietf.org/1id-abstracts.html
+
+   The list of Internet-Draft Shadow Directories can be accessed at
+   http://www.ietf.org/shadow.html
+
+Abstract
+
+   This document describes the encryption and key management used by
+   GigaBeam as part of the WiFiber(tm) family of radio link products.
+   The security solution is documented in the hope that other wireless
+   product development efforts will include comparable capabilities.
+
+
+
+
+
+
+
+
+
+Housley & Corry                                                 [Page 1]
+
+INTERNET DRAFT       GigaBeam Radio Link Encryption           April 2006
+
+
+1.  Introduction
+
+   The GigaBeam WiFiber(tm) product family provides a high-speed point-
+   to-point radio link.  Data rates exceed 1 gigabit/second at a
+   distance of about a mile.  GigaBeam links have very low probability
+   of interception due to a narrow transmission beam-width (less than
+   one degree), even so, some customers require confidentiality and
+   integrity protection for the data on the radio link.  This document
+   describes the security solution designed and deployed by GigaBeam to
+   provide these security services.
+
+   The GigaBeam security solution employs:
+
+     o  AES-GCM [GCM] with a custom security protocol to provide
+        confidentiality and integrity protection of subscriber
+        traffic on the radio link;
+
+     o  AES-CBC [CBC] and HMAC-SHA-1 [HMAC] with IPsec ESP [ESP] to
+        provide confidentiality and integrity protection of management
+        traffic between the radio control modules;
+
+     o  AES-CBC [CBC] and HMAC-SHA-1 [HMAC] with IKE [IKE] to provide
+        confidentiality and integrity protection of key management
+        traffic between the radio control modules; and
+
+     o  OAKLEY key agreement [OAKLEY] and RSA digital signatures [PKCS1]
+        with IKE to provide automated key management.
+
+2.  GigaBeam High-Speed Radio Link Overview
+
+   The GigaBeam high-speed radio link transparently provides a fiber
+   interface to two network devices.  Figure 1 illustrates the
+   connection of two devices that normally communicate using Gigabit
+   Ethernet over a fiber optic cable.
+
+
+     +---------+     +----------+        +----------+     +---------+
+     |         |     |          +----/   |          |     |         |
+     | Network |     | GigaBeam |   /    | GigaBeam |     | Network |
+     | Device  +=====+  Radio   |  /---- +  Radio   +=====+ Device  |
+     |         |     |          |        |          |     |         |
+     +---------+  ^  +----------+   ^    +----------+  ^  +---------+
+                  |                 |                  |
+                  |                 |                  |
+          Gigabit Ethernet          |          Gigabit Ethernet
+                           GigaBeam Radio Link
+
+                  Figure 1.  GigaBeam Radio Link Example.
+
+
+
+Housley & Corry                                                 [Page 2]
+
+INTERNET DRAFT       GigaBeam Radio Link Encryption           April 2006
+
+
+   Gigabit Ethernet traffic encoded in 8B/10B format.  The GigaBeam
+   Radio Control Module (RCM) decodes the data to recover the 8-bit
+   characters plus an indication of whether the character is a control
+   code.  The radio link frame is constructed from 224 10-bit input
+   words, and a 4-way interleaved (56,50,10) Reed Solomon Forward Error
+   Correction block is employed.  Conversion of the Gigabit Ethernet
+   data from 8B/10B format creates 224-bits of additional capacity in
+   each frame, and another 196 bits is gained by recoding the 9-bit data
+   using 64B/65B block codes.  This additional 420 bits of capacity is
+   used for the framing overhead required for FEC and link control.
+
+   The fields are summarized in Figure 2, which also provides the length
+   of each field in bits.
+
+
+      Field   Length   Description
+      -----   ------   -----------
+      SYNC       11    Frame Synchronization Pattern ('10110111000'b)
+      KEYSEL      1    Indicates which AES key was used for this frame
+      PN         40    AES-GCM Packet Number
+      FLAGS      28    Control bits, one bit for each 64B/65B data block
+      DCC         8    Data Communications Channel
+      DATA     1792    Data (28 encrypted 64B/65B code blocks)
+      TAG        96    Authentication Tag
+      SPARE      24    Reserved for alternative FEC algorithms
+      CHECK     240    Reed-Solomon Check Words for 4 10-bit
+                       symbol (56,50) code
+
+              Figure 2.  GigaBeam Radio Link Frame Structure.
+
+
+   Each of the fields in the GigaBeam 2240-bit radio link frame are
+   described below.
+
+      SYNC     Synchronization field, an 11-bit Barker code.  Always set
+               to '10110111000'b.
+
+      KEYSEL   Key Selector -- select the appropriate key register for
+               this frame.  Two key registers are maintained to allow
+               seamless rollover between encryption keys.
+
+      PN       Packet Number -- needed by AES-GCM; it carries the unique
+               counter value for this frame.  The value is incremented
+               for each frame.
+
+
+
+
+
+
+
+Housley & Corry                                                 [Page 3]
+
+INTERNET DRAFT       GigaBeam Radio Link Encryption           April 2006
+
+
+      FLAGS    Control bits, one for each 64B/65B data block carried in
+               the DATA field.  If the bit is set, then the
+               corresponding 64B/65B block in the DATA field contains a
+               control code.  This field is integrity protected by
+               AES-GCM.
+
+      DCC      Data Communications Channel -- each frame carries one
+               octet of the point-to-point data communications channel
+               between the two radio control modules.  The Internet
+               Protocol (IP) is used on the resulting management
+               network.
+
+      DATA     Subscriber data carried as 28 64B/65B code blocks.  This
+               field is encrypted and integrity protected by AES-GCM.
+
+      TAG      The authentication tag generated by AES-GCM, truncated to
+               96 bits.
+
+      SPARE    24 bits, set to zero.
+
+      CHECK    Forward error correction check value -- 24 check symbols
+               are generated by a 4-way interleaved Reed-Solomon
+               (56,50,10) algorithm.  FEC is always active, but
+               correction can be selectively enabled.  For each frame,
+               FEC processing also returns the number of bit errors, the
+               number of symbols in error, and whether the FEC
+               processing failed for the frame.  This information allows
+               an estimation of the bit error rate for the link.
+
+2.  Radio Link Processing
+
+   The fiber interface constantly provides a stream of data encoded in
+   8B/10B format.  A radio link frame is constructed from 224 10-bit
+   input words.  Conversion of the data from 8B/10B format creates
+   224-bits of additional capacity in each frame, and then recoding
+   using 64B/65B block codes creates another 196 bits of additional
+   capacity.  After encryption, the 64B/65B blocks are carried in the
+   DATA field, and the control code indicator bits are carried in the
+   FLAGS field. The additional capacity is used for the framing
+   overhead.
+
+   The framing overhead DCC field contains a single octet of the point-
+   to-point data communications channel between the two GigaBeam RCMs.
+   IP is used on data control channel.  IKE [IKE] runs on this two-node
+   IP network to manage all cryptographic keying material.  IPsec ESP
+   [ESP] is used in the usual fashion to protect all non-IKE traffic on
+   the data control channel.  IPsec ESP employs AES-CBC as described in
+   [ESP-CBC] and HMAC-SHA1 as described in [ESP-HMAC].
+
+
+
+Housley & Corry                                                 [Page 4]
+
+INTERNET DRAFT       GigaBeam Radio Link Encryption           April 2006
+
+
+   Processing proceeds as follows:
+
+     o  encryption and integrity protection as described in section 2.1;
+
+     o  forward error correction (FEC) processing as described in
+        section 2.2;
+
+     o  scrambling as described in section 2.3; and
+
+     o  differential encoding as described in section 2.4.
+
+2.1.  Encryption and Integrity Protection
+
+   The GigaBeam RCM contains two key registers.  The single-bit KEYSEL
+   field indicates which of the two registers was used for the frame.
+
+   AES-GCM [GCM] employs counter mode for encryption.  Therefore, a
+   unique value for each frame is needed to construct the counter.  The
+   same value must not be used for more than one frame encrypted with
+   the same key.  The PN field carries this unique 40-bit value.
+
+   AES-GCM is used to protect the FLAGS and DATA fields.  The FLAGS
+   field is treated as authenticated header data, and it is integrity
+   protected, but it is not encrypted.  The DATA field is encrypted and
+   authenticated.  The TAG field contains the authentication tag
+   generated by AES-GCM, truncated to 96 bits.
+
+   Reception processing performs decryption and integrity checking.  If
+   the integrity checks fail, to maintain a continuous stream of
+   traffic, the frame is replaced with to K30.7 control characters.
+   These control characters are normally used to mark errors in the data
+   stream.  Without encryption and integrity checking these control
+   characters usually indicate parity or code errors.
+
+2.2.  Forward Error Correction (FEC)
+
+   The GigaBeam RCM implements a Reed Solomon Code, RS(56,50), designed
+   for 10-bit symbols.  The 224 10-bit data symbols that make up each
+   radio link frame, which contains the encrypted data payload and the
+   framing overhead fields, are grouped into 4 sub-frames each
+   consisting of 56 symbols.  The sub-frames are formed by symbol
+   interleaving.
+
+   This Reed Solomon Code detects 6 errors and corrects 3 errors within
+   each sub-frame.  The FEC function is always active; however, it is
+   possible to disable correction of the received data to support
+   debugging.
+
+
+
+
+Housley & Corry                                                 [Page 5]
+
+INTERNET DRAFT       GigaBeam Radio Link Encryption           April 2006
+
+
+2.3.  Scrambler
+
+   The scrambling polynomial is (1 + x^14 + x^15).  All words of a frame
+   except the SYNC pattern are scrambled prior to transmission using
+   this linear feedback shift register (LFSR).  The LFSR is initialized
+   to all ones at the start of each frame, prior to the first processed
+   bit.  Each processed input bit is added modulo 2 (i.e., an XOR) to
+   the output of the x15 tap to form the output bit.
+
+   On reception, an identical process is performed after frame
+   synchronization and prior to subsequent processing to recover the
+   original bit pattern.
+
+2.4.  Differential Encoding
+
+   The data stream is differentially encoded to avoid symbol ambiguity
+   at the receiver.  Since the demodulator could produce true or
+   inverted data depending on the details of the RF and IF processing
+   chains, differential encoding is used to ensure proper reception of
+   the intended bit value.  A zero bit is encoded as no change from the
+   previous output bit, and a one bit is encoded as a change from the
+   previous output bit.  Thus, an output bit is the result of XORing the
+   unencoded bit with the previously transmitted encoded bit.
+
+   On reception, a complementary operation will be performed to produce
+   the decoded datastream.  The bitstream is formed by XORing the
+   received encoded bit and the previously received encoded bit.
+
+3.  Key Management
+
+   The Internet Key Exchange (IKE) is used for key management [IKE].
+   IKE has two phases.  In Phase 1, two ISAKMP peers establish a secure,
+   authenticated channel with which to communicate.  This is called the
+   ISAKMP Security Association (SA).  In the GigaBeam environment, the
+   phase 1 exchange is IKE Aggressive Mode with signatures and
+   certificates.  Figure 3 illustrates the Aggressive Mode message
+   exchange using the notation in [IKE].  The RSA signature algorithm is
+   used to generate the signed data, SIG_I or SIG_R.
+
+
+      Initiator                                               Responder
+      ---------                                               ---------
+      HDR, SA, KE, Ni, IDii   --->
+                              <---   HDR, SA, KE, Nr, IDir, CERT, SIG_R
+      HDR, CERT, SIG_I        --->
+
+       Figure 3.  Aggressive Mode with Signatures and Certificates.
+
+
+
+
+Housley & Corry                                                 [Page 6]
+
+INTERNET DRAFT       GigaBeam Radio Link Encryption           April 2006
+
+
+   Phase 2 negotiates the Security Associations for the GigaBeam custom
+   security protocol that protects subscriber traffic and IPsec ESP that
+   protects the management traffic between the radio control modules.
+   In the GigaBeam environment, the phase 2 exchange is IKE Quick Mode,
+   without perfect forward secrecy (PFS).  The information exchanged
+   along with Quick Mode is be protected by the ISAKMP SA.  That is, all
+   payloads except the ISAKMP header are encrypted.  Figure 4
+   illustrates the Quick Mode message exchange using the notation in
+   [IKE].  A detailed description can be found in Section 5.5 of [IKE].
+
+
+      Initiator                                               Responder
+      ---------                                               ---------
+      HDR*, HASH(1), SA, Ni
+        [, IDci, IDcr ]    --->
+                           <---   HDR*, HASH(2), SA, Nr [, IDci, IDcr ]
+      HDR*, HASH(3)        --->
+
+                    Figure 4.  Quick Mode without PFS.
+
+
+   When the Security Association is no longer needed, the ISAKMP Delete
+   Payload is used to tell the peer GigaBeam device that it is being
+   discarded.  Figure 5 illustrates the ISAKMP Notify or Delete Payload
+   using the notation in [IKE].
+
+
+      Initiator                                               Responder
+      ---------                                               ---------
+      HDR*, HASH(1), N/D    --->
+
+                Figure 5.  ISAKMP Notify or Delete Payload
+
+
+3.1.  Certificates
+
+   Each GigaBeam device generates its own public/private key pair.  This
+   generation is performed at the factory, and the public key is
+   certified by a Certification Authority (CA) in the factory.  The
+   certificate includes a name of the following format:
+
+      C=US
+      O=GigaBeam Corporation
+      OU=GigaBeam WiFiber(tm)
+      SerialNumber=<device-model-identifier>/<device-serial-number>
+
+
+
+
+
+
+Housley & Corry                                                 [Page 7]
+
+INTERNET DRAFT       GigaBeam Radio Link Encryption           April 2006
+
+
+   The ISAKMP Certificate Payload is used to transport certificates, and
+   in the GigaBeam environment, the "X.509 Certificate - Signature"
+   certificate encoding type (indicated by a value of 4) is always used.
+
+   GigaBeam devices are always installed in pairs.  At installation
+   time, each one is configured with the device model identifier and
+   device serial number of its peer.  The device model identifier and
+   device serial number of a backup device can also be provided.  An
+   access control check is performed when certificates are exchanged.
+   The certificate subject name must match one of these configured
+   values, and the certification path must validate to the GigaBeam Root
+   CA using the validation rules in [PKIX1].
+
+3.2.  Oakley Groups
+
+   With IKE, several possible Diffie-Hellman groups are supported.
+   These groups originated with the Oakley protocol and are therefore
+   called "Oakley Groups".
+
+   GigaBeam devices use group 14, which is described in section 3 of
+   [MODP].
+
+3.3.  Security Protocol Identifier
+
+   The ISAKMP proposal syntax was specifically designed to allow for the
+   simultaneous negotiation of multiple Phase 2 security protocol
+   suites.  The identifiers for the IPsec Domain of Interpretation (DOI)
+   are given in [IPDOI].
+
+   The GigaBeam custom security protocol has been assigned the
+   PROTO_GIGABEAM_RADIO protocol identifier, with a value of TBD.
+
+   The PROTO_GIGABEAM_RADIO specifies the use of the GigaBeam radio link
+   frame structure, which uses a single algorithm for both
+   confidentiality and authentication.  The following table indicates
+   the algorithm values that are currently defined.
+
+      Transform ID                      Value
+      ------------                      -----
+      RESERVED                            0
+      GIGABEAM_AES128_GCM                 1
+
+3.4.  Keying Material
+
+   GIGABEAM_AES128_GCM requires 20 octets of keying material (called
+   KEYMAT in [IKE]).  The first 16 octets are the 128-bit AES key, and
+   the remaining four octets are used as the salt value in the AES
+   counter block.
+
+
+
+Housley & Corry                                                 [Page 8]
+
+INTERNET DRAFT       GigaBeam Radio Link Encryption           April 2006
+
+
+3.5.  Identification Type Values
+
+   The following table lists the assigned values for the Identification
+   Type field found in the ISAKMP Identification Payload.
+
+      ID Type                           Value
+      -------                           -----
+      RESERVED                            0
+      ID_IPV4_ADDR                        1
+      ID_FQDN                             2
+      ID_USER_FQDN                        3
+      ID_IPV4_ADDR_SUBNET                 4
+      ID_IPV6_ADDR                        5
+      ID_IPV6_ADDR_SUBNET                 6
+      ID_IPV4_ADDR_RANGE                  7
+      ID_IPV6_ADDR_RANGE                  8
+      ID_DER_ASN1_DN                      9
+      ID_DER_ASN1_GN                     10
+      ID_KEY_ID                          11
+
+   The ID_DER_ASN1_DN will be used when negotiating security
+   associations for use with the GigaBeam custom security protocol.  The
+   provided distinguished name must match the peer's subject name
+   provided in the X.509 certificate.
+
+3.6.  Security Parameter Index
+
+   The least significant bit of the Security Parameter Index (SPI) is
+   used in the GigaBeam custom security protocol.  When two GigaBeam
+   custom security protocol security associations are active at the same
+   time for communications in the same direction, the least significant
+   bit of the SPI must be different to ensure that these active security
+   associations can be distinguished by the single bit in the GigaBeam
+   custom security protocol.
+
+4.  Security Considerations
+
+   The security consideration in [IKE], [OAKLEY], [PKCS1], and [ESP]
+   apply to the security system defined in this document.
+
+   Confidentiality and integrity are provided by the use of negotiated
+   algorithms.  AES-GCM [GCM] is used with the GigaBeam custom security
+   protocol to provide confidentiality and integrity protection of
+   subscriber traffic on the radio link.  AES-CBC [CBC] and HMAC-SHA-1
+   [HMAC] are used with IPsec ESP [ESP] to provide confidentiality and
+   integrity protection of management traffic between the radio control
+   modules.
+
+
+
+
+Housley & Corry                                                 [Page 9]
+
+INTERNET DRAFT       GigaBeam Radio Link Encryption           April 2006
+
+
+   Repeated re-keying using Quick Mode increases the amount of traffic
+   that will be exposed by disclosing the Diffie-Hellman shared secret.
+   Therefore, the number of Quick Mode Exchanges between exponentiations
+   should not exceed 48.  Implementations should perform a fresh Phase 1
+   exchange before this limit is exceeded.
+
+   Diffie-Hellman exponents used in IKE Phase 1 should be erased from
+   memory immediately after use.
+
+5.  Informative References
+
+   [ESP]      Kent, S. and R. Atkinson, "IP Encapsulating
+              Security Payload (ESP)", RFC 2406, November 1998.
+
+   [ESP-CBC]  Frankel, S., Glenn, R., and S. Kelly, "The AES-CBC
+              Cipher Algorithm and Its Use with IPsec", RFC 3602,
+              September 2003.
+
+   [ESP-HMAC] Madson, C., and R. Glenn, "The Use of HMAC-SHA-1-96
+              within ESP and AH", RFC 2404, November 1998.
+
+   [GCM]      McGrew, D. and J. Viega, "The Galois/Counter Mode of
+              Operation (GCM)", Submission to NIST. http://
+              csrc.nist.gov/CryptoToolkit/modes/proposedmodes/gcm/
+              gcm-spec.pdf, January 2004.
+              [ Soon: NIST SP 800-38D. ]
+
+   [HMAC]     Krawczyk, H., Bellare, M., and R. Canetti, "HMAC:
+              Keyed-Hashing for Message Authentication", RFC 2104,
+              February 1997.
+
+   [IKE]      Harkins, D. and D. Carrel, "The Internet Key Exchange
+              (IKE)", RFC 2409, November 1998.
+
+   [IPDOI]    Piper, D., "The Internet IP Security Domain of
+              Interpretation for ISAKMP", RFC 2407, November 1998.
+
+   [MODP]     Kivinen, T., and M. Kojo. "More Modular Exponential (MODP)
+              Diffie-Hellman groups for Internet Key Exchange (IKE)",
+              RFC 3526, May 2003.
+
+   [OAKLEY]   Orman, H., "The Oakley Key Determination Protocol",
+              RFC 2412, November 1998.
+
+   [PKCS1]    Kaliski, B., "PKCS #1: RSA Encryption Version 1.5",
+              RFC 2313, March 1998.
+
+
+
+
+
+Housley & Corry                                                [Page 10]
+
+INTERNET DRAFT       GigaBeam Radio Link Encryption           April 2006
+
+
+   [PKIX1]    Housley, R., Polk, W., Ford, W. and D. Solo, "Internet
+              X.509 Public Key Infrastructure Certificate and
+              Certificate Revocation List (CRL) Profile", RFC 3280,
+              April 2002.
+
+6.  IANA Considerations
+
+   IANA has assigned one IPsec Security Protocol Identifier in
+   http://www.iana.org/assignments/isakmp-registry for
+   PROTO_GIGABEAM_RADIO.  It was assigned the value TBD.
+
+7.  Acknowledgements
+
+   The authors thank Bob Sutherland and Dave Marcellas for their
+   contributions and review.
+
+Authors' Addresses
+
+   Russell Housley
+   Vigil Security, LLC
+   918 Spring Knoll Drive
+   Herndon, VA 20170
+   USA
+   EMail: housley <at> vigilsec <dot> com
+
+   Alan Corry
+   GigaBeam Corporation
+   470 Springpark Place, Suite 900
+   Herndon, VA 20170
+   EMail: acorry <at> gigabeam <dot> com
+
+Copyright Statement
+
+   Copyright (C) The Internet Society (2006).
+
+   This document is subject to the rights, licenses and restrictions
+   contained in BCP 78, and except as set forth therein, the authors
+   retain all their rights.
+
+   This document and the information contained herein are provided on an
+   "AS IS" basis and THE CONTRIBUTOR, THE ORGANIZATION HE/SHE REPRESENTS
+   OR IS SPONSORED BY (IF ANY), THE INTERNET SOCIETY AND THE INTERNET
+   ENGINEERING TASK FORCE DISCLAIM ALL WARRANTIES, EXPRESS OR IMPLIED,
+   INCLUDING BUT NOT LIMITED TO ANY WARRANTY THAT THE USE OF THE
+   INFORMATION HEREIN WILL NOT INFRINGE ANY RIGHTS OR ANY IMPLIED
+   WARRANTIES OF MERCHANTABILITY OR FITNESS FOR A PARTICULAR PURPOSE.
+
+
+
+
+
+Housley & Corry                                                [Page 11]
