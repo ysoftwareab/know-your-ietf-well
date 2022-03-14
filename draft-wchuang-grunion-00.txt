@@ -1,0 +1,672 @@
+
+
+
+
+Application Area Working Group                                 W. Chuang
+Internet-Draft                                              Google, Inc.
+Expires: April 7, 2016                                   October 5, 2015
+
+
+                        S/MIME Proxy Forwarding
+                        draft-wchuang-grunion-00
+
+Abstract
+
+   S/MIME provides the means to protect message body content but does
+   not protect the sender and recipient identity nor other headers.  We
+   propose a means to do so by proxying the sending and receiving via a
+   trusted SMTP server.  This document describes how the proxyies are
+   discovered and the wrapped messages created.  This then describes how
+   the proxy forwarding is done.
+
+Status of This Memo
+
+   This Internet-Draft is submitted in full conformance with the
+   provisions of BCP 78 and BCP 79.
+
+   Internet-Drafts are working documents of the Internet Engineering
+   Task Force (IETF).  Note that other groups may also distribute
+   working documents as Internet-Drafts.  The list of current Internet-
+   Drafts is at http://datatracker.ietf.org/drafts/current/.
+
+   Internet-Drafts are draft documents valid for a maximum of six months
+   and may be updated, replaced, or obsoleted by other documents at any
+   time.  It is inappropriate to use Internet-Drafts as reference
+   material or to cite them other than as "work in progress."
+
+   This Internet-Draft will expire on April 7, 2016.
+
+Copyright Notice
+
+   Copyright (c) 2015 IETF Trust and the persons identified as the
+   document authors.  All rights reserved.
+
+   This document is subject to BCP 78 and the IETF Trust's Legal
+   Provisions Relating to IETF Documents
+   (http://trustee.ietf.org/license-info) in effect on the date of
+   publication of this document.  Please review these documents
+   carefully, as they describe your rights and restrictions with respect
+   to this document.  Code Components extracted from this document must
+   include Simplified BSD License text as described in Section 4.e of
+   the Trust Legal Provisions and are provided without warranty as
+   described in the Simplified BSD License.
+
+
+
+Chuang                    Expires April 7, 2016                 [Page 1]
+
+Internet-Draft                SMIME-Grunion                 October 2015
+
+
+   This document may not be modified, and derivative works of it may not
+   be created, and it may not be published except as an Internet-Draft.
+
+Table of Contents
+
+   1.  Motivation  . . . . . . . . . . . . . . . . . . . . . . . . .   2
+   2.  Introduction  . . . . . . . . . . . . . . . . . . . . . . . .   3
+     2.1.  Fully Trusted Proxy . . . . . . . . . . . . . . . . . . .   5
+     2.2.  Partly Trusted Proxy  . . . . . . . . . . . . . . . . . .   6
+   3.  Proxying Metadata . . . . . . . . . . . . . . . . . . . . . .   6
+     3.1.  CMS Extension . . . . . . . . . . . . . . . . . . . . . .   7
+     3.2.  Certificate Extension . . . . . . . . . . . . . . . . . .   8
+   4.  Message Sending And Receiving . . . . . . . . . . . . . . . .   9
+     4.1.  Outbound  . . . . . . . . . . . . . . . . . . . . . . . .   9
+     4.2.  Inbound . . . . . . . . . . . . . . . . . . . . . . . . .  10
+     4.3.  Handling Bounce Message . . . . . . . . . . . . . . . . .  10
+     4.4.  Header Processing . . . . . . . . . . . . . . . . . . . .  11
+   5.  General Delivery Traffic with Grunion Delivery  . . . . . . .  11
+   6.  References  . . . . . . . . . . . . . . . . . . . . . . . . .  11
+   Author's Address  . . . . . . . . . . . . . . . . . . . . . . . .  12
+
+1.  Motivation
+
+   MMaking private the email sender and recipient remains an open issue
+   for email delivery despite several privacy protecting RFCs.  S/MIME
+   [RFC5751] provides for the means to wrap the message body but not the
+   header in an effective way, Secure Headers Fields [RFC7508] provides
+   a means to wrap most headers but not the envelope sender and
+   recipient, and Secure SMTP over TLS [RFC2487] has limitations
+   described as follows.  Traditionally mail delivery through SMTP is
+   sent via cleartext and many SMTP servers still only offer this.  To
+   enhance security, SMTP may offer TLS, but the STARTTLS option may be
+   hidden by an active Man-In- the-middle (MitM) that prevents the
+   initiation of the handshake that makes the message delivery private
+   (EFF link).  Further, a sophisticated MitM adversary may allow
+   encryption but with their own TLS keys so they can eavesdrop all the
+   while depending on certain clients not to check the validity of the
+   server TLS certificates.
+
+   Thus mail delivery despite significant effort is still vulnerable to
+   eavesdropping or man-in-in-middle.  The recent Snowden leaks about
+   the PRISM program have shown that relationship metadata about who is
+   communicating with whom is often as important as the message
+   contents.
+
+
+
+
+
+
+
+Chuang                    Expires April 7, 2016                 [Page 2]
+
+Internet-Draft                SMIME-Grunion                 October 2015
+
+
+2.  Introduction
+
+   We propose that S/MIME wrapped, meaning encrypted messages, be sent
+   through partly or fully trusted SMTP MSA and MDA servers via proxy
+   accounts that act as forwarders that hide the true recipient and
+   sender.  While it is assumed that a (partly or fully) trusted network
+   can be established between the sender and recipient to their
+   respective proxy SMTP servers (MSA and MDA), mail delivery between
+   the proxy SMTP servers is assumed to be untrusted i.e. vulnerable to
+   passive monitoring and MitM.  We propose a process described later by
+   which only the non- identifying forwarding proxy accounts names are
+   potentially seen by the eavesdropper and that the message body is
+   wrapped in a way that does not leak the contents nor the true sender
+   or recipient identity.  The proxy accounts should sustain enough
+   aggregate traffic and be unrelated to the original sender and
+   recipient such that traffic analysis is very difficult.  The
+   following diagram illustrates the proxying process.  This forwarding
+   via proxies is analogous to a networking proxying and forwarding of
+   Chaum-mixes wrapped messages in Onion routing.  Our approach also
+   uses proxies and Chaum message wrapping but differs in that the
+   sender and receiver have trusted proxies that are statically defined
+   and willing to support mail flow (which may be large).  To
+   differentiate we call this process S/MIME Grunion forwarding after
+   the small fish that likes to bury itself in the sand when spawning.
+
+   +--------+  +--------+    +-----+    +--------+    +-----+
+   | True   |  | Sender |  +-+     +-+  | Proxy  |  +-+     +-+
+   | Sender +--> MSA    +-->Untrusted+--> Sender +-->Untrusted+-+
+   |        |  |        |  +-+     +-+  | MSA    |  +-+     +-+ |
+   +--------+  +--------+    +-----+    +--------+    +-----+   |
+                                                                |
+     +----------------------------------------------------------+
+     |
+     |  +----------+    +-----+    +----------+  +----------+
+     |  | Proxy    |  +-+     +-+  | Recipient|  | True     |
+     +--> Recipient+-->Untrusted+--> MDA      +--> Recipient|
+        | MDA      |  +-+     +-+  |          |  |          |
+        +----------+    +-----+    +----------+  +----------+
+
+           Figure 1: SMTP Delivery with Partly Trusted Proxying
+
+   We differentiate the proxy as partly or fully trusted as an optional
+   profile provides increased security at the cost of additional
+   encryption and special handling for bounced messages.  The partly
+   trusted proxy is used when the sender and recipient do not trust the
+   proxy MSA and MDA SMTP servers to see the body content, the full
+   path, or message headers.  The sender proxy is not trusted to know
+   who the recipient is, and the recipient proxy is not trusted to see
+
+
+
+Chuang                    Expires April 7, 2016                 [Page 3]
+
+Internet-Draft                SMIME-Grunion                 October 2015
+
+
+   who the sender is.  However the proxies are trusted to forward the
+   message on behalf of the sender and to do cryptographic processing.
+   It also similarly does not trust the network between the end-point to
+   see the body content, the full path, or message headers.  This
+   approach uses S/MIME message/822 header [RFC5751] (RFC5751 sec 3.1)
+   to wrap the whole message including the header and body.  A new
+   headers suitably modified with the proxy sender and recipients as
+   described shortly is prepended.  Special consideration must be made
+   to protect the end-point privacy when specifying a return path in
+   case of bounce messages, when handling message headers generated
+   during the delivery process and when signing the message.
+
+   +-------+    +--------+    +------+    +-----------+  +-----------+
+   | True  |    | Proxy  |  +--      --+  | Proxy     |  | True      |
+   | Sender+----> Sender +--> Untrusted+--> Recipient +--> Recipient |
+   |       |    | + MSA  |  |          |  | + MDA     |  |           |
+   +-------+    +--------+  +--      --+  +-----------+  +-----------+
+                              +------+
+
+            Figure 2: SMTP Delivery with Fully Trusted Proxying
+
+   The fully trusted proxy is used when the sender and recipient trust
+   the proxy SMTP servers to be given the clear-text headers but wishes
+   to use the proxied wrapping of the message when the message is
+   delivered between the MSA and MDA.  Here the network between end-
+   point and the proxy SMTP servers is fully trusted meaning is capable
+   of keeping messages private.  This might be guaranteed by
+   communication through a closed network behind a firewall, or it might
+   be on the open internet but guaranteed to prevent an active MiTM by
+   mandating use of SMTP TLS with certificate chain checks.  It also
+   assumed that bounce messages are not generated from the end-points to
+   the proxying SMTP server as the bounce with the original headers
+   might reveal content to the untrusted network.  This restriction for
+   fully trusted proxying precludes more elaborate send paths that the
+   partially trusted proxying can support.  Fully trusted proxying will
+   also be capable of handling traditional S/MIME CMS [RFC5652] parts be
+   it signed or encrypted if the sender wishes to keep the message
+   content private from the proxy servers yet authenticated.  The
+   advantage of the partly trusted proxy approach is that by being able
+   to read the headers at the proxies, it does not special handling for
+   return-path or 'Received:' headers which greatly simplifies message
+   setup at the client, and during forwarding which reduces runtime
+   overhead.  While both partly and fully trusted proxying modes should
+   be supported, it is likely that fully trusted proxying will be much
+   easier to deploy while maintaining most of the desired privacy
+   properties.  Because of the ease of deployment, we proposed that
+   another use of the fully trusted proxy model could be used as a
+   general replacement for opportunistic TLS even when the original
+
+
+
+Chuang                    Expires April 7, 2016                 [Page 4]
+
+Internet-Draft                SMIME-Grunion                 October 2015
+
+
+   message did not use S/MIME so long as both the sender and recipient
+   SMTP support this model.  This will be described later in the
+   document.
+
+2.1.  Fully Trusted Proxy
+
+   The Fully Trusted Proxy diagram below illustrates that the proxy-
+   sender wraps the original message once and sets a proxy header using
+   the proxy-sender and proxy-recipient where the content may already be
+   a RFC5751 S/MIME wrapped message.  The Grunion S/MIME wrapped message
+   and proxy head is what is seen by the untrusted network until it is
+   received by the proxy-recipient which unwraps the original message
+   and forwards it to the true recipient.  The proxy sender is also
+   capable of unwrapping the Grunion message in case of bounces.  In the
+   following table, the sender proxy address is assumed to be in the
+   same domain as the sender, and similarly the recipient proxy address
+   is assumed to be in the same domain as the recipient.
+
+   The later tables illustrates the differences between partly vs fully
+   trusted proxy methods.  The diagrams illustrate the MIME tree
+   structure where the CMS corresponds to S/MIME content wrapping.  Note
+   that CMS may wrap the message body only or both header and message
+   body.  The tables describe the TO and FROM headers addresses and the
+   SMTP TO and FROM addresses (envelope TO and FROM) at each step.  The
+   Message column indicates S/MIME message body wrapping where the
+   public keys used are: ps- proxy sender, pr- proxy recipient, r-
+   recipient.  The domains are: S- sender, R- recipient and potentially
+   PS- proxy sender, PR-proxy recipient.  The headers are: h- original
+   header, and h_p- proxy header.
+
+Step             FROM      TO        SMTP FROM   SMTP TO   Message (after)
+Sender(orig)     send@S    recip@R                         (h,b)
+Sender           proxy@S   proxy@R   send@S      proxy@S   (h_p, Kpr(h, Kr(b)))
+Proxy-Sender     proxy@S   proxy@R   proxy@S     proxy@R   (h_p, Kpr(h, Kr(b)))
+  + MSA
+Proxy-Recipient  proxy@S   proxy@R                         (h, Kr(b))
+  + MDA
+Recipient        send@S    recip@R                         (h, b)
+  (decrypted)
+
+              Figure 3: Fully Trusted Message Header and Body
+
+   Note that the SMTP FROM (MAIL FROM) address is rewritten at the Proxy
+   Sender MSA from sender@S to proxy@S as that server notices the
+   Grunion message being forwarded.
+
+
+
+
+
+
+Chuang                    Expires April 7, 2016                 [Page 5]
+
+Internet-Draft                SMIME-Grunion                 October 2015
+
+
+2.2.  Partly Trusted Proxy
+
+   The Partly Trusted Proxy diagram illustrates that the message is
+   wrapped thrice with proxy headers by the true sender so as to hide
+   the true path even from the proxies.
+
+Step             FROM      TO        SMTP FROM   SMTP TO   Message (after)
+Sender(orig)     send@S    recip@R                         (h, b)
+Sender MSA       send@S    proxy@PS  send@S      proxy@PS  (h_ps, Kps(
+                                                             (h_pr, Kpr(
+                                                                (h_r, Kr(h, b))
+                                                                 ))))
+Proxy-Sender MSA proxy@PS  proxy@PR  proxy@PS    proxy@PR  (h_pr, Kpr(
+                                                             (h_r, Kr(h, b))))
+Proxy-Recipient  proxy@PR  recip@R   proxy@PR    recip@R   (h_r, Kr(h, b))
+  MDA
+Recipient MSA    proxy@PR  recip@R                         (h_r, Kr(h, b))
+Recipient        send@S    recip@R                         (h, b)
+ (decrypted)
+
+
+             Figure 4: Partly Trusted Message Header and Body
+
+   Proxy accounts define a new altered delivery path that hides the
+   original sender and recipient by replacing them with a new sender and
+   recipient email address i.e. proxy accounts.  Discovery of the proxy
+   accounts is through the X.509 certificates or CMS through a new
+   certificate extension or by a CMS extension that points to the
+   aforementioned extension.  In the X.509 case, this is found by
+   searching the certificate chain from the end-entity certificate
+   through the intermediate Certificate Authority certificates.  Both
+   the sender and the recipient must each specify a certificate chain
+   where one of the certificates has the extension for the S/MIME
+   Grunion routing to work.  The extensions are described shortly.
+
+3.  Proxying Metadata
+
+   Grunion routing requires several CMS and X.509 Certificate extensions
+   for the purposes of discovering proxying certificates, for
+   determining which forwarding profile to use, and to support message
+   delivery during forwarding.  One feature is duplicating the proxying
+   certificate discovery specification in both CMS and X.509
+   certificate.  The advantage of the X.509 extension is that it must be
+   valid for duration of the certificate validity i.e. proxying support
+   must be valid during that time whereas the CMS extension has no such
+   guarantee.  However there is a bootstrapping problem which the CMS
+   extension resolves.  The certificate issuer might want to prove that
+   the proxying path does deliver mail via the proxy SMTP server to or
+
+
+
+Chuang                    Expires April 7, 2016                 [Page 6]
+
+Internet-Draft                SMIME-Grunion                 October 2015
+
+
+   from the recipient and server.  The issuer could generate a test
+   message via the CMS format.  Once the path is proven a certificate
+   with the X.509 extensions could be issued.
+
+3.1.  CMS Extension
+
+   Senders supporting this protocol should advertise this support via a
+   CMS signed-attribute as described in RFC5652 [RFC5652] and RFC2634
+   [RFC2634] called TrustedProxySupported.  The OID for this attribute
+   is TBD.  This attribute may take an repeated argument
+   certificatePaths which is the same format as Subject Information
+   Accesss in RFC5280 [RFC5280] section 4.2.2.2 which describes a means
+   to obtain certificates from a remote location e.g.  URL.  This
+   follows the guidelines there for fetching certificates using a
+   specified protocol and then how to interpret the fetched content.
+   There is a second argument certificateIdentifier that specifies which
+   certificates found at the remote location can be used for
+   TrustedProxying.  This is the same format as the Authority Key
+   Identifier information in RFC5280 [RFC5652] section 4.2.1.1.  If the
+   certificatePaths and/or certificateIdentifier argument are not
+   present, then it is assumed that the proxying certificates for the
+   Grunion forwarding profile is discovered from the certificates in the
+   message signature i.e.  certificates in the CMS SignedData part.
+   Specifying more than one certificateIdentifier provides path
+   diversity and when multiple are present the sender should randomly
+   pick one to use.  The ASN.1 syntax is:
+
+   TrustedProxySupported := SEQUENCE {
+       certificatePaths SubjectInfoAccessSyntax OPTIONAL
+       certificatesIdentifier ProxyCertificateIdentifier OPTIONAL
+   }
+   ProxyCertificateIdentifier := SEQUENCE {
+       keyIdentifier  KeyIdentifier OPTIONAL,
+       proxyCertIssuer GeneralNames OPTIONAL,
+       proxyCertSerialNumber CertificateSerialNumber OPTIONAL
+   }
+   KeyIdentifier ::= OCTET STRING
+
+                      Figure 5: TrustedProxySupported
+
+   Messages with the TrustedProxySupported attribute must specify a
+   Grunion proxying certificate either referenced by the certificate
+   specified by certificatesPaths/certificateIdentifier or from the
+   signature certificate with a TrustedProxyCertificate extension (next
+   section).  This is intended to help the sender find information
+   needed to set up S/MIME Grunion forwarding but does not necessarily
+   indicate that the current message is using S/MIME Grunion forwarding.
+
+
+
+
+Chuang                    Expires April 7, 2016                 [Page 7]
+
+Internet-Draft                SMIME-Grunion                 October 2015
+
+
+   There is a second signed attribute TrustedProxyForwarding that
+   indicates a message is using the Grunion forwarding.  The OID is TBD.
+   This takes two arguments.  The first bounceMessage is an optional
+   pre- generated bouncy message.  This is not set if using the fully
+   trusted proxying or if the message is already a bounce.  If the pre-
+   generated bounce message is needed, then the sender creates the
+   bounceMessage for each wrapped CMS part as otherwise the bounce
+   message is lost during unwrapping.  They use the same structure as
+   partly trusted proxying to protect privacy but addressed in the
+   reverse direction i.e. from current location back to the sender.  The
+   inner message contains an indication that the message has bounced,
+   some identifying message-id header to correlate the bounce to the
+   original message, and a description of the current proxy that will
+   likely generate the bounce e.g. destination address.  Then working
+   from sender back to the current location, the message is recursively
+   wrapped with that destination's public key.  A new header with the
+   destination address as TO is appended.  The second argument is the
+   Grunion forwarding profile used i.e. whether partly or fully trusted
+   proxying is assumed.
+
+   TrustedProxyForwarding := SEQUENCE {
+       bounceMessage EnvelopedData OPTIONAL
+       profile TrustedProxyProfile
+   }
+   TrustedProxyProfile : = ENUMERATED {
+       FullyTrusted(0),
+       PartlyTrusted(1)
+   }
+
+                     Figure 6: TrustedProxyForwarding
+
+3.2.  Certificate Extension
+
+   We propose a new X.509 certificate [RFC5280] extension that
+   designates that a specified email account can act as a trusted proxy
+   (either partly or fully trusted) in the process of S/MIME grunion
+   forwarding.  The TrustedProxyCertificate extension implies a binding
+   of the proxy account to that certificate's public key and associated
+   private-key for the purposes of email encryption and signing, and
+   that such a binding will exist as long as the certificate is valid.
+   The extension also serves as another subject alternative name
+   argument trustedProxy.  Consequently the certificate containing the
+   specified email address must have a valid issuance path and valid
+   name in the presence of any path constraints using the process
+   specified in RFC5280.  Note that trusted proxy certificate may be an
+   intermediate CA certificate.  There is a second argument proxyProfile
+   that specifies whether the trusted proxy supports partly trusted or
+   fully trusted profiles or both.  OID for the extension is TBD.  If
+
+
+
+Chuang                    Expires April 7, 2016                 [Page 8]
+
+Internet-Draft                SMIME-Grunion                 October 2015
+
+
+   this certificate extension appears as part of the user's signature,
+   it must not be placed on the end-entity certificate user certificate
+   as it would otherwise share the keys with the end-entity.  The ASN.1
+   syntax is:
+
+   TrustedProxyCertificate := SEQUENCE {
+       trustedProxy IA5String
+       proxyProfile TrustedProxyProfiles
+   }
+   TrustedProxyProfiles : = SEQUENCE {
+       profile TrustedProxyProfile
+   }
+
+                     Figure 7: TrustedProxyCertificate
+
+   We also propose that the TrustedProxySupported be an additional
+   certificate extensions that also implies support for a trusted proxy
+   with an external certificate chain distinct from the current one.
+   Unlike TrustedProxyCertificate this extension doesn't imply that the
+   proxy certificate is in the user's issuance path.
+   TrustedProxySupported would generally be placed on the user end-
+   entity certificate and are analogous to the CMS extensions in that
+   describes how to fetch the proxy certificate and interpret the
+   content.  Keep in mind that unlike the CMS extension, these binds the
+   user certificate to trusted proxy for the duration of the validity of
+   the certificate.  This means that use of the trusted proxy to reach
+   the user will be available through the life of the certificate.
+
+4.  Message Sending And Receiving
+
+   The following describes the mechanisms for implementing Grunion S/
+   MIME forwarding.
+
+4.1.  Outbound
+
+   The message is composed normally using the true sender and true
+   recipient or recipients.  In the fully trusted case, the sender may
+   first process the message i.e. encrypt/sign using traditional S/MIME
+   3.2 CMS [RFC5751] and the recipient's public key, and encoded as a
+   application/pkcs7-mime part.  The message MIME tree is embedded
+   message/rfc822 part as described in RFC5751 section 3.1.  The new
+   message is encrypted following the instructions in RFC5751 section
+   3.3 to create an application/pkcs7-mime MIME part using the proxy
+   recipient's public key.  A new proxy header is generated with the
+   proxy- sender and proxy-recipient as the TO and FROM addresses and
+   prepended.  Only the original message or innermost wrapped message
+   should be signed using the sender's private key to maintain the
+   privacy of the end- points.
+
+
+
+Chuang                    Expires April 7, 2016                 [Page 9]
+
+Internet-Draft                SMIME-Grunion                 October 2015
+
+
+   In the partly trusted case, message creation uses almost the same
+   wrapping strategy as the partial proxying.  Wrapping is done from the
+   recipient back to the proxy sender recursively.  The wrapping takes
+   the message body in a message/rfc822 part and wrapped with that
+   step's recipient public key.  A new proxy header is generated using
+   that step sender and recipient.  To protect the sender and recipient
+   identity there should be at least two SMTP proxying steps, but more
+   are possible and could be encoded and decoded without modification.
+   This document does not describe how to discover those intermediaries
+   because so far there hasn't been a use case identified for them.  Any
+   message signing done should be on the original unwrapped message to
+   protect the privacy of the endpoints and using the sender's private
+   key.
+
+4.2.  Inbound
+
+   Each proxying SMTP server looks for TrustedProxyForwarding CMS
+   extension.  If found, it checks whether the profile is supported,
+   otherwise bounce the message.  It then checks to see if the FROM
+   field is a supported user, and then if the CMS specified
+   RecipientInfo matches an available key.  If so unwraps the message
+   including extracting the message/rfc822 if found, otherwise bounce
+   the message.  The proxying SMTP server observes the new header's TO
+   address as the forwarding destination.
+
+4.3.  Handling Bounce Message
+
+   One issue with practical mail delivery is that some messages cannot
+   be delivered and must be bounced.  In the partially trusted case, the
+   initial bounce will takes the TrustedProxyForwarding bounceMessage
+   content as the body content and sends it along the return path.  This
+   will be forwarded and unwrapped in a privacy preserving way.  If the
+   bounce initiator understands Grunion forwarding, it should extract
+   bounceMessage, and send that content as the bounce message.  If it
+   doesn't understand this formatting, it may bounce the entire message
+   and the initial recipient of the bounce will have to extract the
+   bounceMessage content in addition to unwrapping and forwarding.  In
+   the fully trusted proxy case, the proxy sender should add itself as a
+   recipient in addition to the proxy recipient to enable decryption of
+   the message it sent but was bounced.  If there is a bounce it should
+   rewrap the bounce message using the sender proxy public key using the
+   fully trusted CMS structure and addressing.  Note that the bounced
+   message in both cases transfers in encrypted form between the proxies
+   retracing the original sending path thus maintaining privacy of the
+   contents and the headers. p
+
+
+
+
+
+
+Chuang                    Expires April 7, 2016                [Page 10]
+
+Internet-Draft                SMIME-Grunion                 October 2015
+
+
+4.4.  Header Processing
+
+   All user generated headers are wrapped in both proxying models.
+   However there are dynamically generated headers appended to the
+   message as it are propagated along the SMTP send path.  Fully trusted
+   proxying means that the proxies can see, and preserve headers which
+   is very useful for debugging without breaking the privacy contract.
+   However SMTP proxying servers should be careful not propagate
+   information about the sender or recipient such as their IP or DNS
+   address.  For example the "Received" header is dynamically generated
+   at SMTP receive time with debug information about the environment,
+   timestamp proxy address and potentially the sender.  Grunion
+   forwarders should scrub the sender or recipient (on bounce) address.
+   Similarly authentication and result headers such as DKIM, SPF and
+   DMARC can similarly be propagated.  Partly trusted headers is much
+   more restrictive in order to protect the more restrictive privacy
+   contract.  In the current design, all dynamically generated headers
+   are not propagated to the recipient at the proxy SMTP servers.
+
+5.  General Delivery Traffic with Grunion Delivery
+
+   A domain may advertise that all messages may be delivered via Grunion
+   forwarding.  As such it could replace opportunistic SMTP TLS to
+   maintain message privacy so long as the sender and recipient SMTP
+   servers can support Grunion forwarding and can act as the proxies.
+   Unlike SMTP TLS which advertises TLS capability on a per session
+   basis, this capability is advertised as being supported as long as
+   the certificate is valid.  As the TrustedProxyCertificate extension
+   may be placed on the intermediate CA certificate, it can be present
+   in other usage scenarios besides S/MIME email such as part of the
+   SMTP server TLS certificates chain.  A stateful SMTP server could
+   track past intermediate certificates presented to it to determine
+   whether a new delivery can be transmitted with the message wrapped in
+   Grunion S/MIME even if the current session doesn't specify STARTTLS.
+   If a message is already wrapped by the sender with the proxy
+   recipient key, the message should not be rewrapped by the proxying
+   sender SMTP server.  To maintain endpoint privacy between the
+   endpoint to the SMTP server only the fully trusted profile should be
+   used.
+
+6.  References
+
+   [RFC2487]  Hoffman, P., "SMTP Service Extension for Secure SMTP over
+              TLS", RFC 2487, DOI 10.17487/RFC2487, January 1999,
+              <http://www.rfc-editor.org/info/rfc2487>.
+
+
+
+
+
+
+Chuang                    Expires April 7, 2016                [Page 11]
+
+Internet-Draft                SMIME-Grunion                 October 2015
+
+
+   [RFC2634]  Hoffman, P., Ed., "Enhanced Security Services for S/MIME",
+              RFC 2634, DOI 10.17487/RFC2634, June 1999,
+              <http://www.rfc-editor.org/info/rfc2634>.
+
+   [RFC5280]  Cooper, D., Santesson, S., Farrell, S., Boeyen, S.,
+              Housley, R., and W. Polk, "Internet X.509 Public Key
+              Infrastructure Certificate and Certificate Revocation List
+              (CRL) Profile", RFC 5280, DOI 10.17487/RFC5280, May 2008,
+              <http://www.rfc-editor.org/info/rfc5280>.
+
+   [RFC5321]  Klensin, J., "Simple Mail Transfer Protocol", RFC 5321,
+              DOI 10.17487/RFC5321, October 2008,
+              <http://www.rfc-editor.org/info/rfc5321>.
+
+   [RFC5322]  Resnick, P., Ed., "Internet Message Format", RFC 5322, DOI
+              10.17487/RFC5322, October 2008,
+              <http://www.rfc-editor.org/info/rfc5322>.
+
+   [RFC5652]  Housley, R., "Cryptographic Message Syntax (CMS)", STD 70,
+              RFC 5652, DOI 10.17487/RFC5652, September 2009,
+              <http://www.rfc-editor.org/info/rfc5652>.
+
+   [RFC5751]  Ramsdell, B. and S. Turner, "Secure/Multipurpose Internet
+              Mail Extensions (S/MIME) Version 3.2 Message
+              Specification", RFC 5751, DOI 10.17487/RFC5751, January
+              2010, <http://www.rfc-editor.org/info/rfc5751>.
+
+   [RFC7508]  Cailleux, L. and C. Bonatti, "Securing Header Fields with
+              S/MIME", RFC 7508, DOI 10.17487/RFC7508, April 2015,
+              <http://www.rfc-editor.org/info/rfc7508>.
+
+Author's Address
+
+   Weihaw Chuang
+   Google, Inc.
+   1600 Amphitheatre Parkway
+   Mountain View, CA  94043
+   US
+
+   Email: weihaw@google.com
+
+
+
+
+
+
+
+
+
+
+
+Chuang                    Expires April 7, 2016                [Page 12]

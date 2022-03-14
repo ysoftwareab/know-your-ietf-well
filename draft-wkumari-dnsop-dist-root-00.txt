@@ -1,0 +1,560 @@
+
+
+
+
+Network Working Group                                     W. Kumari, Ed.
+Internet-Draft                                                    Google
+Intended status: Informational                           P. Hoffman, Ed.
+Expires: December 1, 2014                                 VPN Consortium
+                                                            May 30, 2014
+
+
+                       Distributing the DNS Root
+                    draft-wkumari-dnsop-dist-root-00
+
+Abstract
+
+   This document recommends that recursive DNS resolvers transfer the
+   root zone, securely validate it and then populate their caches with
+   the information.
+
+   [[ Note: This document is largely a discussion starting point. ]]
+
+Status of This Memo
+
+   This Internet-Draft is submitted in full conformance with the
+   provisions of BCP 78 and BCP 79.
+
+   Internet-Drafts are working documents of the Internet Engineering
+   Task Force (IETF).  Note that other groups may also distribute
+   working documents as Internet-Drafts.  The list of current Internet-
+   Drafts is at http://datatracker.ietf.org/drafts/current/.
+
+   Internet-Drafts are draft documents valid for a maximum of six months
+   and may be updated, replaced, or obsoleted by other documents at any
+   time.  It is inappropriate to use Internet-Drafts as reference
+   material or to cite them other than as "work in progress."
+
+   This Internet-Draft will expire on December 1, 2014.
+
+Copyright Notice
+
+   Copyright (c) 2014 IETF Trust and the persons identified as the
+   document authors.  All rights reserved.
+
+   This document is subject to BCP 78 and the IETF Trust's Legal
+   Provisions Relating to IETF Documents
+   (http://trustee.ietf.org/license-info) in effect on the date of
+   publication of this document.  Please review these documents
+   carefully, as they describe your rights and restrictions with respect
+   to this document.  Code Components extracted from this document must
+   include Simplified BSD License text as described in Section 4.e of
+
+
+
+
+Kumari & Hoffman        Expires December 1, 2014                [Page 1]
+
+Internet-Draft          Distributing the DNS Root               May 2014
+
+
+   the Trust Legal Provisions and are provided without warranty as
+   described in the Simplified BSD License.
+
+Table of Contents
+
+   1.  Introduction  . . . . . . . . . . . . . . . . . . . . . . . .   2
+     1.1.  Requirements notation . . . . . . . . . . . . . . . . . .   3
+   2.  Requirements  . . . . . . . . . . . . . . . . . . . . . . . .   3
+   3.  Pros and Cons of this Technique . . . . . . . . . . . . . . .   5
+     3.1.  Pros  . . . . . . . . . . . . . . . . . . . . . . . . . .   5
+     3.2.  Cons  . . . . . . . . . . . . . . . . . . . . . . . . . .   6
+   4.  Open Questions  . . . . . . . . . . . . . . . . . . . . . . .   6
+     4.1.  Transfer Mechanism  . . . . . . . . . . . . . . . . . . .   6
+     4.2.  Transfer Source . . . . . . . . . . . . . . . . . . . . .   7
+     4.3.  Channel / Object Security . . . . . . . . . . . . . . . .   7
+     4.4.  Load Esitmates  . . . . . . . . . . . . . . . . . . . . .   7
+     4.5.  Behavior on Failures. . . . . . . . . . . . . . . . . . .   8
+       4.5.1.  Bad Zone Data / Scaling . . . . . . . . . . . . . . .   8
+       4.5.2.  Failover to the Next Transfer Server  . . . . . . . .   8
+   5.  IANA Considerations . . . . . . . . . . . . . . . . . . . . .   8
+   6.  Security Considerations . . . . . . . . . . . . . . . . . . .   8
+   7.  Acknowledgements  . . . . . . . . . . . . . . . . . . . . . .   9
+   8.  Contributors  . . . . . . . . . . . . . . . . . . . . . . . .   9
+   9.  Normative References  . . . . . . . . . . . . . . . . . . . .  10
+   Appendix A.  Changes / Author Notes.  . . . . . . . . . . . . . .  10
+   Authors' Addresses  . . . . . . . . . . . . . . . . . . . . . . .  10
+
+1.  Introduction
+
+   One of the main advantages of a DNSSEC-signed root zone is that it
+   doesn't matter where you get the data from, as long as you validate
+   the contents of the zone using DNSSEC information.
+
+   When a recursive resolver starts up, it has an empty cache and
+   addresses of the root servers.  As it begins answering queries, it
+   populates its cache by making a number of queries to the set of root
+   servers, and caching the results.  This is a somewhat inefficient
+   process, and a large number of the queries that hit the root are so
+   called "junk" queries, such as queries for second-level domains in
+   non-existent TLDs.
+
+   This document is describes a means to populate caches in recursive
+   resolvers with the contents of the full root zone so that the
+   recursive resolvers have the root zone content cached.  This
+   decreases latency for requests to the resolver, increases reliability
+   and stability of the DNS, and increases DoS resilience for the root
+   servers.
+
+
+
+
+Kumari & Hoffman        Expires December 1, 2014                [Page 2]
+
+Internet-Draft          Distributing the DNS Root               May 2014
+
+
+   This technique can be viewed as pre-populating a resolver's cache
+   with the root zone information, using a transfer operation to do the
+   transfer.
+
+1.1.  Requirements notation
+
+   The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT",
+   "SHOULD", "SHOULD NOT", "RECOMMENDED", "MAY", and "OPTIONAL" in this
+   document are to be interpreted as described in [RFC2119].
+
+2.  Requirements
+
+   [[ Note: We have tried to keep this document easily readable, and to
+   drive discussions.  This means that we might be somewhat loose in
+   terminology at the moment.  I will firm that up later. ]]
+
+   [[ Note: (Written as a separate note for emphasis!): This document
+   proposes one way to do populate caches with the root zone
+   information.  It is a starting point - we have made some choices /
+   trade offs, and written the doc as though they are the right answer.
+   We did this to make reading the document easier - reading a simple
+   (but possibly) wrong solution is easier than having multiple "You
+   could do X, Y, Z" choices at each point.  There is a section of open
+   questions at the end of this document. ]]
+
+   In order to follow these guidelines, a recursive server MUST support
+   DNSSEC, and MUST have an up-to-date copy of the DNS root key.
+
+   On startup, recursive servers follow these steps:
+
+   1.  The resolver SHOULD perform a priming query to get the full list
+       and addresses of root zone transfer servers.  If a priming query
+       is not performed, the resolver MUST have pre-configured knowledge
+       of a list of root zone transfer servers, and (for stability
+       purposes) that list MUST have at least four servers listed.
+
+   2.  The resolver SHOULD randomly sort the list of answers from the
+       priming query.
+
+   3.  The resolver SHOULD attempt to transfer the root zone using AXFR
+       from each one of the servers until either success is achieved or
+       the list has been exhausted.  If the root zone cannot be
+       transferred, the resolver logs this as an error, and falls back
+       to "legacy" operation.  The resolver MAY attempt to transfer in
+       parallel to minimize startup latency.  The resolver MAY store the
+       contents of the root zone to disk.  If the resolver has a stored
+       copy of the root zone, and the data in the zone is not expired,
+       and that copy was written within the refresh time listed in the
+
+
+
+Kumari & Hoffman        Expires December 1, 2014                [Page 3]
+
+Internet-Draft          Distributing the DNS Root               May 2014
+
+
+       zone, the resolver MAY and load that zone instead of
+       transferring.
+
+   4.  The resolver MUST validate the records in the zone using DNSSEC
+       before relying on any of the records.  If any of the records do
+       not validate, the resolver MUST log an error and SHOULD try the
+       next server in the list.
+
+   Until the server has transferred (and validated) the zone, it MUST
+   NOT act as though it is a copy of the root zone.  Once the resolver
+   has transferred and validated the zone, it MUST act as though it is a
+   copy of the root zone.  This includes following the refresh, retry,
+   expire logic, with certain modifications:
+
+   1.  If the zone expires (for example, because it cannot retransfer
+       because of blocked TCP connections), it MUST fall back to
+       "legacy" operation and MUST log an error.  It MUST NOT return
+       SERVFAIL to queries simply because its copy of the root zone
+       expired.
+
+   2.  The resolver MUST validate the contents of the records in the
+       zone using DNSSEC for every transfer.  The resolver SHOULD try
+       alternate servers if the validation fails.  If the resolver is
+       unable to transfer a copy of the zone that validates, it MUST
+       treat this as an error, MUST discard the received records, and
+       fail back to "legacy" operation.  The resolver SHOULD attempt to
+       restart this process at every retry interval for the root zone.
+
+   3.  The resolver SHOULD set the AD bit on responses to queries for
+       records in the root zone.  This action is the same as if it had
+       inserted the entry into its cache through a "normal" query.
+
+   4.  The resolver MUST validate all of the zone contents, and MUST NOT
+       start using the new contents until all have been validated; the
+       resolver MUST NOT use "lazy validation".  This means that the
+       replacement of the existing zone data with the refreshed data
+       MUST be an atomic operation.
+
+   Compliant nameservers software MUST include an option to securely
+   cache the root zone (an example name for this option could be
+   "transfer-and-validate-root [yes|no]").  That is, the mechanism
+   described in this document MUST be optional, and the cache operator
+   MUST be able to turn it off and on.
+
+   [[ Note: TODO: define "legacy operation" - this basically mans "just
+   how things operate now; you go ask a root server where each TLD is.
+   ]]
+
+
+
+
+Kumari & Hoffman        Expires December 1, 2014                [Page 4]
+
+Internet-Draft          Distributing the DNS Root               May 2014
+
+
+   [ Ed: This fallback to legacy operation solution might only work
+   until most people are doing this.  As the number of folk querying the
+   root directly decreases, the scale of the root will presumably
+   decrease.  Once this happens, if there is a large failure and
+   everyone falls back to "legacy" operation, will the root still be big
+   enough to cope with the load?  Should we address this in this
+   document (e.g: After 10 years from today, the "fallback to legacy"
+   option should be disabled")?  Or just note this and suggest that a
+   new document be written, updating this one and disabling the root
+   fallback? ]
+
+3.  Pros and Cons of this Technique
+
+   [[ Note: This section likely to be removed or significantly revised
+   before publication. ]]
+
+   This is primarily a tracking / discussion section, and the text is
+   kept even looser than in the rest of this doc.  These are not
+   ordered.
+
+3.1.  Pros
+
+   o  Decrease in latency to the client - The recursive resolver already
+      knows about all the TLDs and all of their information, so the
+      first query for a particular TLD will always be faster.
+
+   o  DoS against the root servers - By distributing the root to many
+      recursive resolvers, the DoS protection for the root servers is
+      significantly increased.  A DDoS may still be able to take down
+      some recursive servers, but there is no root infrastructure to
+      attack.  Of course, there is still a zone distribution system that
+      could be attacked (but it would need to be kept down for a much
+      longer time to cause significant damage, and so far the root has
+      stood up just fine to DDoS.
+
+   o  No central monitoring point (see also Cons!) - This proposal
+      provides a small increase to privacy of requests, and removes a
+      place where attackers could collect information.  Although query
+      name minimization also achieves some of this, it does still leak
+      the TLDs that people behind a resolver are querying for, which may
+      in itself be a concern (for example someone in a homophobic
+      country who is querying for a name in .gay).
+
+   o  Junk queries / negative caching - Currently, a significant number
+      of queries to the root servers are "junk" queries.  Many of these
+      queries are TLDs that do not (and may never) exist in the root
+      Another significant source of junk is queries where the negative
+      TLD answer did not get cached because the queries are for second-
+
+
+
+Kumari & Hoffman        Expires December 1, 2014                [Page 5]
+
+Internet-Draft          Distributing the DNS Root               May 2014
+
+
+      level domains (a negative cache entry for "foo.example" will not
+      cover a subsequent query for "bar.example").
+
+   o  More use of DNSSEC - In order for a recursive resolver to use this
+      system, it needs to fully deploy DNSSEC.  Many large ISP-run
+      resolvers do so today, but many smaller resolvers do not.  This
+      might be the impetus for them to do so.
+
+3.2.  Cons
+
+   o  No central monitoring point (also see Pros!) - DNS operators lose
+      the ability to monitor the root system.  While there is work
+      underway to implement better instrumentation of the root server
+      system, this (potentially) removes the thing to monitor.
+
+   o  Loss of agility in making root zone changes - Currently, if there
+      is an error in the root zone (or someone needs to make an
+      emergency change), a new root zone can be created, and the root
+      server operators can be notified and start serving the new zone
+      quickly.  Of course, this does not invalidate the bad information
+      in (long TTL) cached answers.  Notifying every recursive resolver
+      is not feasible.
+
+   o  Increased complexity in nameserver software and their operations -
+      Any proposal for recursive servers to copy and serve the root
+      inherently means more code to write and execute.  Note that many
+      recursive resolvers are on inexpensive home routers that are
+      rarely (if ever) updated.
+
+   o  Changes the nature and distribution of traffic hitting the root
+      servers - If all the "good" recursive resolvers deploy root
+      copying, then root servers end up servicing only "bad" recursive
+      resolvers and attack traffic.  The roots (could) become what AS112
+      is for RFC1918.
+
+4.  Open Questions
+
+   [[ Lots of food for thought here. ]]
+
+4.1.  Transfer Mechanism
+
+   The current document uses AXFR as the way to get the zone.  This may
+   be not be the best way to transfer the data.  AXFR is an easy way to
+   explain what we are trying to achieve, and everyone in the DNS world
+   is familiar with transferring a copy of a zone with AXFR.  There are
+   many technologies that might be better for distributing this type of
+   data to lots of locations.  A short list of alternatives includes
+
+
+
+
+Kumari & Hoffman        Expires December 1, 2014                [Page 6]
+
+Internet-Draft          Distributing the DNS Root               May 2014
+
+
+   FTP, HTTP, and BitTorrent.  The whole point of DNSSEC is that it
+   doesn't matter where the data comes from.
+
+4.2.  Transfer Source
+
+   We need a source for the data.  Currently, some of root operators
+   allow open AXFR (B, C, F, G, K), and IANA provides a service as well.
+   Should we continue to use the root servers as a source, or should
+   there be a new infrastructure created for getting copies of the full
+   root zone?  Will the current set of operators / nodes be willing /
+   able to scale to the number of transfers?  Will additional letters be
+   willing to enable AXFR?  What if we changed the transfer mechanism?
+   Should we stand up a new service?
+
+4.3.  Channel / Object Security
+
+   Currently the root zone is signed.  Unfortunately the way DNSSEC
+   works, it only signs the authoritative information in the zone, and
+   non-authoritative information, particularly glue records, are not
+   signed.
+
+   Does this matter?
+
+   o  No.  The non-authoritative information is not signed in the
+      current design.  All that the "copy the root zone" idea does it
+      pre-populate the cache en mass, and so we should do exactly what
+      we currently do.
+
+   o  Yes. It would be good to be able to get all the zone information
+      from anywhere.  An attacker might be stripping or modifying the
+      non-authoritative information.
+
+   An option that has been mentioned would be to wrap the AXFR transfers
+   in SIG(0), but this has serious load implications for the transfer
+   servers.  A simple solution would be to sort the records into a
+   canonical format, make a hash of that, and then append and sign the
+   result.  This would require a new protocol, but it is something that
+   has been done many times in areas outside the DNS.
+
+4.4.  Load Esitmates
+
+   [[ Note: these are quick, on the back of an envelope calculations.
+   They could be very wrong. ]]
+
+   People estimate that there are roughly 180,000 "real" recursive
+   servers that talk to the root server.  To account for restarts, we'll
+   call it 200,000.  We like to keep something like the current agility
+   of the root, so we should try transfer twice a day.  This is 400,000
+
+
+
+Kumari & Hoffman        Expires December 1, 2014                [Page 7]
+
+Internet-Draft          Distributing the DNS Root               May 2014
+
+
+   transfers per day, or less than 5 transfers per second.  The root
+   zone is currently around 550KB.  At 5qps this is roughly 21Mbps.
+   That's quite a low number relative to what the root servers currently
+   serve.  Yes, the root zone is growing in size, but even a few orders
+   of magnitude is still reasonable.
+
+   While this could be handled by a single box, it (obviously!)
+   shouldn't be.  We still need DoS protection, redundancy, overhead,
+   etc - but as a scaling number this is interesting.
+
+4.5.  Behavior on Failures.
+
+   This is actually 2 questions:
+
+4.5.1.  Bad Zone Data / Scaling
+
+   Once most recursive servers start using this, the load on the root
+   will be significantly less and / or different.  This means that the
+   root might no longer be adequately scaled to deal with *everyone*
+   suddenly querying it if there is a bad root zone pushed out.  This is
+   a longer term issue, but how should we address it?  After N years
+   remove the legacy fallback?  What is N?  Or, in a few years someone
+   writes a new doc that updates this one and removes the legacy
+   fallback?
+
+4.5.2.  Failover to the Next Transfer Server
+
+   If you try transfer from a transfer server and get bad data, you
+   should try another one -- but, how do we avoid causing a DoS if a bad
+   root zone is pushed out?  We could solve this with something like
+   "try the next N server, then start exponential backoff, capping at
+   M".  This seems like it might be another form of an existing issue -
+   what happens if someone published a bad DS in the root for a very
+   popular TLD - does everyone start hammering on the door demanding
+   better data?
+
+5.  IANA Considerations
+
+   Currently this document requires no action from the IANA.  Depending
+   on some of the Open Questions discussions this may change.
+
+6.  Security Considerations
+
+   [[ Note: This needs to be filled in more when there is agreement on
+   the actual mechanism. ]]
+
+
+
+
+
+
+Kumari & Hoffman        Expires December 1, 2014                [Page 8]
+
+Internet-Draft          Distributing the DNS Root               May 2014
+
+
+7.  Acknowledgements
+
+   The editors fully acknowledge that this is not a new concept, and
+   that we have chatted with many people about this.  If we have spoken
+   to you and your name is not listed below, let us know.
+
+8.  Contributors
+
+   The general concept in this document is not new; there have been
+   discussions regarding recursive resolvers copying the root zone for
+   many years.  The fact that the root zone is now signed with DNSSEC
+   makes implementing some of these techniques more feasible.
+
+   The following is an unordered list of individuals have contributed
+   text and / or significant discussions to this document.
+
+      Steve Crocker - Shinkuro
+
+      Jaap Akkerhuis - NLnet Labs
+
+      David Conrad - Virtualized, LLC.
+
+      Lars-Johan Liman - Netnod
+
+      Suzanne Woolf - Individual
+
+      Roy Arends - Nominet
+
+      Olaf Kolkman - NLnet Labs
+
+      Danny McPherson - Verisign
+
+      Joe Abley - Dyn
+
+      Jim Martin - ISC
+
+      Jared Mauch - NTT America
+
+      Rob Austien - Dragon Research Labs
+
+      Sam Weiler - Parsons
+
+      Duane Wessels - Verisign
+
+
+
+
+
+
+
+
+Kumari & Hoffman        Expires December 1, 2014                [Page 9]
+
+Internet-Draft          Distributing the DNS Root               May 2014
+
+
+9.  Normative References
+
+   [RFC2119]  Bradner, S., "Key words for use in RFCs to Indicate
+              Requirement Levels", BCP 14, RFC 2119, March 1997.
+
+Appendix A.  Changes / Author Notes.
+
+   [RFC Editor: Please remove this section before publication ]
+
+   Initial to -00
+
+   o  Text!
+
+Authors' Addresses
+
+   Warren Kumari (editor)
+   Google
+   1600 Amphitheatre Parkway
+   Mountain View, Ca  94043
+   US
+
+   Email: Warren@kumari.net
+
+
+   Paul Hoffman (editor)
+   VPN Consortium
+
+   Email: paul.hoffman@vpnc.org
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Kumari & Hoffman        Expires December 1, 2014               [Page 10]

@@ -1,0 +1,1139 @@
+
+NFSv4 Working Group                                     Nicolas Williams
+INTERNET-DRAFT                                          Sun Microsystems
+Category: Experimental                                          May 2003
+
+
+
+	A Method and Protocol for Mapping of Multi-Realm NFSv4 ACE
+	      Names to Internal Security Entity Identifiers
+                <draft-williams-nfsv4-ace-mapping-00.txt>
+
+
+
+
+Status of this Memo
+
+   This document is an Internet-Draft and is in full conformance with
+   all provisions of Section 10 of RFC2026 [RFC2026].
+
+   Internet-Drafts are working documents of the Internet Engineering
+   Task Force (IETF), its areas, and its working groups.  Note that
+   other groups may also distribute working documents as Internet-
+   Drafts.
+
+   Internet-Drafts are draft documents valid for a maximum of six months
+   and may be updated, replaced, or obsoleted by other documents at any
+   time.  It is inappropriate to use Internet- Drafts as reference
+   material or to cite them other than as "work in progress."
+
+   The list of current Internet-Drafts can be accessed at
+   http://www.ietf.org/ietf/1id-abstracts.txt
+
+   The list of Internet-Draft Shadow Directories can be accessed at
+   http://www.ietf.org/shadow.html.
+
+   This draft expires on September 1st, 2003.  Please send comments to
+   the author.
+
+
+Copyright Notice
+
+   Copyright (C) The Internet Society (2003).  All Rights Reserved.
+
+Abstract
+
+   NFSv4 Access Control List (ACL) Element (ACE) "who" names identify
+   users and groups and support a non-flat namespace where each user and
+   group belongs to a given domain.  Servers usually do not store NFSv4
+   ACL ACE names but internal forms, often as fixed sized binary values
+   (e.g., as integers).
+
+   For some operating system standards, such as POSIX, those internal
+   ACE forms have a flat namespace (e.g., from 0 to 2^32 -1).  In order
+   to properly support non-flat NFSv4 ACE names some method is needed to
+   map ACE names from multiple domains to internal forms.  Other
+
+N. Williams							[Page 1]
+
+DRAFT		Mapping NFSv4 ACE Names to IDs		Expires November 2003
+
+   platforms have structured internal identifiers with non-flat
+   namespace, such as Windows SIDs.
+
+   This document presents a model for NFSv4 ACE-name-to-internal-
+   identifier mapping, as well as reverse mappings, which are needed for
+   environments that use multi-protocol file servers, and a protocol for
+   environments where such mappings must be consistent across multiple
+   servers.  Additional features of the protocol include mapping login
+   names, including GSS-API principals to the set of ACE names
+   associated with each such login name, and, optionally, retrieving ACE
+   name and internal identifier retirement/re-use warnings.
+
+Table of Contents
+
+   1  Introduction
+   1.1  Glossary
+   2  ACE Name Mapping Model
+   3  ACE Name Mapping Protocol
+   3.1  ACE Name Mapping Domains
+   3.2  Procedures of the ACE Name Mapping Protocol
+   3.2.1  The NULL Procedure
+   3.2.2  Negotiate RPCSEC_GSS Security Triples
+   3.2.3  Map an ACE Name to an Internal Security Entity ID
+   3.2.4  Map an Internal Security Entity ID to an ACE Name
+   3.2.5  Map Login Names to ACE name Lists
+   3.2.6  Retrieve List of Retired ACE Names and Internal IDs
+   3.3  Authentication and GSS-API Mechanism Negotiation
+   3.4  Relation of ACE Name Mapping to Directories
+   3.5  High Availability of ACE Name Mapping Services
+   3.6  Protocol Extensibility
+   4  Mapping Login Names to ACE Name Lists
+   4.1  Mapping GSS-API Contexts
+   5  ONC RPC Protocol Definition
+   6  Kerberos V Authorization-Data Type for ACE Lookup Optimization
+   7  Operational Considerations
+   7.1  Locating Mapping Services
+   7.2  Redundancy, Reliability, Clustering
+   8  Security Considerations
+   9  References
+   9.1  Normative References
+   9.2  Informative References
+   10  Acknowledgements
+
+
+Conventions used in this document
+
+   The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT",
+   "SHOULD", "SHOULD NOT", "RECOMMENDED",  "MAY", and "OPTIONAL" in this
+   document are to be interpreted as described in [RFC2119].
+
+1  Introduction
+
+   Operating systems such as Linux, BSD and Solaris have a small, flat
+
+N. Williams							[Page 2]
+
+DRAFT		Mapping NFSv4 ACE Names to IDs		Expires November 2003
+
+   namespace of internal identifiers for security entities such as users
+   or groups.  Even small internetworks usually have multiple domains
+   each of which defines its own users and groups names to POSIX UIDs
+   and GIDs.  Generally, users from one domain cannot login to other
+   domains (where authorization would be granted) without having a local
+   (stub) account in each such other domain; this problem applies as
+   much to console logins as to NFS access (specifically NFS ACLs).  The
+   larger the internetwork of domains, the harder it is to automate
+   creation and maintenance of stub accounts through meta-directories or
+   directory synchronization.
+
+   This document defines a model for automatically mapping non-flat user
+   and group namespaces to flat internal identifier namespaces.  This
+   model assumes that no consistency in mappings is required across
+   hosts in one domain, but because this assumption is expected to be
+   generally incorrect this document also defines a protocol which can
+   be used to implement this mapping model across multiple hosts (e.g.,
+   a server cluster, a site, an entire domain).
+
+   The mapping protocol provides additional features beyond mapping ACE
+   names to internal identifiers, including reverse mappings from
+   internal identifiers to ACE names, which is needed for multi-protocol
+   file servers that support remote file system protocols other than
+   NFSv4 and which, unlike NFSv4, reference internal security entity
+   identifiers on the wire.
+
+   The mapping model can fairly be described as "automatic, on-demand
+   mapping."  The protocol merely extends a given 'mapping domain' to
+   all clients of a mapping service for that mapping domain and provides
+   some additional services.
+
+   Areas of particular interest, from operations and security points of
+   view are: ACE name aliases, ACE name reuse, internal identifier
+   reuse, DoS attacks where a malicious or wayward client attempts to
+   exhaust the internal identifier namespaces for a server or domain or
+   otherwise slow down servers by causing too many mapping operations.
+
+1.1  Glossary
+
+   Some familiarity of the reader with NFSv4 [RFC3530], CIFS [CIFS] and
+   RPCSEC_GSS [RFC2203] is expected.
+
+   Some terms defined or heavily used in this document are defined in
+   this partial glossary to help readers:
+
+      - ACE name
+
+        The NFSv4 representation of user and group names; the
+	non-special values of the "who" field of NFSv4 ACEs (struct
+	nfsace4).  The term "ACE name" is not used in RFC3530; it was
+	invented for this document.
+
+      - ISID
+
+N. Williams							[Page 3]
+
+DRAFT		Mapping NFSv4 ACE Names to IDs		Expires November 2003
+
+
+        Internal security entity identifier.  Refers to the internal
+	identifiers used to represent references to users and groups on
+	disk on file systems.  POSIX UIDs and GIDs are ISIDs, as are
+	Windows SIDs.
+
+      - Mapping domain
+
+        The set of ACE name to ISID (and reverse) mappings used by a the
+	clients of the same mapping domain.
+
+2  ACE Name Mapping Model
+
+   The mapping model is quite simple: map ACE names to ISIDs
+   automatically and on-demand.  Typically ACE mapping would be
+   performed as follows as follows: check if a mapping already exists
+   for a given input ACE name, if so return the existing mapping, else
+   [perform various checks and] generate a new mapping by assigning the
+   next available ISID of the applicable type.
+
+   If no ACE name aliases are allowed, no ACE name or ISID reuse is
+   possible, and if DoS attacks against the mapping service are not
+   considered, then the description above is quite simple and adequate.
+   Note that changing a security entity's ACE name amounts to creating
+   an alias of the previous name, so disallowing ACE name aliases
+   amounts to disallowing user and group renaming.
+
+   ACE name aliases can be dealt with by requiring that a given ACE
+   name's domain's directory be accessible to the mapping service and
+   queriable for the ACE name's aliases or canonical ACE name - if
+   either the directory is not accessible or it does not support ACE
+   name alias lookups, then ACE aliases can be presumed to be
+   non-existent in that ACE domain.  In practice directories will have
+   to make it possible to query for an ACE's aliases and/or canonical
+   ACE name.
+
+   DoS attacks against the mapping service can be foiled by requiring
+   that a given ACE name be verifiable against a directory for the ACE
+   name's domain.
+
+   Mapping ACE names robustly in the face of ACE name reuse requires
+   that ACE names' domains' directories be accessible and that they
+   assign minimum non-reuse guaranteed lifetimes or that they otherwise
+   provide notifications to other domains of ACE name reuse.
+
+   ISID reuse can be dealt with by garbage collection: searching servers
+   for files whose ACLs reference an ISID that is to be reused, and
+   removing or replacing references to such ISIDs from those ACLs.  ISID
+   reuse SHOULD be avoided where possible, but where ISID namespaces are
+   too small reuse MAY be used.
+
+   ACE name mapping services SHOULD NOT map ACE names from domains not
+   "trusted" - that is, administratively configured such that mappings
+
+N. Williams							[Page 4]
+
+DRAFT		Mapping NFSv4 ACE Names to IDs		Expires November 2003
+
+   of their ACE names are allowed.
+
+3  ACE Name Mapping Protocol
+
+   Because in practice NFSv4 servers and even clients will need to use
+   consistent mappings amongst themselves and also to facilitate
+   multi-protocol file server implementation an ONC/RPC protocol is
+   defined to effect ACE name mapping on a network.
+
+   The definition of the MAPPER_PROG protocol using the ONC/RPC syntax
+   is given in section 6.
+
+3.1  ACE Name Mapping Domains
+
+   Each host MUST operate in at most one ACE name mapping domain.  Once
+   a host is in one ACE name mapping domain it cannot be moved to
+   another without also searching for all references on the host to ISID
+   of the first mapping domain and replacing them with their equivalents
+   from the second mapping domain.
+
+   The mapping service for a given mapping domain SHOULD map only ACE
+   and login names from "trusted" domains.  These domain trusts are not
+   transitive.
+
+3.2  Procedures of the ACE Name Mapping Protocol
+
+   The ACE name mapping protocol defines four (4) mandatory to implement
+   procedures and three optional to implement procedures (which MUST be
+   implemented but MAY always return an error, MAP_NOPROC).
+
+   One mandatory procedure is the traditional NULL procedure (MAP_NULL).
+
+   Another mandatory procedure is for RPCSEC_GSS security triple
+   negotiation (MAP_SECINFO).
+
+   The third mandatory procedure maps an ACE name to an ISID (e.g., a
+   POSIX UID) (MA_ACE_NAME).
+
+   The fourth mandatory to implement procedure is used for mapping ISIDs
+   to ACE names (MAP_ISID).
+
+   The optional procedures are used for mapping login names to lists of
+   ACE names (MAP_LOGIN_NAME) and for retrieving a list of retired ACE
+   names and ISIDs (MAP_GET_RETIREMENTS).
+
+   All procedures other than the NULL and MAP_SECINFO procedures return
+   a status value of type "enum mapstat", with the following possible
+   values:
+
+      - MAP_OK, for success.
+      - MAP_NO_SUBJECT, for operations where the subject to be mapped
+	does not exist.
+      - MAP_PERM_DENIED, for operations not authorized to the client.
+
+N. Williams							[Page 5]
+
+DRAFT		Mapping NFSv4 ACE Names to IDs		Expires November 2003
+
+      - MAP_UNAVAIL, for when the service is temporarily unavailable.
+      - MAP_NO_MAP, for operations that could not be performed for any
+	other reason.
+      - MAP_INVAL, for requests containing invalid arguments (e.g., an
+	invalid ACE name type).
+      - MAP_NOPROC, for unsupported operations
+
+
+3.2.1  The NULL Procedure
+
+   NAME
+
+    MAP_NULL - Traditional NULL procedure
+
+   SYNOPSIS
+
+      MAP_NULL(void) -> void
+
+   ARGUMENT
+
+      void
+
+   RESULT
+
+      void
+
+   DESCRIPTION
+
+      This is the traditional NULL procedure.
+
+   ERRORS
+
+      <none>
+
+3.2.2  Negotiate RPCSEC_GSS Security Triples
+
+   NAME
+
+      MAP_SECINFO - Get server's RPCSEC_GSS security triples
+
+   SYNOPSIS
+
+      MAP_SECINFO(void) -> rpcsec_gss_info<>
+
+   ARGUMENT
+
+      void
+
+   RESULT
+
+      rpcsec_gss_info<>
+
+   DESCRIPTION
+
+N. Williams							[Page 6]
+
+DRAFT		Mapping NFSv4 ACE Names to IDs		Expires November 2003
+
+
+      Returns the list of RPCSEC_GSS security triples supported by the
+      server in the server's order of preference.
+
+   ERRORS
+
+      <none>
+
+3.2.3  Map an ACE Name to an Internal Security Entity ID
+
+   NAME
+
+      MAP_ACE_NAME - Map an ACE name to an ISID
+
+   SYNOPSIS
+
+      MAP_ACE_NAME(ace_name, ace_name_type, requested_isid_type,
+		   mapping_domain) -> isid
+
+   ARGUMENT
+
+      map_ace_name_args
+
+   RESULT
+
+      MAP_ACE_NAME_results
+
+   DESCRIPTION
+
+      This procedure takes an ACE name type (user or group), and ACE
+      name and an ACE name mapping domain and returns an ISID.
+
+      Clients MUST cache the results of this procedure for as long as
+      there remain references local to the client to the returned ISID.
+
+      Note that when the requested ISID type is a Windows SID the
+      mapping service SHOULD NOT establish a new mapping but instead
+      SHOULD return the SID returned by a lookup in the Windows
+      directory of the input ACE name's domain.
+
+   ERRORS
+
+      MAP_NO_SUBJECT
+      MAP_PERM_DENIED
+      MAP_UNAVAIL
+      MAP_NO_MAP
+
+3.2.4  Map an Internal Security Entity ID to an ACE Name
+
+   NAME
+
+      MAP_ISID - Map an ISID to an ACE name
+
+
+N. Williams							[Page 7]
+
+DRAFT		Mapping NFSv4 ACE Names to IDs		Expires November 2003
+
+   SYNOPSIS
+
+      MAP_ISID(isid, isid_type, mapping_domain) -> isid
+
+   ARGUMENT
+
+      map_isid_args
+
+   RESULT
+
+      MAP_ISID_results
+
+   DESCRIPTION
+
+      This procedure should not be needed and SHOULD NOT be used by any
+      clients that internally reference only one type of ISID and which
+      do not use any protocols, such as NFSv3, which expose ISIDs on the
+      wire, because such clients MUST cache the results of ACE name to
+      ISID mappings and therefore should be able to perform mappings of
+      ISIDs to ACE names without the help of the networked mapping
+      service.
+
+      On the other hand, systems that expose ISIDs on the wire in file
+      system protocols, for example, or which use multiple ISID types
+      internally may need this procedure.
+
+      The mapping service SHOULD authorize use of this procedure only by
+      clients that are known to need this feature.
+
+      Clients MUST cache the results of this procedure for as long as
+      there remain references local to the client to the subject ISID.
+
+   ERRORS
+
+      MAP_NO_SUBJECT
+      MAP_PERM_DENIED
+      MAP_UNAVAIL
+      MAP_NO_MAP
+
+3.2.5  Map Login Names to ACE name Lists
+
+   NAME
+
+      MAP_LOGIN_NAME - Map a login name to a list of ACE names
+
+   SYNOPSIS
+
+      MAP_LOGIN_NAME(login_name, login_name_type, client_default_domain)
+	      -> ace_name_list
+
+   ARGUMENT
+
+      map_login_name_args
+
+N. Williams							[Page 8]
+
+DRAFT		Mapping NFSv4 ACE Names to IDs		Expires November 2003
+
+
+   RESULT
+
+      MAP_LOGIN_NAME_results
+
+   DESCRIPTION
+
+      This procedure is optional.  Its purpose is to map login names
+      (including GSS-API principal names) to the sets or lists of ACE
+      names associated with them.
+
+      The mapping service SHOULD authorize use of this procedure only by
+      clients that are known to need this feature.  For example, thin
+      clients may not need this feature if they use file system
+      protocols which put the responsibility of evaluating access
+      controls on the file servers.
+
+      The mapping service SHOULD construct the list of ACE names
+      associated with a login name such that group membership in groups
+      of the various trusted domains (including the domain of the
+      mapping service itself) is included in the result, but also the
+      mapping service SHOULD provide for domain- and client-specific
+      policies as filters of ACE name sets built in this manner.
+
+      Clients SHOULD cache the results of this procedure for a period of
+      up to as many seconds as indicated by the server in its reply.
+
+   ERRORS
+
+      MAP_NO_SUBJECT
+      MAP_PERM_DENIED
+      MAP_UNAVAIL
+      MAP_NO_MAP
+      MAP_NOPROC
+
+3.2.6  Retrieve List of Retired ACE Names and Internal IDs
+
+   NAME
+
+      MAP_GET_RETIREMENTS - Get list of ACE names / ISIDS to be retired
+
+   SYNOPSIS
+
+      MAP_GET_RETIREMENTS(void) -> retirements
+
+   ARGUMENT
+
+      void
+
+   RESULT
+
+      MAP_GET_RETIREMENTS_results
+
+
+N. Williams							[Page 9]
+
+DRAFT		Mapping NFSv4 ACE Names to IDs		Expires November 2003
+
+   DESCRIPTION
+
+      Normally ACE names and ISIDs are expected not to be reused and
+      SHOULD NOT be reused.  This procedure allows a client to obtain a
+      list of ACE names and ISIDs that have been retired and the date
+      (in terms of remaining seconds) by which each retired item must no
+      longer be referred to by, say, any ACLs.
+
+      Clients of the mapping service SHOULD execute this procedure at
+      least once a week and MUST search for and eliminate any local
+      references to retired ACE names and/or ISIDs.
+
+      Retired ACE names and ISIDs SHOULD NOT be reused for a period of
+      at least six (6) months.  It is RECOMMENDED that neither ACE names
+      nor ISIDs nor their mappings be retired or reused.
+
+   ERRORS
+
+      MAP_NO_SUBJECT
+      MAP_PERM_DENIED
+      MAP_UNAVAIL
+      MAP_NO_MAP
+      MAP_NOPROC
+
+3.3  Authentication and RPCSEC_GSS Security Triple Negotiation
+
+   This protocol REQUIRES the use of RPCSEC_GSS with mutual GSS-API
+   authentication for all procedures except the MAP_NULL and MAP_SECINFO
+   procedures.  The AUTH_NONE security flavor MAY be used when calling
+   the MAP_NULL and MAP_SECINFO procedures.
+
+   The use of either integrity or privacy protection is REQUIRED.
+
+   A procedure, MAP_SECINFO, is provided for clients to obtain the
+   ordered list of RPCSEC_GSS security triples supported by the server.
+
+   Negotiation of RPCSEC_GSS security triples works as follows:
+
+      - Clients SHOULD call MAP_SECINFO using the AUTH_NONE RPC security
+	flavor prior to RPCSEC_GSS GSS-API security context
+	establishment and SHOULD select the first security triple in the
+	server's reply that the client supports.
+
+      - Servers MUST NOT offer or accept the use of RPC_GSS_SVC_NONE.
+	Clients MUST NOT use RPC_GSS_SVC_NONE.
+
+      - Upon completion of RPCSEC_GSS GSS-API security context
+	establishment the client SHOULD again call MAP_SECINFO and
+	verify that the server's reply matches the reply to the
+	MAP_SECINFO made with AUTH_NONE; if the second reply does not
+	match the first one and if the client would have selected a
+	different security triple given the second reply then the client
+	SHOULD establish a new RPCSEC_GSS GSS-API security context and
+
+N. Williams							[Page 10]
+
+DRAFT		Mapping NFSv4 ACE Names to IDs		Expires November 2003
+
+	delete the previous one.
+
+   Thus the client can detect attempted downgrade attacks.
+
+3.4  Relation of ACE Name Mapping to Directories
+
+   The mapping service needs read access to the directories for all
+   trusted domains.  Specifically the service requires the following
+   functions from those directories:
+
+    - Map ACE names to user and group name forms native to the directory
+      (this MAY be an algorithmic mapping) and back.
+
+    - (optional) Lookup the canonical names for a user or group and/or
+      its aliases.  If a given domain's directory does not provide this
+      facility then it MUST NOT allow user or group renaming or
+      deletion (though it MAY allow marking users and groups as
+      deleted).  See below.
+
+    - (optional) Lookup the canonical names for user and group Windows
+      SIDs (i.e., reverse lookups).  If a given domain's directory does
+      not provide this facility to the mapping service then multi-
+      protocol file server clients of the mapping service MUST NOT allow
+      ACLs to reference any ACE names and/or Windows SIDs from the
+      offending domain.
+
+    - (optional) Lookup the groups that a user is a member of.
+
+   Some directories may require schema or other modifications in order
+   to provide these features.
+
+   Note that user and group name canonicalization is often possible by
+   first performing a forward lookup in the directory from user or group
+   to ISID (but note that ISIDs returned by directories are generally
+   not the same as those returned by mapping services) and then
+   performing a reverse lookup from ISID back to user or group name.
+
+3.5  High Availability of ACE Name Mapping Services
+
+   For any mapping domain there MUST be at most one (1) active mapping
+   service servers establishing new mappings for any one range of ACE
+   names in that mapping domain.  Multiple mapping service servers MAY
+   be deployed, provided that they service mapping requests from mapping
+   caches or by proxying the request to the master mapping service
+   server currently performing new mappings.
+
+   Implementors SHOULD provide a mechanism for replication of mapping
+   service databases and SHOULD provide a mechanism or procedure for
+   recovering from failures of the master mapping service server.
+   The specification of such replication and recovery protocols and
+   procedures is beyond the scope of this document.  Future versions of
+   this protocol may provide these additional functions.
+
+
+N. Williams							[Page 11]
+
+DRAFT		Mapping NFSv4 ACE Names to IDs		Expires November 2003
+
+3.6  Protocol Extensibility
+
+   Extensions to this protocol MUST be defined by Standards Track IETF
+   RFCs and MUST be defined through new versions of the RPC program
+   MAPPER_PROG.
+
+4  Mapping Login Names to ACE Name Lists
+
+   Individual login names may be associated with multiple user and group
+   ACE names.  This is because login names may name user accounts which
+   may be members of multiple groups.
+
+   Therefore login names cannot be treated as aliases of ACE
+   names.  Mapping of login names to lists of ACE names is generally
+   necessary for proper operation of NFSv4 with RPCSEC_GSS, where login
+   names take the form of GSS-API principal names.  In this context
+   GSS-API principal names are considered a type of login name.
+
+   File servers, as well as other types of servers, may need to map
+   native login names and/or GSS-API principal names to sets of
+   associated ACE names for proper evaluation of ACLs.  Such login names
+   may have a syntax similar or equal to that of NFSv4 ACE names,
+   however, they are not the same thing; one names a user account and,
+   implicitly, the groups it is a member of, while the other names a
+   a group or user entity excluding the groups it belongs to.
+
+   The MAPPER_PROG's MAP_LOGIN_NAME procedure supports several forms of
+   login names:
+
+      - Unqualified (bare) login names (e.g., "janedoe").
+
+      - Login names qualified with a domain name in the same manner as
+	NFSv4 ACE names (e.g., "janedoe@some.domain.name").
+
+      - Exported GSS-API principal names (i.e., the result of calling
+	GSS_Export_name() on a GSS-API name object with the
+	GSS_C_NT_EXPORT_NAME name type).
+
+4.1  Mapping GSS-API Contexts
+
+   It may, in some cases, be possible to map GSS-API contexts to ACE
+   name lists, rather than GSS-API principals.  For example, in the case
+   of the Kerberos V mechanism for the GSS-API the Kerberos V tickets
+   used in context establishment may contain KDC-provided "authorization
+   data" listing the ACE names associated with the initiator, in which
+   case it should be possible for GSS-API acceptors to "map" Kerberos V
+   GSS-API security contexts (as opposed to names) to ACE name lists by
+   extracting and parsing the authorization data from initiators'
+   Kerberos V tickets.
+
+5  ONC RPC Protocol Definition
+
+   typedef opaque utf8str_t<>;
+
+N. Williams							[Page 12]
+
+DRAFT		Mapping NFSv4 ACE Names to IDs		Expires November 2003
+
+   
+   typedef int int32_t;
+   typedef unsigned int uint32_t;
+   
+   typedef uint32_t seconds;
+   
+   /* SECINFO - more or less lifted from RFC3530 */
+   typedef opaque gss_mech_oid_t<>;
+   typedef uint32_t qop_t;
+   enum rpc_gss_svc_t {/* From RFC 2203 */
+	RPC_GSS_SVC_NONE        = 1, /* MUST NOT be used */
+	RPC_GSS_SVC_INTEGRITY   = 2,
+	RPC_GSS_SVC_PRIVACY     = 3
+   };
+   struct rpcsec_gss_info {
+	gss_mech_oid_t	oid;
+	qop_t		qop;
+	rpc_gss_svc_t	service;
+   };
+   
+   /* Status codes */
+   enum mapstat {
+	MAP_OK		= 0,	/* Success */
+	MAP_NO_SUBJECT	= 1,	/* Subject of mapping does not exist */
+	MAP_PERM_DENIED = 2,	/* Client not authorized to get that mapping */
+	MAP_UNAVAIL	= 3,	/* Request could not be processed - try again */
+	MAP_NO_MAP	= 4,	/* Mapping was not performed */
+	MAP_INVAL	= 5,	/* Invalid argument */
+	MAP_NOPROC	= 6	/* Procedure not supported */
+   }
+   
+   /* Internal security entity identifier types */
+   enum isid_type_t {
+	ISIDT_POSIX_UID32	= 0,
+	ISIDT_POSIX_GID32	= 1,
+	ISIDT_WINDOWS_SID	= 2
+   };
+   
+   enum ace_name_type_t {
+	ACENT_USER	= 0,
+	ACENT_GROUP	= 1
+   };
+   
+   struct isid_t {
+	utf8str_t	mapping_domain;
+	isid_type_t	type;
+	opaque		isid<>;
+   };
+   
+   struct ace_name_mapping_t {
+	utf8str_t	canon_ace_name;
+	utf8str_t	prev_canon_ace_names<>;
+	utf8str_t	ace_name_aliases<>;
+
+N. Williams							[Page 13]
+
+DRAFT		Mapping NFSv4 ACE Names to IDs		Expires November 2003
+
+	isid_t		isid;
+   };
+   
+   struct map_ace_name_args {
+	utf8str_t	ace_name;
+	ace_name_type_t	ace_name_type;
+	isid_type_t	requested_isid_type;
+	utf8str_t	mapping_domain;
+   };
+   
+   typedef ace_name_mapping_t map_ace_name_results;
+   
+   union MAP_ACE_NAME_results switch (enum mapstat status) {
+   case MAP_OK:
+	map_ace_name_results	    results;
+   default:
+	void;
+   }
+   
+   struct map_isid_args {
+	isid_t	    isid;
+	utf8str_t       mapping_domain;
+   };
+   
+   struct map_isid_results {
+	utf8str_t	canon_ace_name;
+	ace_name_type_t	ace_name_type;
+   };
+   
+   union MAP_ISID_results switch (enum mapstat status) {
+   case MAP_OK:
+	map_isid_results	results;
+   default:
+	void;
+   }
+   
+   enum login_name_type_t {
+	LT_BARE_UNAME		= 0,
+	LT_UNAME_WITH_DOMAIN	= 1,
+	LT_GSS_API_EXP_PRINC	= 2
+   };
+   
+   union login_name_t switch (enum login_name_type_t ln_type) {
+   case LT_GSS_API_EXP_PRINC:
+	opaque		gss_exp_name<>;
+   default:
+	utf8str_t	utf8_name;
+   };
+   
+   struct ace_name_list {
+	seconds_t		cache_time;
+	ace_name_mapping_t	primary_user_ace_name;
+	ace_name_mapping_t	primary_group_ace_name;
+
+N. Williams							[Page 14]
+
+DRAFT		Mapping NFSv4 ACE Names to IDs		Expires November 2003
+
+	ace_name_mapping_t	supplemental_user_ace_names<>;
+	ace_name_mapping_t	supplemental_group_ace_names<>;
+   };
+   
+   struct map_login_name_args {
+	login_name_t	login_name;
+	utf8str_t	client_login_domain;
+   };
+   
+   union MAP_LOGIN_NAME_results (enum mapstat status) {
+   case MAP_OK:
+	ace_name_list;
+   default:
+	void;
+   };
+   
+   struct ace_name_retirement_t {
+	ace_name_type_t	ace_name_type;
+	utf8str_t	ace_name;
+	seconds_t	seconds;
+   };
+   
+   struct isid_retirement_t {
+	isid_t		isid;
+	seconds_t	seconds;
+   };
+   
+   struct retirements_t {
+	ace_name_retirement_t	ace_name_retirements<>;
+	isid_retirement_t	isid_retirements<>;
+   }
+   
+   union MAP_GET_RETIREMENTS_results (enum mapstat status) {
+   case MAP_OK:
+	retirements_t	retirements;
+   default:
+	void;
+   };
+   
+   program MAPPER_PROG {
+	version ACEN_MAPPER_VERS {
+		void
+		MAP_NULL(void) = 0;
+   
+		rpcsec_gss_info<>
+		MAP_SECINFO(void) = 1;
+   
+		MAP_ACE_NAME_results
+		MAP_ACE_NAME(map_ace_name_args) = 2;
+   
+		MAP_ISID_results
+		MAP_ISID(map_isid_args) = 3;
+   
+
+N. Williams							[Page 15]
+
+DRAFT		Mapping NFSv4 ACE Names to IDs		Expires November 2003
+
+		MAP_LOGIN_NAME_results
+		MAP_LOGIN_NAME(map_login_name_args) = 4;
+   
+		MAP_GET_RETIREMENTS_results
+		MAP_GET_RETIREMENTS(void) = 5;
+	} = 1;
+   } = TBD;
+
+6  Kerberos V Authorization-Data Type for ACE Lookup Optimization
+
+   A type of authorization data for use with Kerberos V is defined
+   herein for carrying the list of ACE names associated with a ticket's
+   client principal name.  This authorization data type is intended to
+   allow KDCs to perform the login name to ACE name list mapping and
+   save other MAPPER_PROG clients the trouble of mapping Kebreros
+   principal names to ACE name lists and thus greatly reduce the number
+   login name mapping requests in Kerberos V environments.
+
+   This authorization data type's type identifier is TBD (by the IANA or
+   the KRB WG).
+
+   This authorization data type is named NFSv4-ACE-NAME-LIST and is
+   encoded as the DER encoding of the following ASN.1 syntax.
+
+   DEFINITIONS EXPLICIT TAGS ::= BEGIN
+
+   ACE-Name-Domain		    ::= UTF8String
+   ACE-Name-Domain-List		    ::= SEQUENCE SIZE OF 
+					ACE-Name-Domain
+   ACE-Name-Domain-List-Index	    ::= INTEGER (-1..4294967295)
+				-- 0 and up indicates that the domain of
+				-- the ACE name is the Nth domain from
+				-- the domain list
+				--
+				-- -1 indicates that the ACE name is a
+				-- special "who" value.
+
+   ACE-Name	::= SEQUENCE {
+	name-lhs	[0] UTF8String,
+	domain-name	[1] ACE-Name-Domain-List-Index
+   }
+
+   ACE-Name-List    ::= SEQUENCE OF ACE-Name
+
+   NFSv4-ACE-NAME-LIST		::= SEQUENCE {
+	domain-list	[0] ACE-Name-Domain-List,
+	user-ace-names	[1] ACE-Name-List,
+				-- The first user ACE is the primary
+				-- user ACE of the login name.
+				-- A user might have multiple user ACE
+				-- names associated with it; for
+				-- example, root principals may have
+				-- multiple user ACE names associated
+
+N. Williams							[Page 16]
+
+DRAFT		Mapping NFSv4 ACE Names to IDs		Expires November 2003
+
+				-- with them to reduce the number of
+				-- service principals needed by diskless
+				-- clients
+	group-ace-names	[2] ACE-Name-List,
+				-- The first group ACE is the primary
+				-- group ACE of the login name.  The
+				-- remaining group ACE names are the
+				-- supplemental groups of the login.
+   }
+
+   END
+
+7  Operational Considerations
+
+   Availability of the mapping service is crucial to its clients.  If
+   the mapping service is unavailable its clients SHOULD act
+   accordingly.  For example, for an NFSv4 SETATTR request which
+   references an ACE name not in the file server's mapping cache the
+   server then the server could complete the request excluding the ACE
+   whose name could not be mapped then return NFS4ERR_RESOURCE or it
+   could fail immediately and return NFS4ERR_RESOURCE.
+
+7.1  Locating Mapping Services
+
+   [NOTE:  Perhaps location of the mapping service is best left to
+           implementors or to a separate draft.  The author does not yet
+	   know the best way to locate a service of this sort.]
+
+7.2  Redundancy, Reliability, Clustering
+
+   ...
+
+8  Security Considerations
+
+   It is crucial that all procedures of the MAPPER_PROG RPC protocol,
+   excepting the MAP_NULL procedure and the MAP_SECINFO (as described in
+   section 3.3) be mutually authenticated and their integrity be
+   protected.  It is RECOMMENDED that confidentiality services be used.
+
+   MAPPER_PROG clients MUST authenticate the mapping servers.
+
+   Mapping servers SHOULD provide a facility for controlling access to
+   the different mapping procedures based on client principal names.
+
+   If a mapping client does not need to map ISIDs to ACE names then the
+   mapping servers SHOULD respond to ISID mapping requests with an error
+   (MAP_PERM_DENIED).
+
+   If a mapping client does not need to map ACE names to ISIDs then the
+   mapping servers SHOULD respond to both, ACE name and ISID mapping
+   requests with an error (MAP_PERM_DENIED).
+
+   If a mapping client does not need to map login names to ACE name
+
+N. Williams							[Page 17]
+
+DRAFT		Mapping NFSv4 ACE Names to IDs		Expires November 2003
+
+   lists then the mapping servers SHOULD respond to login name mapping
+   requests with an error (MAP_PERM_DENIED).
+
+   If a mapping client needs to map ACE names or ISIDs to the other then
+   mapping servers that support ACE name and/or ISID retirement SHOULD
+   respond to to client requests for ACE name / ISID retirement
+   warnings.
+
+   ...
+
+9  References
+
+9.1  Normative References
+
+   [RFC3050]
+      S. Shepler et. al., RFC3050: "Network File System (NFS) version 4
+      Protocol," April 2003, Status: Standards Track.
+
+   [RFC2203]
+      M. Eisler et. al., RFC2203: "RPCSEC_GSS Protocol Specification,"
+      September 1997, Status: Standards Track.
+
+   [RFC1964]
+      J. Linn, RFC1964: "The Kerberos Version 5 GSS-API Mechanism," June
+      1996, Status: Standards Track.
+
+   [RFC2025]
+      C. Adams, RFC2025: "The Simple Public-Key GSS-API Mechanism
+      (SPKM)," October 1996, Status: Standards Track.
+
+   [RFC2847]
+      M. Eisler, RFC2847: "LIPKEY - A Low Infrastructure Public Key
+      Mechanism Using SPKM," June 2000, Status: Standards Track.
+
+   ...
+
+9.2  Informative References
+
+   ...
+
+10  Acknowledgements
+
+   The author thanks Casper Dik for insisting that mapping is the
+   correct way to use non-flat user and group namespaces with flat POSIX
+   UID and GID namespaces, as well as Spencer Shepler, Lin Ling, Brent
+   Callaghan, Bill Ricker for their comments on the idea of
+   automatically mapping ACE names on-demand.
+
+Authors' Addresses
+
+      Nicolas Williams
+      Sun Microsystems
+      5300 Riata Trace Ct
+
+N. Williams							[Page 18]
+
+DRAFT		Mapping NFSv4 ACE Names to IDs		Expires November 2003
+
+      Austin, TX 78727
+      USA
+      Email: nicolas.williams@sun.com
+
+Full Copyright Statement
+
+   Copyright (C) The Internet Society (2003).  All Rights Reserved.
+
+   This document and translations of it may be copied and furnished to
+   others, and derivative works that comment on or otherwise explain it
+   or assist in its implementation may be prepared, copied, published
+   and distributed, in whole or in part, without restriction of any
+   kind, provided that the above copyright notice and this paragraph are
+   included on all such copies and derivative works.  However, this
+   document itself may not be modified in any way, such as by removing
+   the copyright notice or references to the Internet Society or other
+   Internet organizations, except as needed for the purpose of
+   developing Internet standards in which case the procedures for
+   copyrights defined in the Internet Standards process must be
+   followed, or as required to translate it into languages other than
+   English.
+
+   The limited permissions granted above are perpetual and will not be
+   revoked by the Internet Society or its successors or assigns.
+
+   This document and the information contained herein is provided on an
+   "AS IS" basis and THE INTERNET SOCIETY AND THE INTERNET ENGINEERING
+   TASK FORCE DISCLAIMS ALL WARRANTIES, EXPRESS OR IMPLIED, INCLUDING
+   BUT NOT LIMITED TO ANY WARRANTY THAT THE USE OF THE INFORMATION
+   HEREIN WILL NOT INFRINGE ANY RIGHTS OR ANY IMPLIED WARRANTIES OF
+   MERCHANTABILITY OR FITNESS FOR A PARTICULAR PURPOSE.
+
+Acknowledgement
+
+   Funding for the RFC Editor function is currently provided by the
+   Internet Society.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+N. Williams							[Page 1]
