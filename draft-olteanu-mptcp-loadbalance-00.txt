@@ -1,0 +1,392 @@
+
+
+
+
+Internet Engineering Task Force                               V. Olteanu
+Internet-Draft                                                 C. Raiciu
+Intended status: Experimental        University Politehnica of Bucharest
+Expires: January 9, 2017                                    July 8, 2016
+
+
+                    Layer 4 Loadbalancing for MPTCP
+                   draft-olteanu-mptcp-loadbalance-00
+
+Abstract
+
+   Layer 4 loadbalancers are widely used in the deployment of large-
+   scale web services.  A large number of servers accept incoming
+   connections from clients, while multiple loadbalancers make sure that
+   traffic is spread evenly across the servers.
+
+   Due to its use of multiple subflows, Multipath TCP poses several
+   issues to the design of a scalable layer 4 loadbalancer that supports
+   it.  This document presents two ways in which MPTCP connections can
+   be loadbalanced across a large pool of servers.  Both approaches
+   entail using a slightly modified server stack and work well with
+   unmodified MPTCP clients.
+
+Status of This Memo
+
+   This Internet-Draft is submitted in full conformance with the
+   provisions of BCP 78 and BCP 79.
+
+   Internet-Drafts are working documents of the Internet Engineering
+   Task Force (IETF).  Note that other groups may also distribute
+   working documents as Internet-Drafts.  The list of current Internet-
+   Drafts is at http://datatracker.ietf.org/drafts/current/.
+
+   Internet-Drafts are draft documents valid for a maximum of six months
+   and may be updated, replaced, or obsoleted by other documents at any
+   time.  It is inappropriate to use Internet-Drafts as reference
+   material or to cite them other than as "work in progress."
+
+   This Internet-Draft will expire on January 9, 2017.
+
+Copyright Notice
+
+   Copyright (c) 2016 IETF Trust and the persons identified as the
+   document authors.  All rights reserved.
+
+   This document is subject to BCP 78 and the IETF Trust's Legal
+   Provisions Relating to IETF Documents
+   (http://trustee.ietf.org/license-info) in effect on the date of
+
+
+
+Olteanu & Raiciu         Expires January 9, 2017                [Page 1]
+
+Internet-Draft       Layer 4 Loadbalancing for MPTCP           July 2016
+
+
+   publication of this document.  Please review these documents
+   carefully, as they describe your rights and restrictions with respect
+   to this document.  Code Components extracted from this document must
+   include Simplified BSD License text as described in Section 4.e of
+   the Trust Legal Provisions and are provided without warranty as
+   described in the Simplified BSD License.
+
+Table of Contents
+
+   1.  Introduction  . . . . . . . . . . . . . . . . . . . . . . . .   2
+   2.  Proposal 1  . . . . . . . . . . . . . . . . . . . . . . . . .   3
+   3.  Proposal 2  . . . . . . . . . . . . . . . . . . . . . . . . .   4
+     3.1.  Connection Initiation . . . . . . . . . . . . . . . . . .   4
+     3.2.  Handling MP_JOIN packets  . . . . . . . . . . . . . . . .   5
+     3.3.  Embedding the token in the timestamp  . . . . . . . . . .   5
+       3.3.1.  Impact on PAWS  . . . . . . . . . . . . . . . . . . .   6
+     3.4.  Redirecting packets without timestamps  . . . . . . . . .   6
+   4.  Conclusions . . . . . . . . . . . . . . . . . . . . . . . . .   6
+   5.  References  . . . . . . . . . . . . . . . . . . . . . . . . .   7
+     5.1.  Normative References  . . . . . . . . . . . . . . . . . .   7
+     5.2.  Informative References  . . . . . . . . . . . . . . . . .   7
+   Authors' Addresses  . . . . . . . . . . . . . . . . . . . . . . .   7
+
+1.  Introduction
+
+   Layer 4 loadbalancing is widely used in datacenters.  In order to
+   ensure the smooth operation of a high-capacity web service, incoming
+   requests from clients must be evenly spread across a large number of
+   servers that service said requests.
+
+   Datacenter operators place a number of loadbalancers between the
+   border routers and the servers.  The loadbalancers are tasked with
+   ensuring that all packets belonging to a connection reach the same
+   server.  This is typically achieved via a hashing-based scheme: a
+   hash function is applied to each packet's 5-tuple and a destination
+   server is chosen based on the result.
+
+   Multipath TCP [NSDI-12] is an extension to TCP designed to take
+   advantage of the multiple paths that may exist between two hosts by
+   using an arbitrary number of subflows.  Current loadbalancer designs
+   do not work with Multipath TCP, and this has hampered the adoption of
+   the protocol, especially on the server side.
+
+   The main reason why loadbalancing MPTCP connections is not trivial is
+   because a connection's individual subflows look like independent TCP
+   connections.  There is no discernible relationship between their
+   5-tuples, and loadbalancing them based on a hash of the 5-tuple will
+   most likely result in them reaching different servers.  Furthermore,
+
+
+
+Olteanu & Raiciu         Expires January 9, 2017                [Page 2]
+
+Internet-Draft       Layer 4 Loadbalancing for MPTCP           July 2016
+
+
+   connection-identifying information can only be extracted from the
+   initial 3-way handshake of each flow.
+
+   This document proposes two mutually-exclusive solutions to these
+   problems.  They rely to varying degrees on getting the client to
+   embed connection or server-identifying information in the packets
+   that it sends out.  This extra information can be used statelessly by
+   the loadbalancers.  Both solutions require modifications only to the
+   server stack and work well with existing MPTCP clients.
+
+2.  Proposal 1
+
+   Our first proposal revolves around controlling the destination port
+   that the client uses in all subflows aside from the initial one.  It
+   is possible for the server to advertise an additional port via the
+   ADD_ADDR option [RFC6824].  This informs the client that it can send
+   an MP_JOIN to this new port and initiate a new subflow.
+
+   To take advantage of this, each server is be assigned a unique 16-bit
+   ID, which must be different from the port on which the service is
+   being hosted (e.g. 80).  As soon as a connection is initiated, the
+   server sends an ADD_ADDR to the client advertising a new port equal
+   to said ID.
+
+   Packets that arrive at the loadbalancer are treated as follows:
+
+   o  Packets destined to the port that the service is being hosted on
+      will be forwarded to a server based on a hash of the 5-tuple.
+
+   o  Packets destined to any other port are forwarded to the server
+      whose ID matches the destination port.
+
+   This approach has two drawbacks:
+
+   o  The client will most likely also try to initiate subflows using
+      the server's original port.  Because these subflows are
+      loadbalanced based on a hash of their 5-tuple, they will almost
+      certainly reach a different server and break.  (Using REMOVE_ADDR
+      to prevent the creation of these subflows would entail the
+      destruction of the original subflow.)
+
+   o  If the client is behind a firewall that restricts access to
+      certain destination ports, it might not succeed in establishing
+      any new subflows.
+
+
+
+
+
+
+
+Olteanu & Raiciu         Expires January 9, 2017                [Page 3]
+
+Internet-Draft       Layer 4 Loadbalancing for MPTCP           July 2016
+
+
+3.  Proposal 2
+
+   Our second proposal is to loadbalance packets based on the server's
+   token.  The token's most significant 14 bits are treated as a hash
+   value for the connection.  They are embedded in all outgoing TCP
+   timestamps, and subsequently echoed back by the client.  Incoming
+   packets that do not contain timestamps (such as FINs) are dealt with
+   via redirection between the servers.
+
+3.1.  Connection Initiation
+
+   The client initiates an MPTCP connection by sending a SYN with the
+   MP_CAPABLE option.  Under normal operation, the server then picks a
+   random 64-bit key for the connection, and uses it to compute its
+   token.
+
+   To forward the packet appropriately, the loadbalancer must know the
+   token before deciding what server to send it to.  To accomplish this,
+   we move the key generation to the loadbalancer.  The connection's
+   token can be computed based on the generated key.
+
+   The loadbalancer places the generated key, along with the IP of the
+   server that would be responsible for the subflow under normal 5-tuple
+   hashing (which we call the alternate server IP) in an IP option and
+   forwards the SYN to the server.
+
+
+                             1                   2                   3
+        0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
+       +---------------+---------------+---------------+---------------+
+       |   Type = 96   |  Length = 16  |             Unused            |
+       +---------------+---------------+---------------+---------------+
+       |                                                               |
+       +                          Server Key                           +
+       |                                                               |
+       +---------------+---------------+---------------+---------------+
+       |                      Alternate Server IP                      |
+       +---------------+---------------+---------------+---------------+
+
+              Figure 1: IP Option Used for MP_CAPABLE packets
+
+
+   The figure above depicts the IP option that is inserted into the
+   MP_CAPABLE packet before it is sent to the server.  We have chosen an
+   IP option despite the fact that the data contained therein pertains
+   to the transport layer, because TCP option space is very limited.  IP
+   option type 96 is currently classified as reserved [RFC0791].
+
+
+
+
+Olteanu & Raiciu         Expires January 9, 2017                [Page 4]
+
+Internet-Draft       Layer 4 Loadbalancing for MPTCP           July 2016
+
+
+   Upon receipt of the packet, the server uses the key provided to
+   compute the token for the connection.  If no connection with the same
+   token exists, the server uses the key provided.  Otherwise, it takes
+   a brute-force approach and randomly generates multiple keys and
+   selects one that yields a token with the same 14 highest-order bits.
+
+   The use of the alternate server IP will be discussed in a later
+   section.
+
+3.2.  Handling MP_JOIN packets
+
+   Additional subflows are initiated by the client by sending MP_JOIN
+   packets.  These packets contain the server's token.
+
+   Similarly to how MP_CAPABLE packets are treated, the loadbalancer
+   uses an IP option to inform the server about which other server would
+   be responsible for the subflow under normal 5-tuple hashing.
+
+
+                             1                   2                   3
+        0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
+       +---------------+---------------+---------------+---------------+
+       |   Type = 97   |   Length = 8  |             Unused            |
+       +---------------+---------------+---------------+---------------+
+       |                      Alternate Server IP                      |
+       +---------------+---------------+---------------+---------------+
+
+                Figure 2: IP Option Used for MP_JOIN packets
+
+
+   IP option type 97 is also classified as reserved [RFC0791].
+
+3.3.  Embedding the token in the timestamp
+
+   The TCP timestamp option [RFC7323] is present in most packets and is
+   comprised of two fields: the TSval, which is set by the packet's
+   sender, and TSecr, which contains a timestamp recently received from
+   the other end.
+
+   Taking advantage of the fact that timestamps set by the server are
+   echoed back by the client, the server shifts its timestamp clock left
+   by 14 bits, and embeds the 14 highest-order bits of the token into
+   the 14 lowest-order bits of the TSval.  When a packet with the ACK
+   flag set and with the TS option present arrives at the loadbalancer,
+   it is forwarded based on the 14 least significant bits of the TSecr
+   field.
+
+
+
+
+
+Olteanu & Raiciu         Expires January 9, 2017                [Page 5]
+
+Internet-Draft       Layer 4 Loadbalancing for MPTCP           July 2016
+
+
+3.3.1.  Impact on PAWS
+
+   Timestamps supplied by the server are used by the client for
+   protection against wrapped sequence numbers (PAWS).
+
+   We assume that the server uses a timestamp clock frequency of 1 tick
+   per ms, which is the highest frequency recommended by [RFC7323].  The
+   recycling time of the timestamp clock's sign bit is required to be
+   greater than the Maximum Segment Lifetime of 255 seconds.  Given that
+   the clock ticks once every ms in increments of 2 ^ 14, its recycling
+   time is roughly 262 s, which is within the bounds set by the
+   standard.
+
+   While the quickly-increasing timestamp is benign to active subflows,
+   PAWS will still cause segments to be dropped if the subflow in
+   question had been idle for a period longer than the clock's recycling
+   time.  To solve this, the server periodically sends keepalive
+   messages during idle periods.
+
+3.4.  Redirecting packets without timestamps
+
+   Some packets (most notably FINs) do not contain timestamps or any
+   other connection-identifying information.  As such, they are
+   forwarded to a server based on a hash of the 5-tuple.
+
+   As seen in Section 3.1 and Section 3.2, whenever a new subflow is
+   setup, the server responsible for it (A) also knows which other
+   server (B) would be hit by the packets in case 5-tuple hashing is
+   used.
+
+   A will use a simple peer-to-peer protocol to inform B to setup a
+   redirection rule for the 5-tuple in question.  The redirection rule
+   will be deleted by B either at A's request, after the subflow has
+   finished, or after a timeout.  We do not discuss the specifics of the
+   protocol in this document.
+
+   Redirection of a packet is performed using IP-in-IP encapsulation.
+
+4.  Conclusions
+
+   The ability to perform layer 4 loadbalancing in a scalable manner is
+   crucial for the adoption of Multipath TCP.  This document explored
+   two ways in which this can be accomplished.  We put forth that
+   loadbalancing is feasible with the current version of MPTCP and that
+   significant changes to the protocol for loadbalancing support are
+   unnecessary.
+
+
+
+
+
+Olteanu & Raiciu         Expires January 9, 2017                [Page 6]
+
+Internet-Draft       Layer 4 Loadbalancing for MPTCP           July 2016
+
+
+5.  References
+
+5.1.  Normative References
+
+   [RFC0791]  Postel, J., "Internet Protocol", STD 5, RFC 791,
+              DOI 10.17487/RFC0791, September 1981,
+              <http://www.rfc-editor.org/info/rfc791>.
+
+   [RFC6824]  Ford, A., Raiciu, C., Handley, M., and O. Bonaventure,
+              "TCP Extensions for Multipath Operation with Multiple
+              Addresses", RFC 6824, DOI 10.17487/RFC6824, January 2013,
+              <http://www.rfc-editor.org/info/rfc6824>.
+
+   [RFC7323]  Borman, D., Braden, B., Jacobson, V., and R.
+              Scheffenegger, Ed., "TCP Extensions for High Performance",
+              RFC 7323, DOI 10.17487/RFC7323, September 2014,
+              <http://www.rfc-editor.org/info/rfc7323>.
+
+5.2.  Informative References
+
+   [NSDI-12]  Raiciu, C., Paasch, C., Barre, S., Ford, A., Honda, M.,
+              Duchene, F., Bonaventure, O., and M. Handley, "How hard
+              can it be? designing and implementing a deployable
+              multipath tcp", 2012,
+              <http://dl.acm.org/citation.cfm?id=2228298.2228338>.
+
+Authors' Addresses
+
+   Vladimir Olteanu
+   University Politehnica of Bucharest
+   Splaiul Independentei 313
+   Bucharest
+   Romania
+
+   Email: vladimir.olteanu@cs.pub.ro
+
+
+   Costin Raiciu
+   University Politehnica of Bucharest
+   Splaiul Independentei 313
+   Bucharest
+   Romania
+
+   Email: costin.raiciu@cs.pub.ro
+
+
+
+
+
+
+
+Olteanu & Raiciu         Expires January 9, 2017                [Page 7]
