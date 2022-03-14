@@ -1,0 +1,840 @@
+
+
+
+
+TLS                                                             M. Shore
+Internet-Draft                                                    Fastly
+Intended status: Standards Track                               R. Barnes
+Expires: September 28, 2017                                      Mozilla
+                                                                S. Huque
+                                                              Salesforce
+                                                               W. Toorop
+                                                              NLNet Labs
+                                                          March 27, 2017
+
+
+    A DANE Record and DNSSEC Authentication Chain Extension for TLS
+                draft-ietf-tls-dnssec-chain-extension-03
+
+Abstract
+
+   This draft describes a new TLS extension for transport of a DNS
+   record set serialized with the DNSSEC signatures needed to
+   authenticate that record set.  The intent of this proposal is to
+   allow TLS clients to perform DANE authentication of a TLS server
+   certificate without needing to perform additional DNS record lookups.
+   It will typically not be used for general DNSSEC validation of TLS
+   endpoint names.
+
+Status of This Memo
+
+   This Internet-Draft is submitted in full conformance with the
+   provisions of BCP 78 and BCP 79.
+
+   Internet-Drafts are working documents of the Internet Engineering
+   Task Force (IETF).  Note that other groups may also distribute
+   working documents as Internet-Drafts.  The list of current Internet-
+   Drafts is at http://datatracker.ietf.org/drafts/current/.
+
+   Internet-Drafts are draft documents valid for a maximum of six months
+   and may be updated, replaced, or obsoleted by other documents at any
+   time.  It is inappropriate to use Internet-Drafts as reference
+   material or to cite them other than as "work in progress."
+
+   This Internet-Draft will expire on September 28, 2017.
+
+Copyright Notice
+
+   Copyright (c) 2017 IETF Trust and the persons identified as the
+   document authors.  All rights reserved.
+
+   This document is subject to BCP 78 and the IETF Trust's Legal
+   Provisions Relating to IETF Documents
+
+
+
+Shore, et al.          Expires September 28, 2017               [Page 1]
+
+Internet-Draft         TLS DNSSEC Chain Extension             March 2017
+
+
+   (http://trustee.ietf.org/license-info) in effect on the date of
+   publication of this document.  Please review these documents
+   carefully, as they describe your rights and restrictions with respect
+   to this document.  Code Components extracted from this document must
+   include Simplified BSD License text as described in Section 4.e of
+   the Trust Legal Provisions and are provided without warranty as
+   described in the Simplified BSD License.
+
+Table of Contents
+
+   1.  Requirements Notation . . . . . . . . . . . . . . . . . . . .   2
+   2.  Introduction  . . . . . . . . . . . . . . . . . . . . . . . .   2
+   3.  DNSSEC Authentication Chain Extension . . . . . . . . . . . .   3
+     3.1.  Protocol, TLS 1.2 . . . . . . . . . . . . . . . . . . . .   4
+     3.2.  Protocol, TLS 1.3 . . . . . . . . . . . . . . . . . . . .   4
+     3.3.  Raw Public Keys . . . . . . . . . . . . . . . . . . . . .   4
+     3.4.  DNSSEC Authentication Chain Data  . . . . . . . . . . . .   5
+   4.  Construction of Serialized Authentication Chains  . . . . . .   8
+   5.  Caching and Regeneration of the Authentication Chain  . . . .   9
+   6.  Verification  . . . . . . . . . . . . . . . . . . . . . . . .  10
+   7.  Trust Anchor Maintenance  . . . . . . . . . . . . . . . . . .  10
+   8.  Mandating use of this extension . . . . . . . . . . . . . . .  10
+   9.  Security Considerations . . . . . . . . . . . . . . . . . . .  10
+   10. IANA Considerations . . . . . . . . . . . . . . . . . . . . .  11
+   11. Acknowledgments . . . . . . . . . . . . . . . . . . . . . . .  11
+   12. References  . . . . . . . . . . . . . . . . . . . . . . . . .  11
+     12.1.  Normative References . . . . . . . . . . . . . . . . . .  11
+     12.2.  Informative References . . . . . . . . . . . . . . . . .  12
+   Appendix A.  Updates from -01 and -02 . . . . . . . . . . . . . .  14
+   Appendix B.  Updates from -01 . . . . . . . . . . . . . . . . . .  14
+   Appendix C.  Updates from -00 . . . . . . . . . . . . . . . . . .  14
+   Appendix D.  Test vector  . . . . . . . . . . . . . . . . . . . .  14
+   Authors' Addresses  . . . . . . . . . . . . . . . . . . . . . . .  14
+
+1.  Requirements Notation
+
+   The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT",
+   "SHOULD", "SHOULD NOT", "RECOMMENDED", "MAY", and "OPTIONAL" in this
+   document are to be interpreted as described in [RFC2119].
+
+2.  Introduction
+
+   This draft describes a new TLS [RFC5246] extension for transport of a
+   DNS record set serialized with the DNSSEC signatures [RFC4034] needed
+   to authenticate that record set.  The intent of this proposal is to
+   allow TLS clients to perform DANE authentication [RFC6698] of a TLS
+   server certificate without performing additional DNS record lookups
+   and incurring the associated latency penalty.  It also provides the
+
+
+
+Shore, et al.          Expires September 28, 2017               [Page 2]
+
+Internet-Draft         TLS DNSSEC Chain Extension             March 2017
+
+
+   ability to avoid potential problems with TLS clients being unable to
+   look up DANE records because of an interfering or broken middlebox on
+   the path between the client and a DNS server.  And lastly, it allows
+   a TLS client to validate DANE records itself without necessarily
+   needing access to a validating DNS resolver to which it has a secure
+   connection.  It will typically not be used for general DNSSEC
+   validation of endpoint names, but is more appropriate for validation
+   of DANE TLSA records.
+
+   This mechanism is useful for TLS applications that need to address
+   the problems described above, typically web browsers or VoIP and XMPP
+   applications.  It may not be relevant for many other applications.
+   For example, SMTP MTAs are usually located in data centers, may
+   tolerate extra DNS lookup latency, are on servers where it is easier
+   to provision a validating resolver, or are less likely to experience
+   traffic interference from misconfigured middleboxes.  Furthermore,
+   SMTP MTAs usually employ Opportunistic Security [RFC7435], in which
+   the presence of the DNS TLSA records is used to determine whether to
+   enforce an authenticated TLS connection.  Hence DANE authentication
+   of SMTP MTAs [RFC7672] will typically not use this mechanism.
+
+   The extension described here allows a TLS client to request in the
+   ClientHello message that the DNS authentication chain be returned in
+   the (extended) ServerHello message.  If the server is configured for
+   DANE authentication, then it performs the appropriate DNS queries,
+   builds the authentication chain, and returns it to the client.  The
+   server will usually use a previously cached authentication chain, but
+   it will need to rebuild it periodically as described in Section 5.
+   The client then authenticates the chain using a pre-configured trust
+   anchor.
+
+   This specification is based on Adam Langley's original proposal for
+   serializing DNSSEC authentication chains and delivering them in an
+   X.509 certificate extension [I-D.agl-dane-serializechain].  It
+   modifies the approach by using wire format DNS records in the
+   serialized data (assuming that the data will be prepared and consumed
+   by a DNS-specific library), and by using a TLS extension to deliver
+   the data.
+
+   As described in the DANE specification [RFC6698], this procuedure
+   applies to the DANE authentication of X.509 certificates.  Other
+   credentials may be supported, as needed, in the future.
+
+3.  DNSSEC Authentication Chain Extension
+
+
+
+
+
+
+
+Shore, et al.          Expires September 28, 2017               [Page 3]
+
+Internet-Draft         TLS DNSSEC Chain Extension             March 2017
+
+
+3.1.  Protocol, TLS 1.2
+
+   A client MAY include an extension of type "dnssec_chain" in the
+   (extended) ClientHello.  The "extension_data" field of this extension
+   MUST be empty.
+
+   Servers receiving a "dnssec_chain" extension in the ClientHello, and
+   which are capable of being authenticated via DANE, MAY return a
+   serialized authentication chain in the extended ServerHello message,
+   using the format described below.  If a server is unable to return an
+   authentication chain, or does not wish to return an authentication
+   chain, it does not include a dnssec_chain extension.  As with all TLS
+   extensions, if the server does not support this extension it will not
+   return any authentication chain.
+
+   A client must not be able to force a server to perform lookups on
+   arbitrary domain names using this mechanism.  Therefore, a server
+   MUST NOT construct chains for domain names other than its own.
+
+3.2.  Protocol, TLS 1.3
+
+   A client MAY include an extension of type "dnssec_chain" in the
+   ClientHello.  The "extension_data" field of this extension MUST be
+   empty.
+
+   Servers receiving a "dnssec_chain" extension in the ClientHello, and
+   which are capable of being authenticated via DANE, SHOULD return a
+   serialized authentication chain in the Certificate message associated
+   with the end entity certificate being validated, using the format
+   described below.  The authentication chain will be an extension to
+   the certificate_list to which the certificate being authenticated
+   belongs.
+
+   The extension protocol behavior otherwise follows that specified for
+   TLS version 1.2.
+
+3.3.  Raw Public Keys
+
+   [RFC7250] specifies the use of raw public keys for both server and
+   client authentication in TLS 1.2.  It points out that in cases where
+   raw public keys are being used, code for certificate path validation
+   is not required.  However, DANE, when used in conjunction with the
+   dnssec_chain extension, provides a mechanism for securely binding a
+   raw public key to a named entity in the DNS, and when using DANE for
+   authentication a raw key may be validated using a path chaining back
+   to a DNSSEC trust root.  This has the added benefit of mitigating an
+   unknown key share attack, as described in [I-D.barnes-dane-uks],
+   since it effectively augments the raw public key with the server's
+
+
+
+Shore, et al.          Expires September 28, 2017               [Page 4]
+
+Internet-Draft         TLS DNSSEC Chain Extension             March 2017
+
+
+   name and provides a means to commit both the server and the client to
+   using that binding.
+
+   The UKS attack is possible in situations in which the association
+   between a domain name and a public key is not tightly bound, as in
+   the case in DANE in which a client either ignores the name in
+   certificate (as specified in [RFC7671] or there is no attestation of
+   trust outside of the DNS.  The vulnerability arises in the following
+   situations:
+
+   o  If the client does not verify the identity in the server's
+      certificate (as recommended in Section 5.1 of [RFC7671]), then an
+      attacker can induce the client to accept an unintended identity
+      for the server,
+
+   o  If the client allows the use of raw public keys in TLS, then it
+      will not receive any indication of the server's identity in the
+      TLS channel, and is thus unable to check that the server's
+      identity is as intended.
+
+   The mechanism for conveying DNSSEC validation chains described in
+   this document results in a commitment by both parties, via the TLS
+   handshake, to a domain name which has been validated as belonging to
+   the owner name.
+
+   The mechanism for encoding DNSSEC authentication chains in a TLS
+   extension, as described in this document, is not limited to public
+   keys encapsulated in X.509 containers but MAY be applied to raw
+   public keys and other representations, as well.
+
+3.4.  DNSSEC Authentication Chain Data
+
+   The "extension_data" field of the "dnssec_chain" extension MUST
+   contain a DNSSEC Authentication Chain encoded in the following form:
+
+
+             opaque AuthenticationChain<0..2^16-1>
+
+   The AuthenticationChain structure is composed of a sequence of
+   uncompressed wire format DNS resource record sets (RRset) and
+   corresponding signatures (RRsig) records.  The record sets and
+   signatures are presented in the order returned by the DNS server
+   queried by the TLS server, although they MAY be returned in
+   validation order, starting at the target DANE record, followed by the
+   DNSKEY and DS record sets for each intervening DNS zone up to a trust
+   anchor chosen by the server, typically the DNS root.
+
+
+
+
+
+Shore, et al.          Expires September 28, 2017               [Page 5]
+
+Internet-Draft         TLS DNSSEC Chain Extension             March 2017
+
+
+   This sequence of native DNS wire format records enables easier
+   generation of the data structure on the server and easier
+   verification of the data on client by means of existing DNS library
+   functions.  However this document describes the data structure in
+   sufficient detail that implementers if they desire can write their
+   own code to do this.
+
+   Each RRset in the chain is composed of a sequence of wire format DNS
+   resource records.  The format of the resource record is described in
+   RFC 1035 [RFC1035], Section 3.2.1.  The resource records SHOULD be
+   presented in the canonical form and ordering as described in RFC 4034
+   [RFC4034].
+
+
+             RR(i) = owner | type | class | TTL | RDATA length | RDATA
+
+   RRs within the RRset MAY be ordered canonically, by treating the
+   RDATA portion of each RR as a left-justified unsigned octet sequence
+   in which the absence of an octet sorts before a zero octet.
+
+   The RRsig record is in DNS wire format as described in RFC 4034
+   [RFC4034], Section 3.1.  The signature portion of the RDATA, as
+   described in the same section, is the following:
+
+
+             signature = sign(RRSIG_RDATA | RR(1) | RR(2)... )
+
+   where, RRSIG_RDATA is the wire format of the RRSIG RDATA fields with
+   the Signer's Name field in canonical form and the signature field
+   excluded.
+
+   The first RRset in the chain MUST contain the DANE records being
+   presented.  The subsequent RRsets MUST be a sequence of DNSKEY and DS
+   RRsets, starting with a DNSKEY RRset.  Each RRset MUST authenticate
+   the preceding RRset:
+
+   o  A DNSKEY RRset must include the DNSKEY RR containing the public
+      key used to verify the previous RRset.
+
+   o  For a DS RRset, the set of key hashes MUST overlap with the
+      preceding set of DNSKEY records.
+
+   In addition, a DNSKEY RRset followed by a DS RRset MUST be self-
+   signed, in the sense that its RRSIG MUST verify under one of the keys
+   in the DNSKEY RRSET.
+
+   The final DNSKEY RRset in the authentication chain, containing the
+   trust anchor may be omitted.  If omitted, the client MUST verify that
+
+
+
+Shore, et al.          Expires September 28, 2017               [Page 6]
+
+Internet-Draft         TLS DNSSEC Chain Extension             March 2017
+
+
+   the key tag and owner name in the final RRSIG record correspond to a
+   trust anchor.  There may however be reason to include the trust
+   anchor RRset and signature if clients are expected to use RFC5011
+   compliant key rollover functions inband via the chain data.  In that
+   case, they will need to periodically inspect flags (revocation and
+   secure entry point flags) on the trust anchor DNSKEY RRset.
+
+   For example, for an HTTPS server at www.example.com, where there are
+   zone cuts at "com." and "example.com.", the AuthenticationChain
+   structure would comprise the following RRsets and signatures (the
+   data field of the records are omitted here for brevity):
+
+
+             _443._tcp.www.example.com. TLSA
+             RRSIG(_443._tcp.www.example.com. TLSA)
+             example.com. DNSKEY
+             RRSIG(example.com. DNSKEY)
+             example.com. DS
+             RRSIG(example.com. DS)
+             com. DNSKEY
+             RRSIG(com. DNSKEY)
+             com. DS
+             RRSIG(com. DS)
+             . DNSKEY
+             RRSIG(. DNSKEY)
+
+   Names that are aliased via CNAME and/or DNAME records may involve
+   multiple branches of the DNS tree.  In this case the authentication
+   chain structure will be composed of a sequence of these multiple
+   intersecting branches.  DNAME chains should omit unsigned CNAME
+   records that may have been synthesized in the response from a DNS
+   resolver.  Wildcard DANE records will need to include the wildcard
+   name, and negative proof (i.e.  NSEC or NSEC3 records) that no closer
+   name exists MUST be included.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Shore, et al.          Expires September 28, 2017               [Page 7]
+
+Internet-Draft         TLS DNSSEC Chain Extension             March 2017
+
+
+         A CNAME example:
+
+         _443._tcp.www.example.com.   IN   CNAME    ca.example.net.
+         ca.example.net.              IN   TLSA     2 0 1 ...
+
+         Here the authentication chain structure is composed of two
+         consecutive chains, one for _443._tcp.www.example.com/CNAME
+         and one for ca.example.net/TLSA. The second chain can omit
+         the record sets at the end that overlap with the first.
+
+         TLS DNSSEC chain components:
+
+         _443._tcp.www.example.com. CNAME
+         RRSIG(_443._tcp.www.example.com. CNAME)
+         example.com. DNSKEY
+         RRSIG(example.com. DNSKEY)
+         example.com. DS
+         RRSIG(example.com. DS)
+         com. DNSKEY
+         RRSIG(com. DNSKEY)
+         com. DS
+         RRSIG(com. DS)
+         . DNSKEY
+         RRSIG(. DNSKEY)
+
+         ca.example.net. TLSA
+         RRSIG(ca.example.net. TLSA)
+         example.net. DNSKEY
+         RRSIG(example.net. DNSKEY)
+         example.net. DS
+         RRSIG(example.net. DS)
+         net. DNSKEY
+         RRSIG(net. DNSKEY)
+         net. DS
+         RRSIG(net. DS)
+
+
+   Note as well that if a user has a specific TLSA record for port 443,
+   and a different wildcard covering other ports, attackers MUST NOT be
+   able to substitute the wildcard TLSA RRset for the more specific one
+   for port 443.  DNSSEC wildcards must not be confused with the X.509
+   wildcards.
+
+4.  Construction of Serialized Authentication Chains
+
+   This section describes a possible procedure for the server to use to
+   build the serialized DNSSEC chain.
+
+
+
+
+Shore, et al.          Expires September 28, 2017               [Page 8]
+
+Internet-Draft         TLS DNSSEC Chain Extension             March 2017
+
+
+   When the goal is to perform DANE authentication [RFC6698] of the
+   server's X.509 certificate, the DNS record set to be serialized is a
+   TLSA record set corresponding to the server's domain name.
+
+   The domain name of the server MUST be that included in the TLS
+   server_name extension [RFC6066] when present.  If the server_name
+   extension is not present, or if the server does not recognize the
+   provided name and wishes to proceed with the handshake rather than to
+   abort the connection, the server uses the domain name associated with
+   the server IP address to which the connection has been established.
+
+   The TLSA record to be queried is constructed by prepending the _port
+   and _transport labels to the domain name as described in [RFC6698],
+   where "port" is the port number associated with the TLS server.  The
+   transport is "tcp" for TLS servers, and "udp" for DTLS servers.  The
+   port number label is the left-most label, followed by the transport,
+   followed by the base domain name.
+
+   The components of the authentication chain are built by starting at
+   the target record set and its corresponding RRSIG.  Then traversing
+   the DNS tree upwards towards the trust anchor zone (normally the DNS
+   root), for each zone cut, the DNSKEY and DS RRsets and their
+   signatures are added.  If DNS responses messages contain any domain
+   names utilizing name compression [RFC1035], then they must be
+   uncompressed.
+
+   In the future, proposed DNS protocol enhancements, such as the EDNS
+   Chain Query extension [RFC7901] may offer easy ways to obtain all of
+   the chain data in one transaction with an upstream DNSSEC aware
+   recursive server.
+
+5.  Caching and Regeneration of the Authentication Chain
+
+   DNS records have Time To Live (TTL) parameters, and DNSSEC signatures
+   have validity periods (specifically signature expiration times).
+   After the TLS server constructs the serialized authentication chain,
+   it SHOULD cache and reuse it in multiple TLS connection handshakes.
+   However, it MUST refresh and rebuild the chain as TTLs and signature
+   validity periods dictate.  A server implementation could carefully
+   track these parameters and requery component records in the chain
+   correspondingly.  Alternatively, it could be configured to rebuild
+   the entire chain at some predefined periodic interval that does not
+   exceed the DNS TTLs or signature validity periods of the component
+   records in the chain.
+
+
+
+
+
+
+
+Shore, et al.          Expires September 28, 2017               [Page 9]
+
+Internet-Draft         TLS DNSSEC Chain Extension             March 2017
+
+
+6.  Verification
+
+   A TLS client making use of this specification, and which receives a
+   DNSSEC authentication chain extension from a server, SHOULD use this
+   information to perform DANE authentication of the server certificate.
+   In order to do this, it uses the mechanism specified by the DNSSEC
+   protocol [RFC4035].  This mechanism is sometimes implemented in a
+   DNSSEC validation engine or library.
+
+   If the authentication chain is correctly verified, the client then
+   performs DANE authentication of the server according to the DANE TLS
+   protocol [RFC6698], and the additional protocol requirements outlined
+   in [RFC7671].
+
+7.  Trust Anchor Maintenance
+
+   The trust anchor may change periodically, e.g. when the operator of
+   the trust anchor zone performs a DNSSEC key rollover.  Managed key
+   rollovers typically use a process that can be tracked by verifiers
+   allowing them to automatically update their trust anchors, as
+   described in [RFC5011].  TLS clients using this specification are
+   also expected to use such a mechanism to keep their trust anchors
+   updated.  Some operating systems may have a system-wide service to
+   maintain and keep the root trust anchor up to date.  In such cases,
+   the TLS client application could simply reference that as its trust
+   anchor, periodically checking whether it has changed.
+
+8.  Mandating use of this extension
+
+   A TLS server certificate MAY mandate the use of this extension by
+   means of the X.509 TLS Feature Extension described in [RFC7633].
+   This X.509 certificate extension, when populated with the
+   dnssec_chain TLS extension identifier, indicates to the client that
+   the server must deliver the authentication chain when asked to do so.
+   (The X.509 TLS Feature Extension is the same mechanism used to
+   deliver other mandatory signals, such as OCSP "must staple"
+   assertions.)
+
+9.  Security Considerations
+
+   The security considerations of the normatively referenced RFCs (1035,
+   4034, 4035, 5246, 6066, 6698, 7633, 7671) all pertain to this
+   extension.  Since the server is delivering a chain of DNS records and
+   signatures to the client, it MUST rebuild the chain in accordance
+   with TTL and signature expiration of the chain components as
+   described in Section 5.  TLS clients need roughly accurate time in
+   order to properly authenticate these signatures.  This could be
+   achieved by running a time synchronization protocol like NTP
+
+
+
+Shore, et al.          Expires September 28, 2017              [Page 10]
+
+Internet-Draft         TLS DNSSEC Chain Extension             March 2017
+
+
+   [RFC5905] or SNTP [RFC5905], which are already widely used today.
+   TLS clients MUST support a mechanism to track and rollover the trust
+   anchor key, or be able to avail themselves of a service that does
+   this, as described in Section 7.
+
+10.  IANA Considerations
+
+   This extension requires the registration of a new value in the TLS
+   ExtensionsType registry.  The value requested from IANA is 53.  If
+   the draft is adopted by the WG, the authors expect to make an early
+   allocation request as specified in [RFC7120].
+
+11.  Acknowledgments
+
+   Many thanks to Adam Langley for laying the groundwork for this
+   extension.  The original idea is his but our acknowledgment in no way
+   implies his endorsement.  This document also benefited from
+   discussions with and review from the following people: Viktor
+   Dukhovni, Daniel Kahn Gillmor, Jeff Hodges, Allison Mankin, Patrick
+   McManus, Rick van Rein, Gowri Visweswaran, Duane Wessels, Nico
+   Williams, and Paul Wouters.
+
+12.  References
+
+12.1.  Normative References
+
+   [RFC1035]  Mockapetris, P., "Domain names - implementation and
+              specification", STD 13, RFC 1035, DOI 10.17487/RFC1035,
+              November 1987, <http://www.rfc-editor.org/info/rfc1035>.
+
+   [RFC2119]  Bradner, S., "Key words for use in RFCs to Indicate
+              Requirement Levels", BCP 14, RFC 2119,
+              DOI 10.17487/RFC2119, March 1997,
+              <http://www.rfc-editor.org/info/rfc2119>.
+
+   [RFC4034]  Arends, R., Austein, R., Larson, M., Massey, D., and S.
+              Rose, "Resource Records for the DNS Security Extensions",
+              RFC 4034, DOI 10.17487/RFC4034, March 2005,
+              <http://www.rfc-editor.org/info/rfc4034>.
+
+   [RFC4035]  Arends, R., Austein, R., Larson, M., Massey, D., and S.
+              Rose, "Protocol Modifications for the DNS Security
+              Extensions", RFC 4035, DOI 10.17487/RFC4035, March 2005,
+              <http://www.rfc-editor.org/info/rfc4035>.
+
+
+
+
+
+
+
+Shore, et al.          Expires September 28, 2017              [Page 11]
+
+Internet-Draft         TLS DNSSEC Chain Extension             March 2017
+
+
+   [RFC5246]  Dierks, T. and E. Rescorla, "The Transport Layer Security
+              (TLS) Protocol Version 1.2", RFC 5246,
+              DOI 10.17487/RFC5246, August 2008,
+              <http://www.rfc-editor.org/info/rfc5246>.
+
+   [RFC6066]  Eastlake 3rd, D., "Transport Layer Security (TLS)
+              Extensions: Extension Definitions", RFC 6066,
+              DOI 10.17487/RFC6066, January 2011,
+              <http://www.rfc-editor.org/info/rfc6066>.
+
+   [RFC6698]  Hoffman, P. and J. Schlyter, "The DNS-Based Authentication
+              of Named Entities (DANE) Transport Layer Security (TLS)
+              Protocol: TLSA", RFC 6698, DOI 10.17487/RFC6698, August
+              2012, <http://www.rfc-editor.org/info/rfc6698>.
+
+   [RFC7633]  Hallam-Baker, P., "X.509v3 Transport Layer Security (TLS)
+              Feature Extension", RFC 7633, DOI 10.17487/RFC7633,
+              October 2015, <http://www.rfc-editor.org/info/rfc7633>.
+
+   [RFC7671]  Dukhovni, V. and W. Hardaker, "The DNS-Based
+              Authentication of Named Entities (DANE) Protocol: Updates
+              and Operational Guidance", RFC 7671, DOI 10.17487/RFC7671,
+              October 2015, <http://www.rfc-editor.org/info/rfc7671>.
+
+12.2.  Informative References
+
+   [RFC5011]  StJohns, M., "Automated Updates of DNS Security (DNSSEC)
+              Trust Anchors", STD 74, RFC 5011, DOI 10.17487/RFC5011,
+              September 2007, <http://www.rfc-editor.org/info/rfc5011>.
+
+   [RFC5905]  Mills, D., Martin, J., Ed., Burbank, J., and W. Kasch,
+              "Network Time Protocol Version 4: Protocol and Algorithms
+              Specification", RFC 5905, DOI 10.17487/RFC5905, June 2010,
+              <http://www.rfc-editor.org/info/rfc5905>.
+
+   [RFC7120]  Cotton, M., "Early IANA Allocation of Standards Track Code
+              Points", BCP 100, RFC 7120, DOI 10.17487/RFC7120, January
+              2014, <http://www.rfc-editor.org/info/rfc7120>.
+
+   [RFC7250]  Wouters, P., Ed., Tschofenig, H., Ed., Gilmore, J.,
+              Weiler, S., and T. Kivinen, "Using Raw Public Keys in
+              Transport Layer Security (TLS) and Datagram Transport
+              Layer Security (DTLS)", RFC 7250, DOI 10.17487/RFC7250,
+              June 2014, <http://www.rfc-editor.org/info/rfc7250>.
+
+   [RFC7435]  Dukhovni, V., "Opportunistic Security: Some Protection
+              Most of the Time", RFC 7435, DOI 10.17487/RFC7435,
+              December 2014, <http://www.rfc-editor.org/info/rfc7435>.
+
+
+
+Shore, et al.          Expires September 28, 2017              [Page 12]
+
+Internet-Draft         TLS DNSSEC Chain Extension             March 2017
+
+
+   [RFC7672]  Dukhovni, V. and W. Hardaker, "SMTP Security via
+              Opportunistic DNS-Based Authentication of Named Entities
+              (DANE) Transport Layer Security (TLS)", RFC 7672,
+              DOI 10.17487/RFC7672, October 2015,
+              <http://www.rfc-editor.org/info/rfc7672>.
+
+   [RFC7901]  Wouters, P., "CHAIN Query Requests in DNS", RFC 7901,
+              DOI 10.17487/RFC7901, June 2016,
+              <http://www.rfc-editor.org/info/rfc7901>.
+
+   [I-D.agl-dane-serializechain]
+              Langley, A., "Serializing DNS Records with DNSSEC
+              Authentication", draft-agl-dane-serializechain-01 (work in
+              progress), July 2011.
+
+   [I-D.barnes-dane-uks]
+              Barnes, R., Thomson, M., and E. Rescorla, "Unknown Key-
+              Share Attacks on DNS-based Authentications of Named
+              Entities (DANE)", draft-barnes-dane-uks-00 (work in
+              progress), October 2016.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Shore, et al.          Expires September 28, 2017              [Page 13]
+
+Internet-Draft         TLS DNSSEC Chain Extension             March 2017
+
+
+Appendix A.  Updates from -01 and -02
+
+   o  Editorial updates for style and consistency
+
+   o  Updated discussion of UKS attack
+
+Appendix B.  Updates from -01
+
+   o  Added TLS 1.3 support
+
+   o  Added section describing applicability to raw public keys
+
+   o  Softened language about record order
+
+Appendix C.  Updates from -00
+
+   o  Edits based on comments from Rick van Rein
+
+   o  Warning about not overloading X.509 wildcards on DNSSEC wildcards
+      (from V.  Dukhovny)
+
+   o  Added MUST include negative proof on wildcards (from V.  Dukhovny)
+
+   o  Removed "TODO" on allowing the server to deliver only one
+      signature per RRset
+
+   o  Added additional minor edits suggested by Viktor Dukhovny
+
+Appendix D.  Test vector
+
+   [data go here]
+
+Authors' Addresses
+
+   Melinda Shore
+   Fastly
+
+   EMail: mshore@fastly.com
+
+
+   Richard Barnes
+   Mozilla
+
+   EMail: rlb@ipv.sx
+
+
+
+
+
+
+
+Shore, et al.          Expires September 28, 2017              [Page 14]
+
+Internet-Draft         TLS DNSSEC Chain Extension             March 2017
+
+
+   Shumon Huque
+   Salesforce
+
+   EMail: shumon.huque@gmail.com
+
+
+   Willem Toorop
+   NLNet Labs
+
+   EMail: willem@nlnetlabs.nl
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Shore, et al.          Expires September 28, 2017              [Page 15]
