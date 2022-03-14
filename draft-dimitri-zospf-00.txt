@@ -1,0 +1,880 @@
+
+
+                                                                        
+   Internet Draft                                         A. Dimitrelis 
+                                                            A. Williams 
+   Document: draft-dimitri-zospf-00.txt			       Motorola 
+   Expires: April 2003                                     October 2002 
+    
+    
+     Autoconfiguration of routers using a link state routing protocol 
+    
+    
+Status of this Memo 
+    
+   This document is an Internet-Draft and is in full conformance with 
+   all provisions of Section 10 of RFC2026 [1].  
+    
+   Internet-Drafts are working documents of the Internet Engineering 
+   Task Force (IETF), its areas, and its working groups.  Note that      
+   other groups may also distribute working documents as Internet-
+   Drafts. 
+    
+   Internet-Drafts are draft documents valid for a maximum of six months 
+   and may be updated, replaced, or obsoleted by other documents at any 
+   time.  It is inappropriate to use Internet-Drafts as reference 
+   material or to cite them other than as "work in progress." 
+    
+   The list of current Internet-Drafts can be accessed at 
+        http://www.ietf.org/ietf/1id-abstracts.txt 
+   The list of Internet-Draft Shadow Directories can be accessed at 
+        http://www.ietf.org/shadow.html. 
+    
+    
+Abstract 
+    
+   This memo documents our thinking to date regarding the use of version 
+   3 of the Open Shortest Path First (OSPF) protocol as a mechanism for 
+   the autoconfiguration of IP routers within an OSPF area. 
+   Specifically, a method for the allocation and distribution of IPv4 
+   and IPv6 subnet addresses without explicit configuration is 
+   described. Such a mechanism would be useful in an environment where 
+   routing is desirable, but the network administration skills necessary 
+   to configure IP routers are not available. This draft presents zOSPF 
+   (zeroconfigutaion OSPF), a protocol based on OSFPv3 that will allow 
+   routers to self configure and forward IPv4 and IPv6 traffic. 
+    
+DISCLAIMER 
+ 
+   This draft is a work in progress. Its purpose is to sketch a 
+   potential solution to the problem of router self-configuration and 
+   highlight some of the trade-offs. The hope is to gauge interest 
+   within the IETF community for solving the problem, and soliciting 
+ 
+ 
+Dimitrelis                                                    [Page 1] 
+                        Router Autoconfiguration 
+                              October 2002 
+ 
+ 
+   feedback and suggestions from the designers, implementers, and users 
+   of the protocols referred to within. The purpose of this draft is not 
+   to attempt to set in stone a complete solution to the problem. 
+   Criticism and feedback are welcome. All references to OSPF imply 
+   OSPFv3, unless stated otherwise.  
+    
+    
+Table of Contents 
+    
+   1. Overview.......................................................2 
+      1.3  Scope.....................................................4 
+   2. zOSPF Protocol Operation.......................................5 
+      2.1  Initialization............................................5 
+      2.2  The Hello Protocol........................................5 
+      2.2.1 Active Router ID collision resolution....................6 
+      2.2.2 Passive Router ID collision handling.....................6 
+      2.2.3 Link local address collision.............................7 
+      2.2.4 zOSPF Options field......................................7 
+   3. Exchange of routing information................................8 
+      3.0 Handling IPv4 subnet addresses.............................8 
+      3.1 Designated Router..........................................8 
+      3.2 Non designated router.....................................10 
+      3.3 Stub links................................................11 
+      3.4  Discovering uplinks......................................12 
+      3.5 Processing AS-external LSAs...............................13 
+      3.6  Monitoring for subnet address collisions.................14 
+   4. Layer 2 partitions and merges.................................15 
+   5. Services to hosts.............................................15 
+   6. Related Work..................................................15 
+   Security Considerations..........................................15 
+   References.......................................................15 
+   Author's Addresses...............................................16 
+    
+    
+1. Overview 
+ 
+   The deployment of OSPF requires a non-trivial degree of configuration 
+   effort on the part of a network administrator, in particular the 
+   consistent and correct allocation of subnet addresses to network 
+   links. By 'consistent' we mean that all routers attached to a link 
+   must agree on that link's subnet address (although the subnet model 
+   is relaxed in IPv6), and by 'correct' we imply that for traffic to be 
+   routed reliably, each subnet must have a unique subnet address. So, 
+   the problem is one of allocating a unique subnet address to each link 
+   in the network.  
+    
+
+                                     
+ 
+Dimitrelis                                                    [Page 2] 
+                        Router Autoconfiguration 
+                              October 2002 
+ 
+ 
+   We believe that a protocol based on a cut-down version of OSPF for 
+   IPv6 [2] can be used within limited topologies to route both IPv4 and 
+   IPv6 traffic without requiring manual configuration. The basic idea 
+   is as follows: 
+    
+      o A router comes up and listens. It listens for network prefixes 
+      (e.g. "the link attached to interface 3 has a subnet prefix of 
+      2002:beef:beef:1000::/64"), and for address spaces from which it 
+      can allocate subnet prefixes (e.g. "the global prefix for this 
+      site is 2002:beef:beef::/48"). 
+       
+      o For any links a router is attached to that do not have a prefix 
+      allocated, one particular router (the designated router) will 
+      allocate a prefix. The first router to come up on a link will 
+      typically be responsible for choosing that link's subnet prefix. 
+       
+      o The router includes the prefixes it has allocated in future 
+      routing announcements. This allows other routers to route to the 
+      new IP subnet, and to avoid allocating the prefix to another link 
+      elsewhere in the network.  
+       
+      o The router continues to listen, and is prepared to deal with 
+      addressing collisions by renumbering problematic subnets. 
+    
+   With reference to OSPF, the initial "listening" stage corresponds to 
+   the formation of neighbor relationships (including participating in 
+   the designated router election) and the synchronization of link state 
+   databases. So before a router chooses a subnet prefix at random, it 
+   will have as complete a view of the network, and the prefixes in use 
+   therein, as possible.  
+    
+   OSPF routers "announce" their choice of subnet prefixes by flooding 
+   the appropriate LSAs. In OSPFv3, a designated router that has picked 
+   a subnet address for a link will flood a Link-LSA to OSPFv3 routers 
+   on that link, and an Intra-Area Prefix LSA to all OSPF routers within 
+   the area.  
+    
+   Finally, the ongoing listening stage corresponds to the processing of 
+   LSAs received as part of on-going OSPF operation. Other routers in 
+   the area will periodically resend valid LSA, will revoke invalid 
+   LSAs, and will originate new LSAs as new links come up and as 
+   networks merge. A zOSPF router must perform additional processing on 
+   received LSAs in order to check for prefix collisions. A router is 
+   responsible for handling collisions involving prefixes it itself 
+   allocated. Refer to section 3.6 for a more detailed discussion. 
+ 
+   OSPFv3 is a promising platform for realizing zOSPF routers because: 
+    
+                                     
+ 
+Dimitrelis                                                    [Page 3] 
+                        Router Autoconfiguration 
+                              October 2002 
+ 
+ 
+      o The exchange of OSPFv3 protocol data units occurs using IPv6 
+      link local addressing, which is inherently configuration-free [3]. 
+      This allows the Hello protocol (in particular, the election of a 
+      designated router) and the database distribution protocol to 
+      operate in the absence of area-wide addressing. 
+    
+      o It is straightforward to extend the responsibilities of a 
+      subnet's designated router to include the selection of that link's 
+      prefix. The choice of prefix is made after the designated router 
+      (DR) has gathered as much information about the network as 
+      possible - in other words, after it has become fully adjacent to 
+      the designated routers on its other links. At this point, the DR 
+      has a knowledge of the prefixes that are in use within the 
+      network, and is able to choose prefixes that are least likely to 
+      cause addressing collisions.  
+       
+      o OSPF provides the means for a designated router to signal to 
+      other routers on a link the prefix that has been chosen for that 
+      link - this is the Link LSA. Changing the prefix associated with a 
+      link is also straightforward - the current Link LSA can be timed 
+      out by the originator, and a new link-LSA originated. 
+    
+      o LSAs designed to carry IPv6 addresses can also carry IPv4 
+      addresses, using IPv4 mapped IPv6 addresses. This allows support 
+      for routing IPv4 without the need to introduce additional protocol 
+      data units. 
+       
+      o OSPFv3 decouples addressing and topology information. This means 
+      it is necessary to invalidate only LSAs related to addressing when 
+      a collision is detected.  
+       
+1.2  Motivation 
+ 
+   The quintessential scenario motivating this draft is a home or small 
+   office, possibly connected to the Internet through an ISP. An ISP can 
+   provide a global IPv4 address, a global IPv6 prefix, or both. The 
+   site may contain any number of hosts and routers, and the network 
+   topology within may be arbitrarily complex.  
+    
+ 
+1.3  Scope 
+    
+   The purpose of this draft is to sketch an approach to creating a zero 
+   configuration routing protocol by reusing much of OSPFv3. This draft 
+   does not aim to specify a configuration-free alternative to the OSPF 
+   protocol. Several of OSPF's features are not considered, in 
+   particular: 
+    
+                                     
+ 
+Dimitrelis                                                    [Page 4] 
+                        Router Autoconfiguration 
+                              October 2002 
+ 
+ 
+      o Support for NBMA networks and point-to-multipoint links. 
+    
+      o The ability to route between multiple OSPF areas within an 
+      Autonomous System. The assumption is made that routers talking the 
+      zOSPF protocol are within a single pre-configured area. 
+       
+      o Interoperability with other routing protocols is not rigorously 
+      considered. Section 3.4 discusses how external prefixes can be 
+      discovered and injected into a zOSPF area. Sections detailing 
+      interoperability with established routing protocols may be added 
+      in future (and input is welcome).  
+ 
+    
+2. zOSPF Protocol Operation 
+    
+   This section describes the operation of zOSPF by detailing the 
+   sequence of events that occur from the moment a router begins 
+   operating. The zOSPF scheme is explained by detailing the processing 
+   performed by a zOSPF router in addition to that performed by an 
+   OSPFv3 router. This section assumes a familiarity with OSPFv3. 
+    
+2.1  Initialization 
+    
+   Upon commencing operation, a router must choose a 32-bit router ID. 
+   The router ID will be a pseudorandom number, and is not related to 
+   any of the router's IP addresses. If possible, a router should re-use 
+   an ID that it has previously used with success. A router's initial 
+   selection of router ID may not be final - the router may determine 
+   that the ID is in use elsewhere in the network during the exchange of 
+   database description packets as it becomes fully adjacent with 
+   neighboring designated routers. The router will set its area ID to x 
+   (0 has special meaning, i.e. backbone). A zOSPF router must also 
+   configure broadcast interfaces with IPv6 link local addresses. If a 
+   router must change an IPv6 link local address, it must allow all 
+   adjacencies based on that address to time out (see section 2.2.2).  
+    
+2.2  The Hello Protocol 
+    
+   Once a router has chosen an ID, it is able to engage in the Hello 
+   protocol, as described in sections 3.2.1.1 and 3.2.2 of [2]. A zOSPF 
+   router, just like an OSPFv3 compliant router, continues to transmit 
+   and process Hello packets for the entire time it is up.  
+    
+   Because router IDs are chosen in a pseudorandom manner, and because 
+   the shortest path routing algorithm will fail if two or more distinct 
+   nodes are indistinguishable because of duplicate router IDs, some 
+   extra processing overhead is required to handle router ID collisions. 
+   Therefore, the zOSPF Hello protocol extends OSPF's Hello protocol by 
+                                     
+ 
+Dimitrelis                                                    [Page 5] 
+                        Router Autoconfiguration 
+                              October 2002 
+ 
+ 
+   requiring zOSPF routers perform additional processing in order to 
+   detect and resolve router ID collisions with directly connected 
+   neighbors. References to router ID collisions in the following 
+   subsections imply collisions between directly connected neighbors 
+   only.  
+ 
+2.2.1 Active Router ID collision resolution 
+    
+   This subsection discusses how a zOSPF router is to detect a collision 
+   involving its own router ID, and the actions it must take in order to 
+   resolve the conflict.  
+    
+   A router will detect that it has been involved in an ID collision 
+   when it receives a Hello packet (that it did not itself originate) 
+   that contains its router ID in the router ID field of the OSPF packet 
+   header. 
+     
+   The detecting router will send several gratuitous Hello packets using 
+   the conflicting router ID, and then choose a new ID. These Hello 
+   packets will be sent with the 'R' bit (Appendix A.3.1, [2]) cleared - 
+   this will inform other routers that it is not eligible to forward 
+   traffic. The effect will be that all routers with a conflicting ID 
+   will be excluded from SPF calculations by other routers. This is done 
+   in order to avoid a potential routing loop due to the inconsistent 
+   state of the routing table. The purpose of the gratuitous Hello 
+   packets is to ensure that the other router(s) involved in the ID 
+   collision is (are) aware of the collision. Once a router has chosen a 
+   new router ID, it may begin sending Hello packets identifying itself 
+   with this new ID. It will have to reform adjacencies with its 
+   neighbors, and re-originate its router LSA.  
+    
+   Before announcing that it is eligible to forward packets again (by 
+   setting the R bit), a router that has been involved in a collision 
+   must be reasonably confident that the collision has been resolved. 
+   One way a router might determine the collision to have been resolved 
+   is if it receives Hello packets from each of the routers involved in 
+   the collision with new, non-colliding IDs. The routers involved in 
+   the collision can be identified by their IPv6 link local addresses, 
+   which were stored when the collision was detected. A router can also 
+   assume that it is safe to resume forwarding after it has not received 
+   Hello packets containing the problematic ID for several RouterDead 
+   intervals.  
+    
+2.2.2 Passive Router ID collision handling 
+    
+   This subsection describes how a router is to detect a router ID 
+   collision involving directly connected peers (but not the router 
+
+                                     
+ 
+Dimitrelis                                                    [Page 6] 
+                        Router Autoconfiguration 
+                              October 2002 
+ 
+ 
+   itself), and the actions it must take in order to handle the 
+   collision.  
+    
+   A router will detect a router ID collision on a broadcast subnet to 
+   which it is directly connected if it receives Hello messages from 
+   more than one source with the same router ID. A source is identified 
+   by its IPv6 link local address. The router will store the link local 
+   addresses of the routers it deems involved in the collision and drop 
+   neighbor relationships with them by not including their router IDs in 
+   the Neighbors section of future Hello packets. These changes will 
+   trigger an updated router LSA. The link local addresses of colliding 
+   routers, along with the colliding router ID must be stored so that 
+   future Hello packets with the invalid link-local source 
+   address/router ID combination can be ignored.  
+    
+   The additional processing related to detecting router ID collisions 
+   involves checking the RouterID field of Hello packets and the IPv6 
+   link local source address of the Hello packet. Since the originator 
+   of a Hello packet is identified by its IPv6 link local address (as 
+   well as its Router ID), a router's LL address cannot change if 
+   adjacencies are to be gracefully maintained. Routers must be prepared 
+   to re-establish neighbor adjacencies if they change an IPv6 link 
+   local address whilst they have existing neighbor relationships.  
+    
+   Note that a router ID collision may result in a change of a link's 
+   Designated Router, Backup Designated Router, or both.  
+    
+    
+2.2.3 Link local address collision 
+    
+   A layer 2 merge may bring routers with identical link-local addresses 
+   onto the same link. The detection and resolution of a LL address 
+   collision is the responsibility of the IP layer. This will entail 
+   selecting a new LL address and re-running DAD [3].  
+    
+2.2.4 zOSPF Options field 
+    
+   This draft specifies a new bit in the options field, the Z bit. This 
+   bit will signal to routers receiving Hello, database description, and 
+   LSA packets that the originator is a zOSPF router, and is performing 
+   zOSPF related processing, as specified by this memo. The options 
+   field becomes: 
+    
+                                1                     2 
+            0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8  9  0  1  2  3 
+           -+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+--+--+--+--+--+--+ 
+            | | | | | | | | | | | | | | | | |Z|DC| R| N|MC| E|V6| 
+           -+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+--+--+--+--+--+--+ 
+                                     
+ 
+Dimitrelis                                                    [Page 7] 
+                        Router Autoconfiguration 
+                              October 2002 
+ 
+ 
+    
+                           The Options field 
+    
+   The Options field for OSPFv3 can be found in Appendix A.3.1 of [2]. 
+   zOSPF routers will transmit all applicable zOSPF packets with the Z 
+   bit set, and will not form adjacencies with non zOSPF capable 
+   routers. Hello packets with the Z bit not set are dropped without 
+   further processing. Future versions of this draft may specify a 
+   sensible way to interact with OSPFv3 and OSPFv2 routers.  
+    
+ 
+3. Exchange of routing information 
+    
+   After initializing and participating in the Hello protocol, a router 
+   may find itself elected the designated router (DR) on one or more of 
+   the links it is connected to. This section details additional 
+   routing-related processing routers must perform depending on whether 
+   they are a link's DR or not. Section 5 lists services zOSPF routers 
+   might provide to hosts (such as DHCPv4). 
+    
+3.1 Handling IPv4 subnet addresses 
+    
+   zOSPF handles IPv4 and IPv6 routing in an integrated manner. IPv4 
+   subnet addresses are represented within the routing protocol as IPv4 
+   mapped IPv6 addresses [4]. A router that has claimed 192.168.120/24 
+   for a subnet will flood a network LSA containing the prefix 
+   ::ffff:c0:a8:78:0/48. 
+    
+3.2 Designated Router 
+    
+   A broadcast link's designated router is responsible for selecting and 
+   maintaining that link's IPv4 and IPv6 subnet prefixes. When a router 
+   is elected a link's designated router it must select subnet addresses 
+   for that link.  This can include an IPv4 subnet address, and a number 
+   of IPv6 prefixes. Subnet addresses are chosen in a pseudorandom 
+   manner with constraints - namely, the use of the contents of the link 
+   state database to filter poor prefix choices. Before choosing subnet 
+   prefixes, a DR must form full adjacencies with the designated routers 
+   (if any) on its other links. Forming such adjacencies will allow a 
+   router to learn which subnet prefixes are in use within a network. 
+   With its link state database synchronized, the DR is able to choose a 
+   prefix that is least likely to cause a collision.  
+    
+   OSPF's distributed database also allows a zOSPF router to discover 
+   the address spaces it can use to form IPv6 subnet addresses. The 
+   existence and validity of a dynamically allocated prefix, such as a 
+   global or a 6to4 prefix, can be signaled using area scoped LSAs. In 
+   addition, routers can be preconfigured to allocate out of fixed 
+                                     
+ 
+Dimitrelis                                                    [Page 8] 
+                        Router Autoconfiguration 
+                              October 2002 
+ 
+ 
+   address spaces - such as fec0::/48 and 192.168/16. Section 3.4 
+   discusses how global prefixes are injected into an OSPF routing 
+   domain. 
+    
+   Once a router has been elected the designated router (DR) on a link, 
+   it must select a set of subnet addresses for that link. The procedure 
+   for doing this follows. 
+    
+   (1) For each of the router's other links, ensure one of the 
+   following: 
+   - The router is the designated router on the link 
+   - The router has formed a full adjacency with the DR on the link 
+   - The link is a stub link (i.e. there are no other zOSPF speakers on 
+   the link) 
+    
+   Satisfying (1) ensures that a router that is going to choose subnet 
+   addresses has a knowledge of those subnet addresses that have already 
+   been allocated. This knowledge arises from having allocated those 
+   subnet addresses (as designated router), and from the synchronization 
+   of link state databases, which is a result of forming a full 
+   adjacency with designated routers on its other links.  
+    
+   (2) For each site-wide prefix known to be valid within the OSPF area, 
+   choose a subnet address. Section 3.4.1 discusses how site-wide 
+   prefixes are discovered. For each /48 IPv6 site wide prefix, the 
+   router will choose a /64 IPv6 subnet address. For a /16 IPv4 prefix, 
+   a router will choose a /24 subnet address.  
+    
+   The site allocated subnet identifier of each of the IPv6 addresses 
+   created in (2) is generated using a random number generator. The 
+   address is compared with addresses stored in the link state database. 
+   If a router generates a subnet address that clashes with an address 
+   with an entry in the routing table, the router will generate a new 
+   subnet address.  
+    
+   (3) When a zOSPF router is satisfied that the prefixes it has chosen 
+   for a link do not collide with prefixes already in use within the 
+   OSPF area, it will configure the corresponding network interface with 
+   an address based on the new prefix. The creation of IPv6 addresses 
+   from prefixes is documented in [3]. 
+    
+   (4) The router must inject the new prefixes into the OSPF routing 
+   domain. The process of advertising the new prefix in zOSPF is the 
+   same as the process of advertising a configured prefix in OSPFv3. The 
+   LSAs flooded are: 
+   - A new network LSA, if the link is a transit link 
+   - A new intra-area prefix LSA, if the link is a transit link. This 
+   LSA will contain the subnet address 
+                                     
+ 
+Dimitrelis                                                    [Page 9] 
+                        Router Autoconfiguration 
+                              October 2002 
+ 
+ 
+   - A new router LSA. The router LSA will reference a network LSA if 
+   the link is a transit link, otherwise it will have an entry for a new 
+   stub link.  
+    
+   Note that a newly elected designated router chooses new prefixes for 
+   a link regardless of any prefixes on the link previous to its 
+   becoming the designated router. The prefixes chosen by a previous 
+   designated router must not be reused. The rationale behind this is 
+   presented in section 3.2. 
+    
+   For IPv6 addresses, a subnet prefix will typically be a /64 prefix, 
+   and can be created by appending a subnet identifier to a site-wide 
+   /48 prefix. A site-wide /48 prefix may be: 
+      - a publicly routable IPv6 prefix delegated to a site by an ISP 
+      - a 6to4 prefix [6] created from a public IPv4 address which has 
+      been allocated by an ISP  
+      - the IPv6 site local prefix fec0::/48 
+ 
+    
+3.2 Non designated router 
+    
+   zOSPF routers do not have subnet address information explicitly 
+   configured; they must configure their network interfaces from 
+   information via the routing protocol. Configuring interfaces with 
+   IPv6 addresses consists of learning a network prefix through routing 
+   protocol exchanges, and forming a full address using the mechanisms 
+   described in [3].  
+    
+   3.2.1 Configuring IPv6 Addresses 
+    
+   Non-designated routers will use received link LSAs to configure some 
+   of their interfaces (stub links are not configured via link LSAs, see 
+   section 3.3). A router configures an interface when it receives a 
+   link LSA on that interface. The router processes the link LSA, 
+   extracts the IPv6 prefix, and creates an IPv6 address by combining 
+   the prefix with its MAC address (using the procedure detailed in 
+   [3]). This IPv6 address is assigned to the corresponding interface.  
+    
+   A router will invalidate an address formed as a result of processing 
+   a link LSA when: 
+      - The link LSA is timed out by its originator.  
+      - The originating router of that link LSA (i.e. the link's DR) is 
+      deemed 'dead' by the Hello protocol 
+    
+   In the context of this document, to 'invalidate' an address means to 
+   remove its current interface binding. A router invalidating a prefix 
+   must transmit several router advertisements advertising the prefix 
+   with an expired valid lifetime. The prefix will not be moved to the 
+                                     
+ 
+Dimitrelis                                                   [Page 10] 
+                        Router Autoconfiguration 
+                              October 2002 
+ 
+ 
+   deprecated state. Packets arriving with a source or destination 
+   address based on an invalidated prefix will not be forwarded.  
+    
+   The rational behind the immediate invalidation of a prefix is based 
+   on a conservative approach to avoiding routing failures (including 
+   loops). The originator of link-LSA containing prefix Y will time-out 
+   that LSA if it detects a prefix collision involving Y. The trade-off 
+   is between invaliding an address without a period of deprecation, and 
+   attempting to route traffic with invalid routing information. In this 
+   case, a duplicate prefix constitutes the invalid routing information. 
+   It is the current position of this draft that routing based on 
+   inconsistent or invalid routing information should be avoided.  
+    
+   A router must also immediately invalidate a link-LSA if it loses bi-
+   directional communication with a link's designated router. Such a 
+   loss of communication will be detected by the Hello protocol. Despite 
+   becoming unreachable due to a layer 2 partition, the DR will likely 
+   continue to claim the prefix it originally chose for the link. 
+   Continuing to use the original prefix on both subnets is a prefix 
+   collision.  
+    
+   When the DR is deemed dead, the backup designated router (BDR) will 
+   take over, and will choose a new prefix. It will flood a new set of 
+   LSAs: 
+      - A new link LSA to allow routers on the link to configure their 
+      interfaces with the new prefixes 
+      - A new network LSA, announcing the new prefix to the entire OSPF 
+      domain. This LSA also announces the link's designated router 
+      - A new router LSA, referencing the new network LSA. All other 
+      routers on the link will similarly produce a new router LSA which 
+      references the new network LSA.  
+    
+   The old link LSA will remain in the link state database until it 
+   times out. Each on-link router will invalidate their respective 
+   router LSAs that reference the old network LSA.  
+    
+   There are other situations where it makes sense for a DR to 
+   artificially time-out a link-LSA. An example would be timing out of 
+   subnet prefixes when they are based on a global, provider-based 
+   prefix that has expired. So it would be reasonable for a router to 
+   time out a link LSA containing the 2000:0:beef:cafe::/64 prefix when 
+   an AS border router announces that 2000:0:beef::/48 is no longer 
+   available (because the uplink to the ISP has failed, for example).  
+    
+3.3 Stub links 
+    
+   [7] describes stub links as links to which only one OSPF speaker is 
+   attached.  
+                                     
+ 
+Dimitrelis                                                   [Page 11] 
+                        Router Autoconfiguration 
+                              October 2002 
+ 
+ 
+    
+   Routers will potentially have stub links attached to some of their 
+   network interfaces. A router with attached stub links is responsible 
+   for configuring those links with network prefixes (or subnet 
+   addresses), just as Designated Routers are responsible for 
+   configuring transit networks with prefixes. In particular, a router 
+   will need to have synchronized its link state database before it 
+   begins choosing subnet addresses for stub networks. The list of area-
+   wide prefixes from which to create subnet addresses will have built 
+   by processing AS-external LSAs (section 3.5). A router with stub 
+   links must process routing protocol exchanges for prefix collisions 
+   involving the stub links it has allocated prefixes. The constant 
+   monitoring of prefixes in use elsewhere in the network is identical 
+   to the monitoring performed by designated routers that have chosen 
+   prefixes for transit links. A router must change the prefixes it has 
+   assigned to local stub links if a prefix collision is detected.  
+    
+   A router will update its router LSA to include any prefixes assigned 
+   to local stub links (refer to A.4.2, [7]). 
+    
+3.4  Discovering uplinks 
+    
+   A zOSPF router may have an interface connected to a global uplink, 
+   typically a residential ISP that relies on DHCP for address 
+   configuration. An area border router is responsible for injecting 
+   prefix information into the routing domain and advertising a default 
+   route.  
+    
+   3.4.1 Detecting an uplink 
+    
+   This section briefly describes how a router can detect an uplink 
+   interface and obtain a global address and/or prefix. 
+    
+   After forming adjacencies with other zOSPF routers and configuring 
+   any eligible interfaces, a router will attempt to detect an IPv4 
+   uplink by broadcasting DHCP DISCOVER messages over those interfaces 
+   through which there are no zOSPF adjacencies. Links with zOSPF 
+   adjacencies are avoided because the designated router on each link 
+   acts as a DHCP server. If a zOSPF router receives a response from a 
+   DHCP server that is not another zOSPF speaker, it will request an IP 
+   address and configure its uplink interface with that address. DHCP 
+   responses should be filtered based on MAC address - the MAC addresses 
+   of neighboring zOSPF routers will be known, and DHCP responses from 
+   them should be ignored.  
+    
+   A zOSPF router can also attempt to discover a global IPv6 prefix 
+   delegated by an ISP. There are currently several ways to do this, 
+   including the methods described in - [8], [3], and [9]. 
+                                     
+ 
+Dimitrelis                                                   [Page 12] 
+                        Router Autoconfiguration 
+                              October 2002 
+ 
+ 
+    
+   3.4.2 Injecting external routing information 
+    
+   A zOSPF area border router will inject prefix and global reachability 
+   information into a zOSPF routing domain. AS-external LSAs will be 
+   used to advertise a default route, and also a delegated IPv6 prefix. 
+   The default route is advertised using AS-external LSAs as documented 
+   in [2]. 
+    
+   If a zOSPF area border router is allocated an IPv4 address via DHCP, 
+   it will use this address to form a /48 6to4 prefix, and flood an AS-
+   external LSA throughout the area in order to advertise this prefix. 
+   Similarly, if the site is delegated a global /48 prefix, the prefix 
+   will be signaled to other routers within the area with an AS-external 
+   LSA. This usage overloads the semantics of AS-external LSAs from the 
+   point of view of OSPFv3, as (in this instance) they are not 
+   advertising a route, but instead a prefix. The use of AS-external 
+   LSAs to flood site-wide prefix data is distinguished from their use 
+   in propagating routing information by defining a new bit in the 
+   prefix options field. This new bit is the L bit, as shown below.  
+    
+                     0  1  2  3  4  5  6  7 
+                    +--+--+--+--+--+--+--+--+ 
+                    |  |  |  | L| P|MC|LA|NU| 
+                    +--+--+--+--+--+--+--+--+ 
+    
+                  The zOSPF Prefix Options field 
+    
+   When the L bit is set to 1, the address prefix contained in an AS-
+   external LSA is to be interpreted as a site wide prefix that can be 
+   used to create subnet addresses.  
+    
+   If the L bit is set to 0, the address prefix carried within the AS-
+   external LSA will be treated as an address reachable by the 
+   originator of the LSA. The default route will always be advertised 
+   with the L bit set to 0. 
+ 
+3.5 Processing AS-external LSAs 
+    
+   Section 3.4 discusses how an area border router injects AS-external 
+   LSAs into the routing domain. This section discusses additional 
+   processing that applies to AS-external LSAs carrying prefixes with 
+   the 'L' bit set in the prefix options field (refer to section 3.4.2).  
+    
+   The purpose of AS-external LSAs within zOSPF is twofold: 
+      (1) To advertise the reachability of external prefixes. In a 
+      typical zOSPF deployment, only the default route will be 
+      advertised using an AS-external LSA. 
+                                     
+ 
+Dimitrelis                                                   [Page 13] 
+                        Router Autoconfiguration 
+                              October 2002 
+ 
+ 
+       
+      (2) To advertise IPv6 prefixes that are valid within an area.  
+       
+   There may be multiple valid 'global' IPv6 prefixes within an area, 
+   and the same router need not have originated them. An example would 
+   be where one border router with an IPv4 uplink creates a 6to4 address 
+   while another router has a native IPv6 uplink. In this case, each 
+   router would flood a /48 IPv6 prefix and advertise a default route 
+   for IPv6 traffic.  
+    
+   zOSPF routers use prefixes flooded within AS-external LSAs to 
+   determine the set of area-wide prefixes to use when allocating subnet 
+   addresses to attached links. The entries advertising area-wide 
+   prefixes are distinguished by having the 'L' bit set in their prefix 
+   options field. Prefixes having the 'L' bit set in their prefix 
+   options field are only to be used for creating subnet addresses are 
+   not to be used in SPF calculation. 
+ 
+ 
+3.6  Monitoring for subnet address collisions 
+    
+   Routers that have allocated subnet addresses to any of their directly 
+   connected links will need to perform additional processing on Intra-
+   area prefix LSAs in order to detect and resolve prefix collisions. 
+ 
+   Prefix collisions can occur if two routers simultaneously choose the 
+   same prefix for allocation to distinct subnets, or when two networks 
+   merge. All prefixes allocated by routers to their links will be 
+   announced via Intra-area prefix LSAs. The additional processing 
+   related to detecting prefix collisions is as follows:  
+    
+      o A router maintains a conceptual list of the prefixes it has 
+      allocated to its links. This list includes both IPv4 and IPv6 
+      prefixes, and may be an empty list 
+       
+      o When a router receives an Intra-area prefix LSA that it did not 
+      originate, it compares the prefixes contained in the received LSA 
+      with those that it itself has allocated. Any prefixes advertised 
+      by another router that match a prefix claimed by this router are 
+      involved in a collision. 
+    
+   A router that detects any of its subnet addresses to conflict with 
+   addresses claimed by another zOSPF router will discontinue 
+   advertising the contentious prefixes and choose a new subnet 
+   addresses for the affected links. The LSA advertising the problematic 
+   subnet address will be timed out immediately. 
+    
+
+                                     
+ 
+Dimitrelis                                                   [Page 14] 
+                        Router Autoconfiguration 
+                              October 2002 
+ 
+ 
+4. Layer 2 partitions and merges 
+ 
+   One goal of zOSPF is that it is robust to layer 2 merges and splits. 
+   OSPF's Hello protocol will ensure the reliable election of a 
+   designated router and a backup designated router on a link in the 
+   face of layer 2 partitions and merges. This is coupled with the 
+   strategy that a router that has just taken over as a designated 
+   router chooses a new set of prefixes for a link, rather than 
+   continuing to use the old prefixes. This is because it cannot make 
+   any assumptions about why it has become designated router (refer to 
+   section 3.1).  
+ 
+5. Services to hosts 
+    
+   zOSPF routers will be required to provide a DHCP service, primarily 
+   to allow hosts to configure an IPv4 address, netmask, and default 
+   route. The only active DHCP server on a link will be co-located 
+   within the designated router. A future version of this document will 
+   discuss how hosts will be notified of the premature expiration of 
+   their lease due to a subnet being renumbered. A potential approach 
+   would be a broadcast (rather than unicast) DHCP FORCERENEW message. 
+   [10] specifies the unicast DHCP FORCERENEW message. A broadcast 
+   FORCERENEW message may be necessary when a router that is not aware 
+   of existing leases assumed the role of the designated router and must 
+   renumber the subnet. 
+ 
+6. Related Work 
+ 
+   draft-chelius-router-autoconf-00.txt describes a scheme that utilized 
+   OSPFv3 to configure IPv6-only routers.  
+    
+Security Considerations 
+    
+   The send working group has been chartered to produce mechanisms for 
+   securing IPv6 neighbor discovery. These mechanisms could potentially 
+   fit into a zOSPF scheme in the sense that only those zOSPF routers 
+   with the correct credentials will communicate with each other.  
+    
+    
+References 
+                     
+    
+   [1]  Bradner, S., "The Internet Standards Process", RFC2026, October 
+        1996 
+    
+   [2]  Coltun, R., Ferguson, D., Moy, J., RFC2740, "OSPF for IPv6", 
+        December 1999 
+
+                                     
+ 
+Dimitrelis                                                   [Page 15] 
+                        Router Autoconfiguration 
+                              October 2002 
+ 
+ 
+    
+   [3]  Thomson, S., Narten, T., RFC2462, "IPv6 Stateless Address 
+        Autoconfiguration", December 1998 
+    
+   [4]  Hinden, R., Deering, S., RFC2373, "IP Version 6 Addressing 
+        Architecture", July 1998 
+    
+   [5]  Zinin, A., Friedman, B., Roy, A., Nguyen, L., Yeung, D., draft-
+        nguyen-ospf-lls-01, "OSPF Link-local Signalling" (work in 
+        progress), September 2002 
+    
+   [6]  Carpenter, B., Moore, K., RFC3056, "Connection of IPv6 Domains 
+        via IPv4 Clouds", February 2001 
+    
+   [7]   Moy, J., RFC2178, "OSPF Version 2", April 1998 
+    
+   [8]  Troan, O., Droms, R., draft-troan-dhcpv6-opt-prefix-delegation-
+        01, "IPv6 Prefix Options for DHCPv6" (work in progress), May 
+        2002 
+    
+   [9]  Haberman, B., Martin, J., draft-haberman-ipngwg-auto-prefix-02, 
+        "Automatic Prefix Delegation Protocol for Internet Protocol 
+        Version 6" (work in progress), February 2002 
+    
+   [10] Y. T'Joens, C. Hublet, P. De Schrijver, RFC 3203, "DHCP 
+        reconfigure extension", December 2001 
+ 
+    
+    
+Author's Addresses 
+    
+   Arthur Dimitrelis 
+   Motorola Australia 
+   Locked Bag 5028 
+   Botany NSW 1455 
+   Australia 
+   Email: Arthur.Dimitrelis@Motorola.com 
+     
+   Aidan Williams 
+   Motorola Australia 
+   Locked Bag 5028 
+   Botany NSW 1455 
+   Australia 
+   Email: Aidan.Williams@Motorola.com  
+
+
+
+
+                                     
+Expires: April 2003 
+Dimitrelis                                                   [Page 16] 
+

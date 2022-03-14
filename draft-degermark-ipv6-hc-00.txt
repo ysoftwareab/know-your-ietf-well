@@ -1,0 +1,2595 @@
+
+
+
+
+
+
+Network Working Group                                       M. Degermark
+INTERNET-DRAFT                                               B. Nordgren
+Expires August 18, 1996                                          S. Pink
+                                                        Lulea University
+                                                       Telia Research AB
+                                   Swedish Institute of Computer Science
+                                                                  Sweden
+                                                           February 1996
+
+
+                      Header Compression for IPv6
+                    <draft-degermark-ipv6-hc-00.txt>
+
+
+Status of this Memo
+
+   Publication of this document does not imply acceptance by the IPng
+   Area of any ideas expressed within. Comments should be submitted to
+   the mailing list ipng@sunroof.eng.sun.com
+
+   Distribution of this memo is unlimited.
+
+   This document is an Internet-Draft.  Internet-Drafts are working
+   documents of the Internet Engineering Task Force (IETF), its areas,
+   and its working groups.  Note that other groups may also distribute
+   working documents as Internet-Drafts.
+
+   Internet-Drafts are draft documents valid for a maximum of six months
+   and may be updated, replaced, or obsoleted by other documents at any
+   time.  It is inappropriate to use Internet- Drafts as reference
+   material or to cite them other than as ``work in progress.''
+
+   To learn the current status of any Internet-Draft, please check the
+   ``1id-abstracts.txt'' listing contained in the Internet- Drafts
+   Shadow Directories on ftp.is.co.za (Africa), nic.nordu.net (Europe),
+   munnari.oz.au (Pacific Rim), ds.internic.net (US East Coast), or
+   ftp.isi.edu (US West Coast).
+
+Abstract
+
+   This document describes how to compress IPv6 headers over point-to-
+   point links.  The method can be applied to IPv6 base and extension
+   headers, IPv4 headers, TCP and UDP headers, and encapsulated IPv6 and
+   IPv4 headers.
+
+   A typical IPv6 header can be compressed down to 3-5 octets, including
+   a 2 octet transport layer checksum.
+
+
+
+
+Degermark, Nordgren, Pink                                       [Page 1]
+
+
+
+
+INTERNET-DRAFT        Header Compression for IPv6          February 1996
+
+
+Table of Contents
+
+   1.  Introduction..............................................3
+   2.  Terminology...............................................5
+
+   3.  Compression method........................................7
+        3.1.  Lost packets in TCP packet streams.................7
+        3.2.  Lost packets in non-TCP packet streams.............8
+           3.2.1.  Exponential Backoff of Header Refreshes.......9
+           3.2.2.  Periodic Header Refreshes.....................9
+           3.2.3.  Rules for sending Full Headers...............10
+           3.2.4.  Cost of sending Header Refreshes.............11
+
+   4.  Grouping packets into packet streams.....................13
+        4.1.  Guidelines for grouping packets...................13
+
+   5.  Size Issues..............................................16
+        5.1.  Compression identifiers...........................16
+        5.2.  Size of compression state.........................17
+        5.3.  Size of full headers..............................18
+
+   6.  Compressed Header Formats................................19
+
+   7.  Compression of subheaders................................21
+        7.1.  IPv6 Header.......................................23
+        7.2.  IPv6 Extension Headers............................23
+        7.3.  Options...........................................24
+        7.4.  Hop-by-hop Options Header.........................25
+        7.5.  Routing Header....................................26
+        7.6.  Fragment Header...................................28
+        7.7.  Destination Options Header........................30
+        7.8.  No Next Header....................................30
+        7.9.  Authentication Header.............................31
+        7.10. Encapsulating Security Payload Header.............32
+        7.11. UDP Header........................................33
+        7.12. TCP Header........................................34
+        7.13. IPv4 Header.......................................35
+
+   8.  Changing compression identifiers.........................37
+   9.  Rules for dropping or storing packets....................38
+   10. More aggressive compression..............................39
+   11. Demultiplexing...........................................40
+   12. Configuration Parameters.................................41
+   13. Security Considerations..................................43
+   14. Author's Addresses.......................................43
+   15. References...............................................44
+
+
+
+
+
+Degermark, Nordgren, Pink                                       [Page 2]
+
+
+
+
+INTERNET-DRAFT        Header Compression for IPv6          February 1996
+
+
+1.  Introduction
+
+   There are several reasons to do header compression on a low-speed
+   link, header compression can
+
+      *  Improve interactive response time
+
+         For very low-speed links, echoing of characters may take longer
+         than 100-200 ms because of the time required to transmit large
+         headers. 100-200 ms is the maximum time people can tolerate
+         without feeling that the system is sluggish.
+
+      *  Allow using small packets for bulk data with good line
+         efficiency
+
+         This is important when interactive (for example Telnet) and
+         bulk traffic (for example FTP) is mixed because the bulk data
+         should be carried in small packets to decrease the waiting time
+         when a packet with interactive data is caught behind a bulk
+         data packet.
+
+      *  Allow using small packets for delay sensitive low data-rate
+         traffic
+
+         For such applications, for example voice, the time to fill a
+         packet with data is significant if packets are large.  To get
+         low end-to-end delay small packets are preferred.  Without
+         header compression, the smallest possible IPv6/UDP headers (48
+         octets) consume 19.2 kbit/s with a packet rate of 50 packets/s.
+         50 packets/s is equivalent to having 20 ms worth of voice
+         samples in each packet. Tunneling or routing headers, for
+         example to support mobility, will increase the bandwidth
+         consumed by headers by at least 10-20 kbit/s.  This should be
+         compared with the bandwidth required for the actual sound
+         samples, for example 13 kbit/s with GSM encoding.  Header
+         compression can reduce the bandwidth needed for headers
+         significantly, in the example to about 2 kbit/s.
+
+   The mechanisms described here are intended for a point-to-point link.
+   However, care has been taken to allow extensions for multi-access
+   links and multicast.
+
+   Headers that can be compressed include TCP, UDP, IPv4, and IPv6 base
+   and extension headers.  For TCP packets, the mechanisms of Van
+   Jacobson [RFC-1144] are used to recover from loss. For non-TCP
+   packets, an exponential backoff mechanism allows minimal periods of
+   packet discard after loss of a header that changes the compression
+   state.
+
+
+
+Degermark, Nordgren, Pink                                       [Page 3]
+
+
+
+
+INTERNET-DRAFT        Header Compression for IPv6          February 1996
+
+
+   Header compression relies on many fields being constant or rarely
+   changing in consecutive packets belonging to the same packet stream.
+   Fields that do not change between packets need not be transmitted at
+   all.  Fields that change often with small and/or predictable values,
+   e.g., TCP sequence numbers, can be encoded incrementally so that the
+   number of bits needed for these fields decrease significantly.  Only
+   fields that change often and randomly, e.g., checksums or
+   authentication data, need to be transmitted in every header.
+
+   The general principle of header compression is to occasionally send a
+   packet with a full header; subsequent compressed headers contain
+   changes to the full header.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Degermark, Nordgren, Pink                                       [Page 4]
+
+
+
+
+INTERNET-DRAFT        Header Compression for IPv6          February 1996
+
+
+2.  Terminology
+
+   This section explains some terms used in this document.
+
+   Subheader
+
+         An IPv6 base header, an IPv6 extension header, an IPv4 header,
+         a UDP header, or a TCP header.
+
+   Header
+
+         A chain of subheaders.
+
+   Compress
+
+         The act of reducing the size of a header by removing header
+         fields or reducing the size of header fields. This is done in a
+         way such that a decompressor can reconstruct the header if its
+         compression state is identical to the compression state used
+         when compressing the header.
+
+   Decompress
+
+         The act of reconstructing a compressed header.
+
+   Compression identifier (CID)
+
+         A small unique number identifying the compression state that
+         should be used to decompress a compressed header. Carried in
+         full headers and compressed headers.
+
+   Compression state
+
+         The state which the compressor uses to compress a header and
+         the decompressor uses to decompress a header.  The compression
+         state is the uncompressed version of the last header sent
+         (compressor) or received (decompressor) over the link, except
+         for fields in the header which are included "as-is" in
+         compressed headers or can be inferred from e.g., the size of
+         the link-level frame.
+
+         The compression state for a packet stream is associated with a
+         compression identifier.  The compression state for non-TCP
+         packet streams is also associated with a generation.
+
+
+
+
+
+
+
+Degermark, Nordgren, Pink                                       [Page 5]
+
+
+
+
+INTERNET-DRAFT        Header Compression for IPv6          February 1996
+
+
+   Generation
+
+         For non-TCP packet streams, each new version of the compression
+         state for a given CID is associated with a generation: a small
+         number that is incremented whenever the compression state
+         associated with that CID changes. Carried by full and
+         compressed non-TCP headers.
+
+   Packet stream
+
+         A sequence of packets whose headers are similar and share
+         compression state. For example, headers in a TCP packet stream
+         have the same source and final destination address, and the
+         same port numbers in the TCP header.  Similarly, headers in a
+         UDP packet stream have the same source and destination address,
+         and the same port numbers in the UDP header.
+
+   Full header (header refresh)
+
+         An uncompressed header that updates or refreshes the
+         compression state for a packet stream. It carries a CID that
+         will be used to identify the compression state.
+
+         Full headers for non-TCP packet streams also carry the
+         generation of the compression state they update or refresh.
+
+   Regular header
+
+         A normal, uncompressed, header.  Does not carry CID or
+         generation association.
+
+   Incorrect decompression
+
+         When a compressed and then decompressed header is different
+         from the uncompressed header. Usually due to mismatching
+         compression state between the compressor and decompressor or
+         bit errors during transmission of the compressed header.
+
+   Differential coding
+
+         A compression technique where the compressed value of a header
+         field is the difference between the current value of the field
+         and the value of the same field in the previous header
+         belonging to the same packet stream. This technique is used for
+         TCP streams but not for non-TCP streams.
+
+
+
+
+
+
+Degermark, Nordgren, Pink                                       [Page 6]
+
+
+
+
+INTERNET-DRAFT        Header Compression for IPv6          February 1996
+
+
+3.  Compression method
+
+   Much of the header information stays the same over the life-time of a
+   packet stream. For non-TCP packet streams almost all fields of the
+   headers are constant. For TCP many fields are constant and others
+   change with small and predictable values.
+
+   To initiate compression of the headers of a packet stream, a full
+   header carrying a compression identifier, CID, is transmitted over
+   the link.  The compressor and decompressor store most fields of this
+   full header as compression state.  The compression state consists of
+   the fields of the header whose values are constant and thus need not
+   be sent over the link at all, or change little between consecutive
+   headers so that it uses fewer bits to send the difference from the
+   previous value compared to sending the absolute value.
+
+   Any change in fields that are expected to be constant in a packet
+   stream will cause the compressor to send a full header again to
+   update the compression state at the decompressor. As long as the
+   compression state is the same at compressor and decompressor, headers
+   can be decompressed to be exactly as they were before compression.
+   However, if a full header or compressed header is damaged or lost
+   during transmission, the compression state of the decompressor may
+   become obsolete as it is not updated properly. Compressed headers
+   will then be decompressed incorrectly.
+
+   So a header compression scheme needs mechanisms to update the
+   compression state at the decompressor and to detect or avoid
+   incorrect decompression.  Sections 3.1 and 3.2 describe how packet
+   loss is dealt with for TCP and non-TCP packet streams.
+
+   The compression mechanisms in this document assume that packets are
+   not reordered between the compressor and decompressor.  They also
+   assume that the link-layer implementation can provide the length of
+   packets.
+
+3.1.  Lost packets in TCP packet streams
+
+   Since TCP headers are compressed using the difference from the
+   previous TCP header, loss of a packet with a compressed header or a
+   full header will cause subsequent compressed headers to be
+   decompressed incorrectly because the compression state used for
+   decompression was not incremented properly.
+
+   Loss of a compressed TCP header will cause the TCP sequence numbers
+   of subsequently decompressed TCP headers to be off by k, where k is
+   the number of payload octets in the lost packet.  Such incorrectly
+   decompressed TCP headers will be discarded by the TCP receiver as the
+
+
+
+Degermark, Nordgren, Pink                                       [Page 7]
+
+
+
+
+INTERNET-DRAFT        Header Compression for IPv6          February 1996
+
+
+   TCP checksum reliably catches "off-by-k" errors in the sequence
+   numbers for plausible k.
+
+   TCP's repair mechanisms will eventually retransmit the discarded
+   segment and the compressor peeks into the TCP headers to detect when
+   TCP retransmits.  When this happens, the compressor sends a full
+   header on the assumption that the retransmission was due to
+   mismatching compression state at the decompressor.  [RFC-1144] has a
+   good explanation of this mechanism.
+
+3.2.  Lost packets in UDP and other non-TCP packet streams
+
+   Incorrectly decompressed headers of UDP packets and other non-TCP
+   packets are not so well-protected by checksums as TCP packets because
+   differential coding is not used and there are no sequence numbers.
+   The UDP checksum only covers payload, UDP header, and pseudo header.
+   The pseudo header includes the source and destination addresses, the
+   transport protocol type and the length of the transport packet.
+   Except for those fields, large parts of the IPv6 header are not
+   covered by the UDP checksum.  Moreover, other non-TCP headers lack
+   checksums altogether, for example fragments.
+
+   In order to safely avoid incorrect decompression of non-TCP headers,
+   each version of the compression state for non-TCP packet streams is
+   identified by a generation, a small number that is carried by the
+   full headers that establish and refresh the compression state.
+   Compressed headers carry the generation value of the compression
+   state that were used to compress them.  When a decompressor sees that
+   a compressed header carries a generation value other than the
+   generation of its compression state for that packet stream, the
+   compression state is not up to date and the packet must be discarded
+   or stored until a full header establishes correct compression state.
+
+   Differential coding is not used for non-TCP streams, so compressed
+   non-TCP headers do not change the compression state.  Thus, loss of a
+   compressed header does not invalidate subsequent packets with
+   compressed headers. Moreover, the generation field changes only when
+   the compression state of a full header is different from the
+   compression state of the previous full header. This means that losing
+   a full header will make the compression state of the decompressor
+   obsolete only when the full header would actually have changed the
+   compression state.
+
+   The generation field is one octet long so the generation value
+   repeats itself after 256 changes to the compression state. To avoid
+   incorrect decompression after error bursts or other temporary
+   disruptions, the compressor must not reuse the same generation value
+   after a shorter time than MIN_WRAP seconds. A decompressor which has
+
+
+
+Degermark, Nordgren, Pink                                       [Page 8]
+
+
+
+
+INTERNET-DRAFT        Header Compression for IPv6          February 1996
+
+
+   been disconnected MIN_WRAP seconds or more must wait for the next
+   full header before decompressing.
+
+   Instead of reusing a generation value too soon, a compressor may
+   switch to another CID or else send regular headers until MIN_WRAP
+   seconds have passed.  The value of MIN_WRAP is found in section 12.
+
+3.2.1.  Exponential Backoff of Header Refreshes
+
+   To allow the decompressor to recover quickly from loss of a full
+   header that would have changed the compression state, full headers
+   are sent periodically with an exponentially increasing period after a
+   change in the compression state. This technique avoids an exchange of
+   messages between compressor and decompressor used by other
+   compression schemes, such as in [RFC-1553]. Such exchanges can be
+   costly for wireless mobiles as more power is consumed by the
+   transmitter and delay can be introduced by repeated switching between
+   sending and receiving.  Moreover, techniques that require an exchange
+   of messages cannot be used over simplex links, such as direct-
+   broadcast satellite channels or cable TV systems.
+
+     |.|..|....|........|................|..............................
+     ^
+     Change   Sent packets: | with full header, . with compressed header
+
+   The picture shows how packets are sent after change.  The compressor
+   keeps a variable for each non-TCP packet stream, F_PERIOD, that keeps
+   track of how many compressed headers may be sent between full
+   headers.  When the headers of a non-TCP packet stream change so that
+   its compression state changes, a full header is sent and F_PERIOD is
+   set to one. After sending F_PERIOD compressed headers a full header
+   is sent, and F_PERIOD is doubled each time a full header is sent.
+
+3.2.2.  Periodic Header Refreshes
+
+   To avoid losing too many packets if a receiver has lost its
+   compression state, there is an upper limit, F_MAX_PERIOD, on the
+   number of non-TCP packets with compressed headers that may be sent
+   between header refreshes. If a packet is to be sent and F_MAX_PERIOD
+   compressed headers have been sent since the last full header for this
+   packet stream was sent, a full header must be sent.
+
+   To avoid long periods of disconnection for low data rate packet
+   streams, there is also an upper bound, F_MAX_TIME, on the time
+   between full headers in a non-TCP packet stream. If a packet is to be
+   sent and more than F_MAX_TIME seconds have passed since the last full
+   header was sent for this packet stream, a full header must be sent.
+   The values of F_MAX_PERIOD and F_MAX_TIME are found in section 12.
+
+
+
+Degermark, Nordgren, Pink                                       [Page 9]
+
+
+
+
+INTERNET-DRAFT        Header Compression for IPv6          February 1996
+
+
+3.2.3. Rules for sending Full Headers
+
+   The following pseudo code can be used by the compressor to determine
+   when to send a full header for a non-TCP packet stream.  The code
+   maintains two variables:
+
+      C_NUM       a count of the number of compressed headers sent
+                  since the last full header was sent
+
+      F_LAST      the time of sending the last full header
+
+   and uses the functions
+
+      current_time()       return the current time
+
+      min(a,b)             return the smallest of a and b
+
+   the procedures send_full_header() and send_compressed_header()
+   do the obvious thing.
+
+      if ( <this header changes the compression state> )
+
+          C_NUM := 0;
+          F_LAST := current_time();
+          F_PERIOD := 1;
+          send_full_header();           -- generation value incremented
+
+      elseif ( C_NUM >= F_PERIOD )
+
+          C_NUM := 0;
+          F_LAST := current_time();
+          F_PERIOD := min(2 * F_PERIOD, F_MAX_PERIOD);
+          send_full_header();           -- generation value unchanged
+
+      elseif ( current_time() > F_LAST + F_MAX_TIME )
+
+          C_NUM := 0;
+          F_LAST := current_time();
+          send_full_header();           -- generation value unchanged
+
+      else
+
+          C_NUM := C_NUM + 1
+          send_compressed_header();     -- with current generation value
+
+      endif
+
+
+
+
+
+Degermark, Nordgren, Pink                                      [Page 10]
+
+
+
+
+INTERNET-DRAFT        Header Compression for IPv6          February 1996
+
+
+3.2.4.  Cost of sending Header Refreshes
+
+   If every f'th packet carries a full header, H is the size of a full
+   header, and C is the size of a compressed header, the average header
+   size is
+
+                 (H-C)/f + C
+
+   For f > 1, the average header size is (H-C)/f larger than a
+   compressed header.
+
+   In a diagram where the average header size is plotted for various f
+   values, there is a distinct knee in the curve, i.e., there is a limit
+   beyond which further increasing f gives diminishing returns.
+   F_MAX_PERIOD should be chosen to be a frequency well to the right of
+   the knee of the curve.  For typical sizes of H and C, say 48 octets
+   for the full header (IPv6/UDP) and 4 octets for the compressed
+   header, setting F_MAX_PERIOD > 44 means that full headers will
+   contribute less than a byte to the average header size. With a four-
+   address routing header, F_MAX_PERIOD > 115 will have the same effect.
+
+   The default F_MAX_PERIOD value of 256 (section 12) puts the full
+   header frequency well to the right of the knee and means that full
+   headers will typically contribute considerably less than a byte to
+   the average header size.  For H = 48 and C = 4, full headers
+   contribute about 1.4 bits to the average header size after reaching
+   the steady-state header refresh frequency determined by the default
+   F_MAX_PERIOD. 1.4 bits is a very small overhead.
+
+   After a change in compression state, the exponential backoff scheme
+   will initially send full headers frequently.  The default
+   F_MAX_PERIOD will be reached after nine full headers and 255
+   compressed headers have been sent.  This is equivalent to a little
+   over 5 seconds for a typical voice stream with 20 ms worth of voice
+   samples per packet.
+
+   During the whole backoff period, full headers contribute 1.5 octets
+   to the average header size, when H = 48 and C = 4.  For 20 ms voice
+   samples, it takes less than 1.3 seconds until full headers contribute
+   less than one octet to the average header size, and during these
+   initial 1.3 seconds full headers add less than 4 octets to the
+   average header size.  The cost of the exponential backoff is not
+   great and as the headers of non-TCP packet streams are expected to
+   change seldomly, it will be amortized over a long time.
+
+
+
+
+
+
+
+Degermark, Nordgren, Pink                                      [Page 11]
+
+
+
+
+INTERNET-DRAFT        Header Compression for IPv6          February 1996
+
+
+   The cost of header refreshes in terms of bandwidth are higher than
+   similar costs for hard state schemes like [RFC-1553] where full
+   headers must be acknowledged by the decompressor before compressed
+   headers may be sent. Such schemes typically send one full header plus
+   a few control messages when the compression state changes.  Hard
+   state schemes require more types of protocol messages and an exchange
+   of messages is necessary.  Hard state schemes also need to deal
+   explicitly with various error conditions that soft state handles
+   automatically, for instance the case of one party disappearing
+   unexpectedly, a common situation on wireless links where mobiles may
+   go out of range of the base station.
+
+   The major advantage of our soft state scheme is that no handshakes
+   are needed between compressor and decompressor, so the scheme can be
+   used over simplex links.  The costs in terms of bandwidth are higher
+   than for hard state schemes, but we feel that the simplicity of the
+   decompressor, the simplicity of the protocol, and the lack of
+   handshakes between compressor and decompressor justifies this small
+   cost. Moreover, soft state schemes are more easily extended to
+   multi-access links and multicast.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Degermark, Nordgren, Pink                                      [Page 12]
+
+
+
+
+INTERNET-DRAFT        Header Compression for IPv6          February 1996
+
+
+4.  Grouping packets into packet streams
+
+   This section explains how packets may be grouped together into packet
+   streams for compression.
+
+   To achieve the best compression rates, packets should be grouped
+   together such that packets in the same packet stream have similar
+   headers. If this grouping fails, thrashing may occur as the
+   compression algorithm can rarely utilize the existing compression
+   state for the packet stream and full headers must be sent frequently.
+
+   Grouping is done by the compressor. A compressor may use whatever
+   criterion it finds appropriate to group packets into packet streams.
+   To determine what packet stream a packet belongs to, a compressor
+   might
+
+   a) examine the compressible chain of subheaders (see section 7),
+
+   b) examine the contents of an upper layer protocol header that
+      follows the compressible chain of subheaders, for example ICMP
+      headers, DVMRP headers, or tunneled IPX headers,
+
+   c) use information obtained from a resource manager, for example if a
+      resource manager requests compression for a particular packet
+      stream and provides a way to identify packets belonging to that
+      packet stream,
+
+   d) use any other relevant information, for example recent traffic
+      patterns.
+
+   A compressor is also free not to group packets into packet streams
+   for compression, letting some packets keep their regular headers and
+   passing them through unmodified.
+
+   As long as the rules for when to send full headers for a packet
+   stream are followed and the subheaders are compressed as specified in
+   this document, the decompressor is able to reconstruct a compressed
+   header correctly regardless of how packets are grouped into packet
+   streams.
+
+4.1  Guidelines for grouping packets
+
+   We offer the following quidelines for how packets may be grouped into
+   packet streams. Four kinds of packet streams are recognized in these
+   guidelines, packets that do not match any of them are not compressed.
+
+
+
+
+
+
+Degermark, Nordgren, Pink                                      [Page 13]
+
+
+
+
+INTERNET-DRAFT        Header Compression for IPv6          February 1996
+
+
+   Flow Label non-zero
+
+         When the Flow Label is non-zero, only the Flow Label and Source
+         Address need to be examined to determine the packet stream of a
+         packet. However, fragments and unfragmented packets are
+         separated into different packet streams even in this case.
+
+   Transport layer port numbers visible
+
+         When the Flow Label is zero, the transport layer's notion of
+         stream is used. For UDP and TCP packets, source and final
+         destination addresses plus transport protocol type plus port
+         numbers are used to identify the packet stream of the packet.
+
+   Fragmented packets
+
+         For packet fragments port numbers may not be available. They
+         might be in another packet, and thus the rules that guarantee a
+         unique Identification field are used to identify the packet
+         stream of a fragmented packet.  Note that the Identification
+         field itself is not used to identify the packet stream. If it
+         was, the first fragment of a new packet would cause an
+         expontential backoff.
+
+   Encrypted packets
+
+         For encrypted packets, port numbers may not be available, and
+         even if they are, it is unwise to utilize them to identify
+         packet streams. If port numbers were used to identify packet
+         streams, CIDs would disclose traffic patterns and may defeat
+         the purpose of the encryption. For encrypted packets, defining
+         fields are the source address, final destination address, and
+         the Security Payload Identification, SPI, of the ESP Header.
+         All of these are in clear text.
+
+   When IP packets are tunneled they are encapsulated with an additional
+   IP header at the tunnel entry point and then sent to the tunnel
+   endpoint. To group such packets into packet streams, the inner
+   headers should also be examined to determine the packet stream.  If
+   this is not done, full headers will be sent each time the headers of
+   the inner IP packet changes.  So when a packet is tunneled, the
+   identifying fields of the inner subheaders should be considered in
+   addition to the identifying fields of the initial IP header.
+
+   We stress that these guidlines are only educated guesses, when IPv6
+   is widely deployed and IPv6 traffic can be analyzed, we might find
+   that other grouping algorithms perform better.
+
+
+
+
+Degermark, Nordgren, Pink                                      [Page 14]
+
+
+
+
+INTERNET-DRAFT        Header Compression for IPv6          February 1996
+
+
+   The above reasoning results in the following header fields that
+   define packet streams for compression
+
+   0. IPv4 addresses
+        When IPv4 headers are present, their source and destination
+        addresses are defining fields of the packet stream.
+
+   1. IPv6 Flows - the Flow Label field is non-zero.
+
+        Defining fields:
+
+             Flow Label (non-zero).  Source Address.  (Fragmented pack-
+             ets are grouped separately.)
+
+   2. IPv6 Non-flows - the Flow Label field is zero.
+
+        case a:  Transport layer header visible
+
+             Defining Fields:
+
+                  Flow Label (zero).  Source Address.  final Destination
+                  Address (possibly in Routing Header).  Transport Pro-
+                  tocol Type (in the subheader immediately preceding the
+                  Transport header; Next Header field if that is an IPv6
+                  base or extension header,  or Protocol field if it is
+                  an IPv4 header).  Transport stream identification (TCP
+                  or UDP port numbers).
+
+        case b: Fragmented packets
+
+             Defining Fields:
+
+                  Flow Label (zero).  Source Address.  final Destination
+                  Address (possibly in Routing Header).
+
+        case c: Encrypted packets
+
+             Defining Fields:
+
+                  Flow Label (zero).  Source Address.  final Destination
+                  Address (possibly in Routing Header).  Security Pay-
+                  load Identifier, SPI, (in ESP Header).
+
+   NOTE: Several IP headers may occur in a chain of subheaders.  In this
+   case the defining fields of all subheaders are considered when iden-
+   tifying the packet stream.
+
+   Detailed grouping hints are also found in section 7.
+
+
+
+Degermark, Nordgren, Pink                                      [Page 15]
+
+
+
+
+INTERNET-DRAFT        Header Compression for IPv6          February 1996
+
+
+5.  Size Issues
+
+5.1.  Compression Identifiers
+
+   Compression identifiers can be 4, 8 or 24 bits long.  Their size is
+   not relevant for finding the compression state, a 4-bit CID with
+   value two, 0010, and an 8-bit CID with value two, 00000010, are
+   equivalent.
+
+   The CID spaces for TCP and non-TCP are separate, so a TCP CID and a
+   non-TCP CID never identify the same compression state, even if they
+   have the same value.  This doubles the available CID space while
+   using the same number of bits for CIDs.  It is always possible to
+   tell whether a full or compressed header is for a TCP or non-TCP
+   packet, so no mixups can occur.
+
+   Non-TCP compressed headers encode the size of the CID using two bits
+   in the first byte of the compressed header. The 4-bit CID allows a
+   minimum compressed header size of 2 octets for non-TCP packets, the
+   size bits and the CID fit in the first octet and the generation value
+   uses the second octet. A compressor should use 4-bit CIDs for packet
+   streams with the highest packet frequencies to achieve the best
+   compression rates.
+
+   There are no bits available to encode the CID size in the first octet
+   of the compressed TCP header, so for TCP the only available CID size
+   is 8 bits.  Using a 4-bit CID would not reduce the size of the
+   compressed TCP header, and 8 bits is probably sufficient as TCP con-
+   nections are always point-to-point.
+
+   The 24 bit CID size is probably not needed for point-to-point links;
+   it is intended for use on multi-access links where a larger CID space
+   may be needed for efficient selection of CIDs for multicast packet
+   streams.
+
+   The major difficulty with multicast over multi-access links is that
+   several compressors share the CID space of a decompressor.  CIDs can
+   no longer be selected independently by the compressor as collisions
+   may occur.  This problem may be resolved by letting the decompressors
+   have a separate CID space for each compressor.  Having separate CID
+   spaces requires that decompressors can identify which compressor sent
+   the compressed packet, perhaps by utilizing link-layer information as
+   to who sent the link layer frame.  If such information is not avail-
+   able, all compressors on the multi-access link may be enumerated,
+   automatically or otherwise, and supply their number as part of the
+   CID. This method requires a large CID space.
+
+
+
+
+
+Degermark, Nordgren, Pink                                      [Page 16]
+
+
+
+
+INTERNET-DRAFT        Header Compression for IPv6          February 1996
+
+
+5.2.  Size of Compression State
+
+   The size of the compression state should be limited to simplify
+   implementation of compressor and decompressor, and put a limit on
+   their memory requirements.  However, there is no upper limit on the
+   size of an IPv6 header as the chain of extension headers can be arbi-
+   trarily long.  This is a problem as the compression state is essen-
+   tially a stored header.
+
+   The configurable parameter MAX_HEADER (see section 12) represents the
+   maximum size of the compression state, expressed as the maximum sized
+   header that can be stored as compression state.  When an IPv6 header
+   is larger than MAX_HEADER, only part of it is stored as compression
+   state.  An implementation must not compress more than the initial
+   MAX_HEADER octets of a header.  An implementation must not partially
+   compress a subheader.  Thus, the part of the header that is stored as
+   compression state and compressed is the longest initial sequence of
+   entire subheaders that is not larger than MAX_HEADER.
+
+         NOTE: We are not totally happy with this solution since most of
+         the [MAX_HEADER * (size of CID spaces)] sized memory is wasted
+         if headers are small.  We are investigating other solutions to
+         the problem of specifying tight memory requirements while
+         allowing correct decompression and a low number of packet dis-
+         cards.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Degermark, Nordgren, Pink                                      [Page 17]
+
+
+
+
+INTERNET-DRAFT        Header Compression for IPv6          February 1996
+
+
+5.3.  Size of full headers
+
+   It is desirable to avoid increasing the size of packets with full
+   headers beyond their original size, as their size may be optimized
+   for the MTU of the link. Since we assume that the link layer imple-
+   mentation provides the length of packets, we can use the length
+   fields in a full header to pass the values of the CID and the genera-
+   tion to the decompressor.
+
+   This requires that the link-layer must not add padding to the pay-
+   load, at least, not padding that can be delivered to the destination
+   link user.
+
+   The generation requires one octet and the CID may require up to 3
+   octets.  Length fields of 2 octets occur in the IPv6 Base Header, the
+   IPv4 header, and the UDP header.
+
+   A full TCP header will thus have at least 2 octets available in the
+   IPv6 base header to pass the 8 bit CID, which is sufficient.  [RFC-
+   1144] uses the 8 bit Protocol field of the IPv4 header to pass the
+   CID. We cannot use the corresponding method for IPv6 as the sequence
+   of extension headers is not fixed and CID values are not disjoint
+   from the legal values of Next Header fields.
+
+   An IPv6/UDP or IPv4/UDP packet will have 4 octets available to pass
+   the generation and the CID, so all CID sizes may be used.
+
+   Fragmented or encrypted packet streams may have only 2 octets avail-
+   able to pass the generation and CID, thus 4 bit and 8 bit CIDs may be
+   the only CID sizes that can be used for those packet streams.
+
+   When IPv6/IPv4 or IPv4/IPv6 tunneling is used, there will be at least
+   4 octets available, and all CID sizes may be used.
+
+   The generation value is passed in the higher order octet of the first
+   length field in the full header. When only one length field is avail-
+   able, the 4 bit or 8 bit CID is passed in the low order octet.  When
+   two length fields are available, the lowest two octets of the CID are
+   passed in the second length field and the low order octet of the
+   first length field carries the highest octet of the CID.
+
+
+
+
+
+
+
+
+
+
+
+Degermark, Nordgren, Pink                                      [Page 18]
+
+
+
+
+INTERNET-DRAFT        Header Compression for IPv6          February 1996
+
+
+6.  Compressed Header Formats
+
+   a) Compressed TCP header format (same as [RFC 1144]):
+
+         +-+-+-+-+-+-+-+-+- - - - - - - -
+         | |C I P S A W U|      CID      |
+         +-+-+-+-+-+-+-+-+- - - - - - - -
+
+      Used in the same way as in [RFC-1144], regardless of whether TCP
+      segments are carried by IPv6 or IPv4. The compression state asso-
+      ciated with the CID keeps track of the IP version. Note that the
+      CID is present only if the C flag is set, if not the previous TCP
+      CID is used.  See section 10.
+
+      The I flag is zero unless an encapsulating or encapsulated IPv4
+      header is present as there is no Identification field in the IPv6
+      header.  The CID size for TCP packet streams is always 8 bits.
+
+      The initial flag byte is followed by an 8-bit CID if the C flag is
+      set, after which the DELTA and RANDOM fields follow in the same
+      order as they occur in the original uncompressed header.  If the I
+      flag is set, the IPv4 Identifier value is placed at the position
+      that corresponds to the place of the IPv4 subheader in the
+      uncompressed header.  The TCP Checksum and the optional values
+      associated with the SAWU flags are placed in the order prescribed
+      by [RFC-1144] at the position corresponding to the place of the
+      TCP subheader in the original uncompressed header.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Degermark, Nordgren, Pink                                      [Page 19]
+
+
+
+
+INTERNET-DRAFT        Header Compression for IPv6          February 1996
+
+
+   b) Compressed non-TCP header, 4 bit CID:
+
+       +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+       |   |0 1|  CID  |   Generation  |
+       +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+
+   c) Compressed non-TCP header, 8 bit CID:
+
+       +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+       |   |1 0|  Res  |      CID      |  Generation   |
+       +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+
+   d) Compressed non-TCP header, 24 bit CID:
+
+       +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+       |   |1 1|  Res  |                      CID                      |
+       +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+       |  Generation   |
+       +-+-+-+-+-+-+-+-+
+
+   The Res field of formats c) and d) is not used and is initialized to
+   zero by the compressor and ignored by the decompressor.
+
+   Compressed non-TCP headers are followed by relevant RANDOM fields
+   (see section 7) placed in the same order as they occur in the origi-
+   nal uncompressed header, followed by the payload.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Degermark, Nordgren, Pink                                      [Page 20]
+
+
+
+
+INTERNET-DRAFT        Header Compression for IPv6          February 1996
+
+
+7.  Compression of subheaders
+
+   This section gives rules for how the compressible chain of subheaders
+   is compressed.  Subheaders that may be compressed include IPv6 base
+   and extension headers, TCP headers, UDP headers, and IPv4 headers.
+   The compressible chain of subheaders extends from the beginning of
+   the header
+
+   a) up to but not including the first header that is not an IPv4
+      header, an IPv6 base or extension header, a TCP header, or a UDP
+      header, or
+
+   b) up to and including the first TCP header, UDP header, Fragment
+      Header, Encapsulating Security Payload Header, or IPv4 header for
+      a fragment,
+
+   whichever gives the shorter chain. For example, rules a) and b) both
+   fit a chain of subheaders that contain a Fragment Header and ends at
+   a tunneled IPX packet. Since rule b) gives a shorter chain, the
+   compressible chain of subheaders stops at the Fragment Header.
+
+   The following subsections are a systematic classification of how all
+   fields in subheaders are expected to change.
+
+   NOCHANGE    The field is not expected to change. Any change means
+               that a full header must be sent to update the compression
+               state.
+
+   DELTA       The field may change often but usually the difference
+               from the field in the previous header is small, so that
+               it is cheaper to send the change from the previous value
+               rather than the current value.  This type of compression
+               is not used for non-TCP packet streams.
+
+   RANDOM      The field should be included "as-is" in compressed
+               headers, usually because it changes unpredictably.
+
+   INFERRED    The field contains a value that can be inferred from
+               other values, for example the size of the frame carrying
+               the packet, and thus need not be included in the
+               compressed header.
+
+
+
+
+
+
+
+
+
+
+Degermark, Nordgren, Pink                                      [Page 21]
+
+
+
+
+INTERNET-DRAFT        Header Compression for IPv6          February 1996
+
+
+   The classification implies how a compressed header is constructed. No
+   field that is NOCHANGE or INFERRED is present in a compressed header.
+   A compressor obtains the values of NOCHANGE fields from the compres-
+   sion state identified by the compression identifier, and obtains the
+   values of INFERRED fields from the link-layer implementation, e.g.,
+   from the size of the link-layer frame, or from other fields, e.g., by
+   recalculating the IPv4 header checksum.  DELTA fields are encoded as
+   the difference to the value in the previous packet in the same packet
+   stream, the decompressor adds the value in the compressed header to
+   the value in its compression state to obtain the proper value.  RAN-
+   DOM fields are sent "as-is" in the compressed header.  DELTA and RAN-
+   DOM fields occur in the same order in the compressed header as they
+   occur in the full header.
+
+   There is currently little experience with actual IPv6 traffic, so
+   this classification may change as IPv6 traffic can be observed.
+
+   Fields that may be used to identify what packet stream a packet
+   belongs to according to section 4.1 are marked with the word DEF. To
+   a compressor using the guidelines from section 4.1, any difference in
+   corresponding DEF fields between two packets implies that the packets
+   belong to different packet streams. Moreover, if a DEF field is
+   present in one packet but not in another, the packets belong to dif-
+   ferent packet streams.  The words DEF IFZERO means that the field is
+   DEF if the closest preceding IP header is an IPv4 header or an IPv6
+   header with a zero Flow Label.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Degermark, Nordgren, Pink                                      [Page 22]
+
+
+
+
+INTERNET-DRAFT        Header Compression for IPv6          February 1996
+
+
+7.1.  IPv6 Header [IPv6, section 3]
+
+      +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+      |Version| Prio. |                   Flow Label                  |
+      +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+      |         Payload Length        |  Next Header  |   Hop Limit   |
+      +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+      |                                                               |
+      +                                                               +
+      |                                                               |
+      +                         Source Address                        +
+      |                                                               |
+      +                                                               +
+      |                                                               |
+      +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+      |                                                               |
+      +                                                               +
+      |                                                               |
+      +                      Destination Address                      +
+      |                                                               |
+      +                                                               +
+      |                                                               |
+      +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+
+         Version                   NOCHANGE (DEF)
+         Prio                      NOCHANGE
+         Flow Label                NOCHANGE (DEF)
+         Payload Length            INFERRED
+         Next Header               NOCHANGE
+         Hop Limit                 NOCHANGE
+         Source Address            NOCHANGE (DEF)
+         Destination Address       NOCHANGE (DEF, if Flow Label is zero
+                                             and a corresponding Routing
+                                             Header is exhausted)
+
+   This classification implies that the whole IPv6 base header can be
+   compressed away.
+
+7.2.  IPv6 Extension Headers [IPv6, section 4]
+
+   What extension headers are present and the relative order of them is
+   not expected to change in a packet stream.  Whenever there is a
+   change, a full packet header must be sent.  All Next Header fields in
+   IPv6 base header and IPv6 extension headers are NOCHANGE.
+
+
+
+
+
+
+
+Degermark, Nordgren, Pink                                      [Page 23]
+
+
+
+
+INTERNET-DRAFT        Header Compression for IPv6          February 1996
+
+
+7.3.  Options [IPv6, section 4.2]
+
+   The contents of Hop-by-hop Options and Destination Options extension
+   headers are encoded with TLV "options":
+
+         +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+- - - - - - - - -
+         |  Option Type  |  Opt Data Len |  Option Data
+         +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+- - - - - - - - -
+
+   Option Type and Opt Data Len fields are assumed to be fixed for a
+   given packet stream, so they are classified as NOCHANGE.  The Option
+   data is RANDOM unless specified otherwise below.
+
+   Padding
+
+      Pad1 option
+
+         +-+-+-+-+-+-+-+-+
+         |       0       |
+         +-+-+-+-+-+-+-+-+
+
+         Entire option is NOCHANGE.
+
+      PadN option
+
+         +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+- - - - - - - - -
+         |       1       |  Opt Data Len |  Option Data
+         +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+- - - - - - - - -
+
+         All fields are NOCHANGE.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Degermark, Nordgren, Pink                                      [Page 24]
+
+
+
+
+INTERNET-DRAFT        Header Compression for IPv6          February 1996
+
+
+7.4.  Hop-by-Hop Options Header [IPv6, section 4.3]
+
+
+      +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+      |  Next Header  |  Hdr Ext Len  |                               |
+      +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+                               +
+      |                                                               |
+      .                                                               .
+      .                            Options                            .
+      .                                                               .
+      |                                                               |
+      +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+
+      Next Header          NOCHANGE
+      Hdr Ext Len          NOCHANGE
+
+      Options              TLV coded values and padding.
+                           Classified according to 7.3 above, unless
+                           being a Jumbo Payload option (see below).
+
+   Jumbo Payload option
+
+                                      +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+                                      |      194      |Opt Data Len=4 |
+      +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+      |                     Jumbo Payload Length                      |
+      +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+
+      First two fields are NOCHANGE and Jumbo Payload Length INFERRED.
+      (frame length must be supplied by link layer implementation).
+
+         NOTE: It is silly to compress the headers of a packet carrying
+         a Jumbo Payload Option since the relative header overhead is
+         negligible. Moreover, it is questionable if any packet ever
+         sent over a low-speed link will carry this option!
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Degermark, Nordgren, Pink                                      [Page 25]
+
+
+
+
+INTERNET-DRAFT        Header Compression for IPv6          February 1996
+
+
+7.5.  Routing Header [IPv6, section 4.4]
+
+      +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+      |  Next Header  |  Hdr Ext Len  |  Routing Type | Segments Left |
+      +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+      |                                                               |
+      .                                                               .
+      .                       type-specific data                      .
+      .                                                               .
+      |                                                               |
+      +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+
+   If the Routing Type is not recognized, it is impossible to determine
+   the final Destination Address unless the Segments Left field has the
+   value zero, in which case the Destination Address is the final Desti-
+   nation Address. For unknown routing types, all fields of the Routing
+   Header are NOCHANGE.
+
+   If the Flow Label is zero and the Segments Left field is not zero,
+   the packet stream can be identified only when the Routing Type is 0,
+   the only Routing Type currently defined.
+
+   The fields of the Type 0 Routing Header are classified as follows:
+
+      +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+      |  Next Header  |  Hdr Ext Len  | Routing Type=0| Segments Left |
+      +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+      |   Reserved    |             Strict/Loose Bit Mask             |
+      +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+      |                                                               |
+      +                                                               +
+      |                                                               |
+      +                           Address[1]                          +
+      |                                                               |
+      +                                                               +
+      |                                                               |
+      +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+      |                                                               |
+      +                                                               +
+      |                                                               |
+      +                           Address[2]                          +
+      |                                                               |
+      +                                                               +
+      |                                                               |
+      +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+      .                               .                               .
+      .                               .                               .
+      .                               .                               .
+
+
+
+Degermark, Nordgren, Pink                                      [Page 26]
+
+
+
+
+INTERNET-DRAFT        Header Compression for IPv6          February 1996
+
+
+      +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+      |                                                               |
+      +                                                               +
+      |                                                               |
+      +                           Address[n]                          +
+      |                                                               |
+      +                                                               +
+      |                                                               |
+      +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+
+      Next Header          NOCHANGE
+      Routing Type         NOCHANGE
+      Hdr Ext Len          NOCHANGE
+      Segments Left        NOCHANGE
+
+      Reserved             NOCHANGE
+
+      Strict/Loose Bit Mask
+                           NOCHANGE
+
+      Address[1..n]        NOCHANGE
+                             (Address[n] may be the final Destination
+                              address. It is DEF IFZERO when
+                              Segments Left > 0 )
+
+   This classification allows Routing Headers of type 0 to be compressed
+   away completely. This is a big win as the maximum size of the Routing
+   Header is 392 octets.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Degermark, Nordgren, Pink                                      [Page 27]
+
+
+
+
+INTERNET-DRAFT        Header Compression for IPv6          February 1996
+
+
+7.6.  Fragment Header [IPv6, section 4.5]
+
+   The first fragment of a packet has Fragment Offset = 0 and the chain
+   of subheaders extends beyond its Fragment Header. If a fragment is
+   not the first (Fragment Offset not 0), there are no subsequent sub-
+   headers (unless the chain of subheaders in the first fragment didn't
+   fit entirely in the first fragment).
+
+   Since packets may be reordered before reaching the compression point,
+   and some fragments may follow other routes through the network, a
+   compressor cannot rely on seeing the first fragment before other
+   fragments. This implies that information in subheaders following the
+   Fragment Header of the first fragment cannot be examined to determine
+   the proper packet stream for other fragments.
+
+   It is possible to design compression schemes that can compress sub-
+   headers after the Fragment Header, at least in the first fragment,
+   but to avoid complicating the rules for sending full headers and the
+   rules for compression and decompression, the chain of subheaders that
+   follow a Fragment Header must not be compressed.
+
+   The fields of the Fragment Header are classified as follows.
+
+      +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+      |  Next Header  |   Reserved    |      Fragment Offset    |Res|M|
+      +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+      |                         Identification                        |
+      +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+
+      Next Header          NOCHANGE
+      Reserved             NOCHANGE
+      Res                  RANDOM
+      M flag               RANDOM
+      Fragment Offset      RANDOM
+      Identification       RANDOM   (it is never compressed away)
+
+   This classification implies that a Fragment Header is compressed down
+   to 6 octets. The minimum IPv6 MTU is 576 octets so most fragments
+   will be at least 576 octets. Since the 6 octet overhead of the
+   compressed fragment header is amortized over a fairly large packet,
+   the additional complexity of more sophisticated compression schemes
+   is not justifiable.
+
+         NOTE: The Identification field is RANDOM instead of NOCHANGE to
+         avoid an exponential backoff per packet.
+
+
+
+
+
+
+Degermark, Nordgren, Pink                                      [Page 28]
+
+
+
+
+INTERNET-DRAFT        Header Compression for IPv6          February 1996
+
+
+   Grouping of fragments according to the guidelines in section 4.1
+
+      If the Flow Label of the closest preceding IPv6 base header is
+      nonzero, the packet stream is defined by the combination of Flow
+      Label and Source Address. However, fragments and unfragmented
+      packets should not be grouped together.
+
+      Port numbers cannot be used to identify the packet stream when the
+      Flow Label of the closest preceding IP header is zero, because
+      port numbers are not present in every fragment.  To adhere to the
+      uniqueness rules for the Identification value, a fragmented packet
+      stream is identified by the combination of Source Address and
+      final Destination Address.
+
+            NOTE: The Identification value is NOT used to identify the
+            packet stream. This avoids using a new CID for each packet
+            and saves the cost of the associated initial exponential
+            backoff.  We hope that the unfragmentable part of the
+            headers will not change too frequently, if it does thrashing
+            may occur.
+
+            NOTE: These rules imply that a packet stream never contains
+            both fragmented and unfragmented packets. A good grouping
+            algorithm should always separate fragmented from unfrag-
+            mented packets to avoid compression state changes and the
+            associated exponential backoffs.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Degermark, Nordgren, Pink                                      [Page 29]
+
+
+
+
+INTERNET-DRAFT        Header Compression for IPv6          February 1996
+
+
+7.7.  Destination Options Header [IPv6, section 4.6]
+
+        +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+        |  Next Header  |  Hdr Ext Len  |                               |
+        +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+                               +
+        |                                                               |
+        .                                                               .
+        .                            Options                            .
+        .                                                               .
+        |                                                               |
+        +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+
+        Next Header          NOCHANGE
+        Hdr Ext Len          NOCHANGE
+
+        Options              TLV coded values and padding.
+                             Compressed according to 7.3 above.
+
+   The only Destination Options defined in [IPv6] are the padding
+   options.  When further Destination Options are defined, more clever
+   compression techniques may be defined.
+
+7.8.  No Next Header [IPv6, section 4.7]
+
+   Covered by rules for IPv6 Header Extensions (7.2).
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Degermark, Nordgren, Pink                                      [Page 30]
+
+
+
+
+INTERNET-DRAFT        Header Compression for IPv6          February 1996
+
+
+7.9.  Authentication Header [RFC-1826, section 3.2]
+
+       1 2 3 4 5 6 7 8 1 2 3 4 5 6 7 8 1 2 3 4 5 6 7 8 1 2 3 4 5 6 7 8
+      +---------------+---------------+---------------+---------------+
+      | Next Header   | Length        |           RESERVED            |
+      +---------------+---------------+---------------+---------------+
+      |                Security Parameters Index (SPI)                |
+      +---------------+---------------+---------------+---------------+
+      |                                                               |
+      +     Authentication Data (variable number of 32-bit words)     |
+      |                                                               |
+      +---------------+---------------+---------------+---------------+
+
+      Next Header          NOCHANGE
+      Length               NOCHANGE
+      Reserved             NOCHANGE
+      SPI                  NOCHANGE (DEF IFZERO)
+      Authentication Data  RANDOM
+
+   [RFC-1828] specifies how to do authentication with keyed MD5, the
+   authentication method all IPv6 implementations must support.  For
+   this method, the Authentication Data is 128 bits. These 128 bits are
+   sent "as-is" in compressed headers and thus increase the size of the
+   compressed header by 16 octets.
+
+   As this is typically more than a 300% increase in the size of the
+   compressed header, authentication should be used with care over low-
+   speed links. It is a bad idea to authenticate all packets if one is
+   primarily concerned with bandwidth efficiency and/or low delay.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Degermark, Nordgren, Pink                                      [Page 31]
+
+
+
+
+INTERNET-DRAFT        Header Compression for IPv6          February 1996
+
+
+7.10.  Encapsulating Security Payload Header [RFC-1827, section 3.1]
+
+   This header implies that the subsequent parts of the packet are
+   encrypted. Thus, no further header compression is possible on subse-
+   quent headers as encryption is typically already performed when the
+   compressor sees the packet.
+
+   However, when the ESP Header is used in tunnel mode an entire IP
+   packet is encrypted, and the headers of that packet may be compressed
+   before the packet is encrypted at the entry point of the tunnel.
+   This means that it must be possible to feed an IP packet and its
+   length to the decompressor, as if it came from the link-layer. Note
+   that this type of compression can be done only when it is guaranteed
+   that packets will not be reordered in the tunnel, as the compression
+   mechanisms specified in this document assume that the packet order is
+   preserved between the compressor and decompressor.
+
+      +---------------+---------------+---------------+---------------+
+      |        Security Association Identifier (SPI), 32 bits         |
+      +===============+===============+===============+===============+
+      |            Opaque Transform Data, variable length             |
+      +---------------+---------------+---------------+---------------+
+
+      SPI                          NOCHANGE (DEF IFZERO)
+      Opaque Transform Data        RANDOM
+
+   Everything after the SPI is encrypted, and is not compressed.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Degermark, Nordgren, Pink                                      [Page 32]
+
+
+
+
+INTERNET-DRAFT        Header Compression for IPv6          February 1996
+
+
+7.11.  UDP Header
+
+   The UDP header is described in [RFC-768].
+
+   The Next Header field (IPv6) or Protocol field (IPv4) in the preced-
+   ing subheader is DEF IFZERO.
+
+      +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+      |          Source Port          |       Destination Port        |
+      +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+      |            Length             |           Checksum            |
+      +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+
+      Source Port          NOCHANGE (DEF IFZERO)
+      Destination Port     NOCHANGE (DEF IFZERO)
+      Length               INFERRED
+      Checksum             RANDOM
+
+   The UDP header is compressed down to 2 octets, the UDP checksum.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Degermark, Nordgren, Pink                                      [Page 33]
+
+
+
+
+INTERNET-DRAFT        Header Compression for IPv6          February 1996
+
+
+7.12.  TCP Header
+
+   The TCP header is described in [RFC-793].
+
+   The Next Header field (IPv6) or Protocol field (IPv4) in the preced-
+   ing subheader is DEF IFZERO.
+
+      +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+      |          Source Port          |       Destination Port        |
+      +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+      |                        Sequence Number                        |
+      +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+      |                    Acknowledgment Number                      |
+      +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+      | Offset| Reserved  |U|A|P|R|S|F|            Window             |
+      +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+      |           Checksum            |         Urgent Pointer        |
+      +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+      |                    Options                    |    Padding    |
+      +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+
+      Source Port           NOCHANGE  (DEF IFZERO)
+      Destination Port      NOCHANGE  (DEF IFZERO)
+      Sequence Number       DELTA
+      Acknowledgment Number DELTA
+      Offset                INFERRED/DELTA
+      Reserved              NOCHANGE
+      U,A,P,R,S,F           see [RFC-1144]
+      WINDOW                see [RFC-1144]
+      Checksum              RANDOM
+      Urgent Pointer        see [RFC-1144]
+      Options               see [RFC-1144]
+      Padding               NOCHANGE
+
+   The TCP header is compressed as described by Jacobson in [RFC-1144].
+   For placement of compressed TCP header fields, see section 6.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Degermark, Nordgren, Pink                                      [Page 34]
+
+
+
+
+INTERNET-DRAFT        Header Compression for IPv6          February 1996
+
+
+7.13.  IPv4 header [RFC-791, section 3.1]
+
+   As we expect many IPv6 packets to be encapsulated in IPv4 packets,
+   and many IPv4 packets to be encapsulated in IPv6 packets, it is
+   important to be able to compress IPv4 headers.
+
+       0                   1                   2                   3
+       0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
+      +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+      |Version|  IHL  |Type of Service|          Total Length         |
+      +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+      |         Identification        |Flags|      Fragment Offset    |
+      +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+      |  Time to Live |    Protocol   |         Header Checksum       |
+      +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+      |                       Source Address                          |
+      +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+      |                    Destination Address                        |
+      +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+      |                    Options                    |    Padding    |
+      +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+
+   There are two ways to compress the IPv4 header
+
+   a) If the IPv4 header is not for a fragment (MF flag is not set and
+      Fragment Offset is zero) and there are no options (IHL is 5), it
+      is classified as follows
+
+         Version              NOCHANGE   (DEF)
+         IHL                  NOCHANGE   (DEF, must be 5)
+         Type of Service      NOCHANGE
+         Total Length         INFERRED   (from link-layer implementation
+                                          or encapsulating IP header)
+
+         Identification       DELTA/     (for TCP)
+                              RANDOM     (for non-TCP)
+
+         Flags                NOCHANGE   (MF bit must not be set)
+         Fragment Offset      NOCHANGE   (must be zero)
+         Time to Live         NOCHANGE
+         Protocol             NOCHANGE
+         Header Checksum      INFERRED   (calculated from other fields)
+         Source Address       NOCHANGE   (DEF)
+         Destination Address  NOCHANGE   (DEF)
+         Options, Padding                (not present)
+
+
+
+
+
+
+Degermark, Nordgren, Pink                                      [Page 35]
+
+
+
+
+INTERNET-DRAFT        Header Compression for IPv6          February 1996
+
+
+   b) If the IPv4 header is for a fragment (MF bit set or Fragment
+      Offset nonzero), or there are options (IHL > 5), all fields are
+      RANDOM (i.e., they are sent as-is and not compressed).  If the
+      IPv4 header is for a fragment it is the last subheader to be
+      compressed.  If the IPv4 header has options but is not for a frag-
+      ment it does not end the compressible chain of subheaders, so sub-
+      sequent subheaders are compressed.
+
+   A compressor that follows the guidelines of section 4.1 will in case
+   a) use the Version, Source Address and Destination Address to define
+   the packet stream, together with the fact that there are no IPv4
+   options and that this is not a fragment.
+
+   Case b) can define two kinds of packet streams depending on whether
+   the IPv4 header is for a fragment or not.
+
+   If the IPv4 header in case b) is for a fragment, the compressor uses
+   that fact together with the Version, Source Address, and Destination
+   Address to determine the packet stream.
+
+   If the IPv4 header in case b) is not for a fragment, it must have
+   options. The compressor uses that fact (but not the size of the
+   options) together with the Version, Source Address, and Destination
+   Address to determine the packet stream.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Degermark, Nordgren, Pink                                      [Page 36]
+
+
+
+
+INTERNET-DRAFT        Header Compression for IPv6          February 1996
+
+
+8.  Changing compression identifiers
+
+   On a point-to-point link, the compressor has total knowledge of what
+   CIDs are in use at the decompressor and can change what CID a packet
+   stream uses or reuse CIDs at will. To get the highest possible
+   compression rate, 4-bit CIDs should be allocated to the non-TCP
+   packet streams with the highest packet rates.  However, changing a
+   CID to a new packet stream involves paying the cost of at least one
+   exponential backoff, so it should not be done too frequently.
+
+   Each non-TCP CID is associated with a compression state with a gen-
+   eration value. To avoid too rapid generation wrap-around and poten-
+   tial incorrect decompression, an implementation must avoid wrap-
+   around of the generation value in less than MIN_WRAP seconds (see
+   section 12).
+
+   To aid in avoiding wrap-around, the generation value associated with
+   a non-TCP CID should be maintained when changing a CID to a new
+   packet stream.  A compressor must increment the generation value by
+   one when switching to a new non-TCP packet stream.
+
+   An implementation must not reset the generation value when changing a
+   CID to a new packet stream.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Degermark, Nordgren, Pink                                      [Page 37]
+
+
+
+
+INTERNET-DRAFT        Header Compression for IPv6          February 1996
+
+
+9.  Rules for dropping or storing packets
+
+   When a decompressor receives a packet with a compressed TCP header
+   with CID C, it must be discarded
+
+      a) when the compression state for C is not initialized.
+
+   When a decompressor receives a packet with a compressed non-TCP
+   header with CID C and generation G, it must be discarded
+
+      b) when the decompressor has been disconnected from the compressor
+         more than MIN_WRAP seconds (see section 12),
+
+      c) when the compression state for C is not initialized,
+
+      d) when the generation of the compression state for C is neither G
+         nor G-1 (modulo 256).
+
+   When a decompressor receives a packet with a compressed non-TCP
+   header with CID C and generation G, and the compression state for C
+   has generation G-1 (modulo 256),
+
+      e) the header must not be decompressed using the current compres-
+         sion state. The packet can either be
+
+           i)  discarded immediately, or else
+
+           ii) stored temporarily until the compression state is updated
+               by a packet with a full non-TCP header with CID C and
+               generation G, after which the header can be decompressed.
+
+         Packets stored according to ii) must be discarded when
+
+           1)  receiving full or compressed non-TCP headers with CID C
+               and a generation other than G,
+
+           2)  the decompressor has not received packets with CID C in
+               the last MIN_WRAP seconds.
+
+   When full headers are lost, a decompressor may receive compressed
+   non-TCP headers with a generation value immediately succeeding the
+   generation of its compression state.  Rule e) ii) allows the
+   decompressor to store such headers until they can be decompressed
+   using the correct compression state.
+
+
+
+
+
+
+
+Degermark, Nordgren, Pink                                      [Page 38]
+
+
+
+
+INTERNET-DRAFT        Header Compression for IPv6          February 1996
+
+
+10.  More aggressive compression
+
+   [RFC-1144] allows the CID to be compressed away for TCP packet
+   streams under certain circumstances.  This typically reduces the size
+   of the compressed TCP header from 4 to 3 bytes.
+
+   In a similar vein, compressed non-TCP headers can be reduced to a
+   single octet by substituting CID and generation with a single 4-bit
+   value after an association has formed between a 4-bit identifier
+   called the CGID, and the CID and generation. The format of such
+   compressed headers is
+
+      +-+-+-+-+-+-+-+-+
+      |   |0 0| CGID  |
+      +-+-+-+-+-+-+-+-+
+
+   The association between CGID and CID plus generation is established
+   by placing the CGID in the Res field in compressed non-TCP headers of
+   format c) or d). The CGID is subsequently treated as an alias for the
+   CID and generation in that compressed non-TCP header. The compressor
+   should send a few compressed headers with format c) or d) before
+   switching to the one octet format to increase the chance that the
+   decompressor has established the association.  The value zero is used
+   to signal absence of a GCID in formats c) and d), and neither estab-
+   lishes nor deletes an association.
+
+   To avoid incorrect decompression when the CGID is used, only one CGID
+   value is valid at any given time. When a new association is desired
+   the current CGID value is incremented by one (modulo 16), skipping
+   over zero.  The compressor must not wrap-around the CGID value in
+   less than MIN_WRAP seconds.  A CGID association must be refreshed at
+   least once every MIN_WRAP seconds.  These rules allow the decompres-
+   sor to avoid incorrect decompression by discarding packets with CGIDs
+   other than the one it believes is current.
+
+   It is questionable whether this more aggressive compression technique
+   is defensible as the risk of incorrect compression and discarded
+   packets increases. It also increases the complexity of the protocol.
+   When the link has a low error rate and there are few streams, say a
+   single voice flow, it may be a win.
+
+
+
+
+
+
+
+
+
+
+
+Degermark, Nordgren, Pink                                      [Page 39]
+
+
+
+
+INTERNET-DRAFT        Header Compression for IPv6          February 1996
+
+
+11.  Demultiplexing
+
+   It is necessary to distinguish packets with regular IPv4 headers,
+   regular IPv6 headers, full IPv6 packets, full IPv4 packets,
+   compressed TCP packets, and compressed non-TCP packets.
+
+   The decision to use a distinct ethertype (or equivalent) for IPv6 has
+   already been taken, so this takes care of distinguishing packets with
+   regular IPv4 and IPv6 headers.
+
+   Four different packet types remain. Our suggestion is to use one
+   additional ethertype (or equivalent) for full and compressed headers
+   and encode the first four bits of the full and compressed headers as
+   follows
+
+      First bits of header Type of header
+      -------------------- --------------
+
+      0100                 full IPv4 header (with CID and generation)
+      0110                 full IPv6 header (with CID and generation)
+
+      1***                 compressed TCP header (format a)
+      00**                 compressed non-TCP header (formats b c or d),
+                             or the one byte format from section 10.
+
+   If a new ethertype cannot be obtained we suggest that the IPv6 ether-
+   type is used and the following encoding of the first four bits is
+   used
+
+      First bits of header Type of header
+      -------------------- --------------
+
+      0100                 regular IPv4 header (own ethertype)
+      0110                 regular IPv6 header
+
+      0111                 full IPv4 packet (with CID and generation)
+      0101                 full IPv6 packet (with CID and generation)
+
+      1***                 compressed TCP header (format a)
+      00**                 compressed non-TCP header (formats b c or d)
+
+   Here, care has been taken to use the same encoding as suggested by
+   Jacobson in [RFC-1144] whenever applicable.  This latter encoding
+   could also be used for links where the link-layer does not provide a
+   way to encode payload type. However, ST-2 already uses 0101 so this
+   will not work on links where ST-2 traffic is present.
+
+
+
+
+
+Degermark, Nordgren, Pink                                      [Page 40]
+
+
+
+
+INTERNET-DRAFT        Header Compression for IPv6          February 1996
+
+
+12.  Configuration Parameters
+
+   The following parameters are fixed for all implementations of this
+   header compression scheme.
+
+      MIN_WRAP     - minimum time of generation value wrap around
+
+           3 seconds.
+
+   The following parameters can be negotiated between the compressor and
+   decompressor. If not negotiated their values must be as specified by
+   DEFAULT.
+
+      F_MAX_PERIOD - Largest number of compressed headers that may be
+                     sent without a header refresh.
+
+           DEFAULT is 256
+
+
+      F_MAX_TIME   - Compressed headers may not be sent more than
+                     F_MAX_TIME seconds after sending last full header.
+
+           DEFAULT is 5 seconds
+
+           NOTE:  F_MAX_PERIOD and F_MAX_TIME should be lower when it is
+                  likely that a decompressor loses its state.
+
+
+      MAX_HEADER   - The largest header size (in 8-octet units) that may
+                     be compressed.
+
+           DEFAULT is 25  (200 octets).
+
+           Minimum is 16  (128 octets), which covers
+
+                           IPv6 Base Header
+                           Routing Header with two addresses
+                           Keyed MD5 Authentication Header
+                           Minimum TCP Header
+
+
+
+
+
+
+
+
+
+
+
+
+Degermark, Nordgren, Pink                                      [Page 41]
+
+
+
+
+INTERNET-DRAFT        Header Compression for IPv6          February 1996
+
+
+      TCP_SPACE    - Size of allowed CID space for TCP streams.
+
+           TCP_SPACE is the 2-logarithm of size of TCP CID space.
+
+           DEFAULT is 7, giving a maximum TCP CID of 2^7-1 = 127
+
+           TCP_SPACE must be at least 2 and at most 8.
+
+
+      NON_TCP_SPACE    - Size of allowed CID space for non-TCP streams.
+
+           NON_TCP_SPACE is the 2-logarithm of the size of the
+                   non-TCP CID space.
+
+           DEFAULT is 7, giving a maximum non-TCP CID of 2^7-1 = 127
+
+           NON_TCP_SPACE must be at least 2 and at most 24.
+
+
+      ENABLE_CID_COMPRESSION  - may TCP CIDs be compressed away?
+
+           DEFAULT no.
+
+
+      ENABLE_ONE_OCTET        - may one octet non-TCP format be used?
+
+           DEFAULT no.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Degermark, Nordgren, Pink                                      [Page 42]
+
+
+
+
+INTERNET-DRAFT        Header Compression for IPv6          February 1996
+
+
+13.  Security Considerations
+
+   We advise against identifying packet streams with the aid of informa-
+   tion that is encrypted even if such information happens to be avail-
+   able to the compressor. Doing so would expose traffic patterns.
+
+   We advise against using authentication on all packets sent over a
+   low-speed link as doing so will increase the size of the average
+   compressed header significantly.  Almost as good security may be
+   achievable by carefully selecting what packets to authenticate.
+
+14.  Author's Addresses
+
+      Mikael Degermark                        Bjorn Nordgren
+      CDT/Dept of Computer Science            CDT/Telia Research AB
+      Lulea University                        Aurorum 6
+      S-971 87 Lulea, Sweden                  S-977 75 Lulea, Sweden
+      Tel: +46 920 91188                      Tel: +46 920 75400
+      Fax: +46 920 72191                      Fax: +46 920 75490
+      EMail: micke@sm.luth.se                 EMail: bcn@lulea.trab.se
+
+
+      Stephen Pink
+      CDT/Swedish Institute of Computer Science
+      PO Box 1263
+      S-164 28 Kista, Sweden
+      Tel: +46 8 752 15 59
+      Fax: +46 8 751 72 30
+      Mobile: +46 70 532 0007
+      EMail: steve@sics.se
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Degermark, Nordgren, Pink                                      [Page 43]
+
+
+
+
+INTERNET-DRAFT        Header Compression for IPv6          February 1996
+
+
+15.  References
+
+   [RFC-768]   J. Postel, User Datagram Protocol, RFC 761, August 1980.
+
+   [RFC-791]   J. Postel, Internet Protocol, RFC 791, September 1981.
+
+   [RFC-793]   J. Postel, Transmission Control Protocol, RFC 793, Sep-
+               tember 1981.
+
+   [RFC-1144]  V. Jacobson, Compressing TCP/IP Headers for Low-Speed
+               Serial Links, RFC 1144, February 1990.
+
+   [RFC-1553]  A. Mathur, M. Lewis, Compressing IPX Headers Over WAN
+               Media (CIPX), RFC 1553, December 1993.
+
+   [RFC-1700]  J. Reynolds and J. Postel, Assigned Numbers, RFC-1700,
+               October 1994.
+
+   [RFC-1826]  R. Atkinson, IP Authentication Header, RFC 1826, August
+               1995.
+
+   [RFC-1827]  R. Atkinson, IP Encapsulating Security Protocol (ESP),
+               RFC 1827, August 1995.
+
+   [RFC-1828]  Metzger, W. Simpson, IP Authentication using Keyed MD5,
+               RFC 1828, August 1995.
+
+   [IPv6]      S. Deering, R. Hinden, Internet Protocol, Version 6
+               (IPv6) Specification, RFC 1883, December 1995.
+
+   [ICMPv6]    A. Conta, S. Deering, Internet Control Message Protocol
+               (ICMPv6) for the Internet Protocol Version 6 (IPv6), RFC
+               1885, December 1995.
+
+
+
+
+
+
+
+
+
+                          This draft expires August 18, 1996
+
+
+
+
+
+
+
+
+Degermark, Nordgren, Pink                                      [Page 44]

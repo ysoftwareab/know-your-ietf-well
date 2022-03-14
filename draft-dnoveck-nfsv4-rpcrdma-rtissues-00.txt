@@ -1,0 +1,672 @@
+
+
+
+
+Network File System Version 4                                  D. Noveck
+Internet-Draft                                                       HPE
+Intended status: Informational                            April 17, 2016
+Expires: October 19, 2016
+
+
+         Issues Related to RPC-over-RDMA Internode Round-trips
+                draft-dnoveck-nfsv4-rpcrdma-rtissues-00
+
+Abstract
+
+   As currently designed and implemented, the RPC-over-RDMA protocol
+   requires use of multiple internode round trips to process many common
+   operations.  For example, NFS READ or WRITE operations require use of
+   three internode round trips.  This document looks at this issue and
+   discusses what can and what should be done to address it, both within
+   the context of an extensible version of RPC-over-RDMA and possibly
+   outside that framework.
+
+Status of This Memo
+
+   This Internet-Draft is submitted in full conformance with the
+   provisions of BCP 78 and BCP 79.
+
+   Internet-Drafts are working documents of the Internet Engineering
+   Task Force (IETF).  Note that other groups may also distribute
+   working documents as Internet-Drafts.  The list of current Internet-
+   Drafts is at http://datatracker.ietf.org/drafts/current/.
+
+   Internet-Drafts are draft documents valid for a maximum of six months
+   and may be updated, replaced, or obsoleted by other documents at any
+   time.  It is inappropriate to use Internet-Drafts as reference
+   material or to cite them other than as "work in progress."
+
+   This Internet-Draft will expire on October 19, 2016.
+
+Copyright Notice
+
+   Copyright (c) 2016 IETF Trust and the persons identified as the
+   document authors.  All rights reserved.
+
+   This document is subject to BCP 78 and the IETF Trust's Legal
+   Provisions Relating to IETF Documents
+   (http://trustee.ietf.org/license-info) in effect on the date of
+   publication of this document.  Please review these documents
+   carefully, as they describe your rights and restrictions with respect
+   to this document.  Code Components extracted from this document must
+   include Simplified BSD License text as described in Section 4.e of
+
+
+
+Noveck                  Expires October 19, 2016                [Page 1]
+
+Internet-Draft         RPC/RDMA Round-trip Issues             April 2016
+
+
+   the Trust Legal Provisions and are provided without warranty as
+   described in the Simplified BSD License.
+
+Table of Contents
+
+   1.  Preliminaries . . . . . . . . . . . . . . . . . . . . . . . .   2
+     1.1.  Requirements Language . . . . . . . . . . . . . . . . . .   2
+     1.2.  Introduction  . . . . . . . . . . . . . . . . . . . . . .   2
+   2.  Review of the Current Situation . . . . . . . . . . . . . . .   3
+     2.1.  Troublesome Requests  . . . . . . . . . . . . . . . . . .   3
+     2.2.  Request Processing Details  . . . . . . . . . . . . . . .   3
+   3.  Near-term Work  . . . . . . . . . . . . . . . . . . . . . . .   5
+     3.1.  Target Performance  . . . . . . . . . . . . . . . . . . .   5
+     3.2.  Message Continuation  . . . . . . . . . . . . . . . . . .   6
+     3.3.  Send-based DDP  . . . . . . . . . . . . . . . . . . . . .   7
+     3.4.  Feature Synergy . . . . . . . . . . . . . . . . . . . . .   8
+   4.  Possible Future Development . . . . . . . . . . . . . . . . .   8
+   5.  Summary . . . . . . . . . . . . . . . . . . . . . . . . . . .   9
+   6.  Security Considerations . . . . . . . . . . . . . . . . . . .  11
+   7.  IANA Considerations . . . . . . . . . . . . . . . . . . . . .  11
+   8.  References  . . . . . . . . . . . . . . . . . . . . . . . . .  11
+     8.1.  Normative References  . . . . . . . . . . . . . . . . . .  11
+     8.2.  Informative References  . . . . . . . . . . . . . . . . .  11
+   Appendix A.  Acknowledgements . . . . . . . . . . . . . . . . . .  12
+   Author's Address  . . . . . . . . . . . . . . . . . . . . . . . .  12
+
+1.  Preliminaries
+
+1.1.  Requirements Language
+
+   The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT",
+   "SHOULD", "SHOULD NOT", "RECOMMENDED", "MAY", and "OPTIONAL" in this
+   document are to be interpreted as described in [RFC2119].
+
+1.2.  Introduction
+
+   When many common operations are performed using RPC-over-RDMA,
+   additional inter-node round-trip latencies are required to take
+   advantage of the performance benefits provided by RDMA Functionality.
+
+   While the latencies involved are generally small, they are a reason
+   for concern for two reasons.
+
+   o  With the ongoing improvement of persistent memory technologies,
+      such internode latencies, being fixed, can be expected to consume
+      an increasing portion of the total latency required for processing
+      NFS requests using RPC-over-RDMA.
+
+
+
+
+Noveck                  Expires October 19, 2016                [Page 2]
+
+Internet-Draft         RPC/RDMA Round-trip Issues             April 2016
+
+
+   o  High-performance transfers using NFS may be needed outside of a
+      machine-room environment.  As RPC-over-RDMA is used in networks of
+      campus and metropolitan scale, the internode round-trip time of
+      sixteen microseconds per mile becomes an issue.
+
+   Given this background, round trips beyond the minimum necessary need
+   to be justified by corresponding benefits.  If they are not, work
+   needs to be done to eliminate those excess round trips.
+
+   We are going to look at the existing situation with regard to round
+   trip latency and make some suggestions as to how the issue might be
+   best addressed.  We will consider things that could be done in the
+   near future and also explore further possibilities that would require
+   a longer-term approach to be adopted.
+
+2.  Review of the Current Situation
+
+2.1.  Troublesome Requests
+
+   We will be looking at four sorts of situations:
+
+   o  An RPC operation involving Direct Data Placement of request data
+      (e.g., an NFSv3 WRITE or corresponding NFSv4 COMPOUND).
+
+   o  An RPC operation involving Direct Data Placement of response data
+      (e.g., an NFSv3 READ or corresponding NFSv4 COMPOUND).
+
+   o  An RPC operation where the request data is longer than the inline
+      buffer limit.
+
+   o  An RPC operation where the response data is longer than the inline
+      buffer limit.
+
+   We will survey the resulting latencies in an RPC-over-RDMA Version
+   One environment in Section 2.2 below.
+
+2.2.  Request Processing Details
+
+   We'll start with the case of a request involving direct placement of
+   request data.  Processing proceeds as described below.  Although we
+   are focused on internode latency, the time to perform a request also
+   includes such things as interrupt latency, overhead involved in
+   interacting with the RNIC, and the time for the server to execute the
+   requested operation.
+
+   o  First, the memory to be accessed remotely is registered.  This is
+      a local operation.
+
+
+
+
+Noveck                  Expires October 19, 2016                [Page 3]
+
+Internet-Draft         RPC/RDMA Round-trip Issues             April 2016
+
+
+   o  Once the registration has been done, the initial send of the
+      request can proceed.  Since this is in the context of connected
+      operation, there is an internode round-trip involved.  However,
+      the next step can proceed after the initial transmission is
+      received.  As a result, only the responder-bound side of the
+      transmission contributes to overall operation latency.
+
+   o  The responder, after being notified of the receipt of the request,
+      uses RDMA READ to fetch the bulk data.  This involves an internode
+      round-trip latency.  The responder then needs to be notified of
+      the completion of the explicit RDMA operation
+
+   o  The responder (after doing the actual operation) sends the
+      response.  Again, as this is in the context of connected
+      operation, there is an internode round-trip involved.  However,
+      the next step can proceed after the initial transmission is
+      received by the requester.
+
+   o  The requester, after being notified of the receipt of the
+      response, deregisters the memory originally registered before the
+      request was issued.  This is also a local operation.
+
+   To summarize, if we exclude the actual server execution of the
+   request, the latency consists of two round-trip internode latencies
+   plus two-responder-side interrupt latencies plus one requester-side
+   interrupt latency plus any necessary registration/de-registration
+   overhead.  This is in contrast to a request not using explicit RDMA
+   operations in which there is a single inter-node round-trip latency
+   and one interrupt latency on the requester and the responder.
+
+   The processing of the other sorts of requests mentioned in
+   Section 2.1 is very similar.
+
+   o  The case of direct data placement of response data follows the
+      same pattern.  The only difference is that the transfer of the
+      bulk data is performed using RDMA WRITE, rather than RDMA READ.
+
+   o  Handling of a long request is also similar to the above.  The
+      memory associated with a position-zero read chunk is registered,
+      transferred using RDMA READ, and deregistered.  As a result we
+      have the same overhead and latency issues associated with the case
+      of direct data placement, without the corresponding benefits.
+
+   o  Handling of a long response is a mirror image in that RDMA WRITE
+      is used, rather than RDMA READ.
+
+
+
+
+
+
+Noveck                  Expires October 19, 2016                [Page 4]
+
+Internet-Draft         RPC/RDMA Round-trip Issues             April 2016
+
+
+3.  Near-term Work
+
+   We are going to consider how the latency issues discussed in
+   Section 2 might be addressed in the context of an extensible version
+   of RPC-over-RDMA, such as that proposed in [rpcrdmav2].
+
+   In Section 3.1, we will establish a performance target for the
+   troublesome requests, based on the performance of requests that do
+   not involve long messages or direct data placement.
+
+   We will then consider how extensions might be defined to bring
+   latency and overhead for the requests discussed in Section 2.1 into
+   line with those for other requests.  There will be two specific
+   classes of requests to address:
+
+   o  Those that do not involve direct data placement will be addressed
+      in Section 3.2.  In this case, there are no compensating benefits
+      justifying the higher latency and overhead.
+
+   o  The more complicated case of requests that do involve direct data
+      placement is discussed in Section 3.3.  In this case, direct data
+      placement could serve as a compensating benefit, and the important
+      question to be addressed is whether Direct Data Placement can be
+      effected without the additional round-trip latencies.
+
+   The optional features to deal with each of the classes of messages
+   discussed above could be implemented separately.  However, in the
+   handling of RPCs with very large amounts of bulk data, the two
+   features are synergistic.  This fact makes it desirable to define the
+   features as part of the same extension.  See Section 3.4 for details.
+
+3.1.  Target Performance
+
+   As our target, we will look at the latency and overhead associated
+   with other sorts of RPC requests, i.e. those that do not use DDP, and
+   that have request and response messages which do fit within the
+   buffer limit.
+
+   Processing proceeds as follows:
+
+   o  The initial send of the request is done.  Since this is in the
+      context of connected operation, there is an internode round-trip
+      involved.  However, the next step can proceed after the initial
+      transmission is received.  As a result, only the responder-bound
+      side of the transmission contributes to overall operation latency.
+
+   o  The responder, after being notified of the receipt of the request,
+      performs the requested operation and sends the reply.  As in the
+
+
+
+Noveck                  Expires October 19, 2016                [Page 5]
+
+Internet-Draft         RPC/RDMA Round-trip Issues             April 2016
+
+
+      case of the request, there is an internode round-trip involved.
+      However, the request can be considered complete upon receipt of
+      the requester-bound transmission.  The responder-bound
+      acknowledgment does not contribute to request latency.
+
+   In this case there is only a single internode round-trip latency
+   necessary to effect the RPC.  Total request latency includes this
+   round-trip latency plus interrupt latency on the requester and
+   responder, plus the time for the responder to actually perform the
+   requested operation.
+
+   Thus the delta between the operations discussed in Section 2 and our
+   baseline consists of:
+
+   o  One additional internode round-trip latency.
+
+   o  One additional instance of responder-side interrupt latency
+
+   o  The additional overhead necessary to do memory registration and
+      deregistration.
+
+3.2.  Message Continuation
+
+   Using multiple RPC-over-RDMA transmissions, in sequence, to send a
+   single RPC message avoids the additional latency associated with the
+   use of explicit RDMA operations to transfer position-zero read chunks
+   or reply chunks.
+
+   Although transfer of a single request or reply in N transmissions
+   will involve N+1 internode latencies, overall request latency is not
+   increased as it currently is, by requiring that operations involving
+   multiple nodes be serialized.
+
+   As an illustration, let's consider the case of a request involving a
+   response consisting of two RPC-over-RDMA transmissions.  Even though
+   each of these transmissions is acknowledged, that acknowledgement
+   does not contribute to request latency.  The second transmission can
+   be received by the requester and acted upon without waiting for
+   either acknowledgment.
+
+   This situation would require multiple receive-side interrupts but it
+   is unlikely to result in extended interrupt latency.  With 1K sends
+   (Version One), the second receive will complete about 200 nanoseconds
+   after the first assuming a 40Gb/s transmission rate.  Given likely
+   interrupt latencies, the first interrupt routine would be able to
+   note that the completion of the second receive had already occurred.
+
+
+
+
+
+Noveck                  Expires October 19, 2016                [Page 6]
+
+Internet-Draft         RPC/RDMA Round-trip Issues             April 2016
+
+
+3.3.  Send-based DDP
+
+   In order to effect proper placement of request or reply data within
+   the context of individual RPC-over-RDMA transmissions, receive
+   buffers must be structured to accommodate this function
+
+   To illustrate the considerations that lead clients and servers to
+   choose particular buffer structures, we will use as examples, the
+   cases of NFS READs and WRITEs of 8K data blocks (or the corresponding
+   NFSv4 COMPOUNDs).
+
+   In such cases, the client and server need to have the DDP-eligible
+   bulk data placed in 8K-aligned 8K buffer segments.  Rather than being
+   transferred in separate transmissions using explicit RDMA operations,
+   a message can be sent so that bulk data is received into an
+   appropriate buffer segment.  In this case, it will be excised from
+   the XDR payload stream, just as it is in the case of existing DDP
+   facilities.
+
+   Consider a server expecting write requests which are mostly X bytes
+   long, exclusive of an 8K bulk data area.  In this case the payload
+   stream will be less than X bytes and will fit in buffer segment
+   devoted to that purpose.  The bulk data needs to be placed in the
+   subsequent buffer segment in order to align it properly, i.e. with 8K
+   alignment in the DDP target buffer.  In order to place the data
+   appropriately, the sender (in the case, the client needs) to add
+   padding of length X-Y bytes where Y is the length of payload stream
+   for the current request.  The case of reads is exactly the same
+   except that the sender adding the padding is the server.
+
+   To provide send-based DDP as an RPC-over-RDMA extension, the
+   framework defined in [xcharext] could be used.  A new "transport
+   characteristic" could be defined which allowed a participant to
+   expose the structure of his receive buffers and to identify the
+   buffer segments capable of being used as DDP targets.  In addition, a
+   new optional message header would have to be defined.  It would be
+   defined to provide:
+
+   o  A way to designate DDP-eligible data item as corresponding to
+      target buffer segments, rather than memory registered for RDMA.
+
+   o  A way to indicate to the responder that it should place DDP-
+      eligible data items in DDP-targetable buffer segments, rather than
+      in memory registered for RDMA.
+
+   o  A way to designate a limited portion of an RPC-over-RDMA
+      transmission as constituting the payload stream.
+
+
+
+
+Noveck                  Expires October 19, 2016                [Page 7]
+
+Internet-Draft         RPC/RDMA Round-trip Issues             April 2016
+
+
+3.4.  Feature Synergy
+
+   While message continuation and send-based DDP each address an
+   important class of commonly used messages, their combination allows
+   simpler handling of some important classes of messages:
+
+   o  READs and WRITEs transferring larger IOs
+
+   o  COMPOUNDs containing multiple IO operations.
+
+   o  Operations whose associated payload stream is longer than the
+      typical value.
+
+   To accommodate these situations, it seems that the definition of the
+   headers for message continuation need to interact with data
+   structures for send-based DDP as follows:
+
+   o  The header type for the message starting a chained group contains
+      DDP-directing structures which support both send-based DDP as well
+      as DDP using Explicit RDMA operations.
+
+   o  Buffer references for Send-based DDP should be relative to the
+      start of the transmission group and should allow transitions
+      between buffer segments in different receive buffers.
+
+   o  The header type for messages within a chained group should not
+      have DDP-related fields but should rely on the initial message of
+      the group for DDP-related functions.
+
+   o  The portion of each received transmission devoted to the payload
+      stream should be part of the header for each message within a
+      chained group.  The payload stream for the message as a whole
+      should be the concatenation of those for each transmission.
+
+4.  Possible Future Development
+
+   Although the reduction of explicit RDMA operation reduces the number
+   of inter-node round trips and eliminates sequences of operations in
+   which multiple round-trip latencies are serialized with server
+   interrupt latencies, the use of connected operations means that
+   round-trip latencies will always be present, since each message is
+   acknowledged.
+
+   One avenue that has been considered is use of unreliable-datagram
+   (UD) transmission in environments where the "unreliable" transmission
+   is sufficiently reliable that RPC replay can deal with a very low
+   rate of message loss.  For example, UD in Infiniband specifies a low
+
+
+
+
+Noveck                  Expires October 19, 2016                [Page 8]
+
+Internet-Draft         RPC/RDMA Round-trip Issues             April 2016
+
+
+   enough rate of frame loss to make this a viable approach,
+   particularly given NFSv4.1's EOS support.
+
+   With this sort of arrangement, request latency is still the same.
+   However, since the acknowledgements are not serving any substantial
+   function, it is tempting to consider removing them, as they do take
+   up some transmission bandwidth, that might be used otherwise, if the
+   protocol were to reach the goal of effectively using the underlying
+   medium.
+
+   The size of such wasted transmission bandwidth depends on the average
+   messages size and many implementation considerations regarding how
+   acknowledgments are done.  In any case, given expected message sizes,
+   the wasted transmission bandwidth will be very small.
+
+   When RPC messages are quite small, acknowledgments may be of concern.
+   However, in that situation, a better response would be transfer
+   multiple RPC messages within a single RPC-over-RDMA transmission.
+
+   When multiple RPC messages are combined into a single transmission,
+   the overhead of interfacing with the RNIC, particularly the interrupt
+   handling overhead, is amortized over multiple RPC messages.
+
+   Although this technique is quite outside the spirit of existing RPC-
+   over-RDMA implementations, it appears possible to define new header
+   types capable of supporting this sort of transmission, using the
+   extension framework described in [rpcrdmav2].
+
+5.  Summary
+
+   We've examined the issue of round-trip latency and concluded:
+
+   o  That the number of round trips per se is not as important as the
+      contribution of any extra round-trips to overall request latency.
+
+   o  That the latency issue can be addressed using the extension
+      mechanism provided for in [rpcrdmav2].
+
+   As it seems that the features sketched out could put internode
+   latencies for a large class of requests back to the baseline value
+   for the RPC paradigm, more detailed definition of the required
+   extension functionality is in order.
+
+   We've also looked at round-trips at the physical level, in that
+   acknowledgments are sent in circumstances where there is no obvious
+   need for them.  With regard to these, we have concluded:
+
+   o  That these acknowledgements do not contribute to request latency.
+
+
+
+Noveck                  Expires October 19, 2016                [Page 9]
+
+Internet-Draft         RPC/RDMA Round-trip Issues             April 2016
+
+
+   o  That while UD transmission can remove acknowledgements of limited
+      value, the performance benefits are not sufficient to justify the
+      disruption that this would entail.
+
+   o  That issues with transmission bandwidth overhead in a small-
+      message environment are better addressed by combining multiple RPC
+      messages in a single RPC-over-RDMA transmission.  This is
+      particularly so, because such a step is likely to reduce overhead
+      in such environments as well
+
+   As the features described involve the use of alternatives to explicit
+   RDMA operations, in performing direct data placement and in
+   transferring messages that are larger than the receive buffer limit,
+   it is appropriate to understand the role that such operations are
+   expected to have once the extensions discussed in this document are
+   fully specified and implemented.
+
+   It is important to note that these extensions are OPTIONAL and are
+   expected to remain so, while support for explicit RDMA operations
+   will remain an integral part of RPC-over-RDMA.
+
+   Given this framework, the degree to which explicit RDMA operations
+   will be used will reflect future implementation choices and needs.
+   While we have been focusing on cases in which other options might be
+   more efficient in some cases, it worth looking also at the cases in
+   which explicit RDMA operations are likely to remain preferable:
+
+   o  In some environments in which direct data placement to memory of a
+      certain alignment does not meet application requirements and in
+      which data needs to be read into a particular address on the
+      client.  Also, large physically contiguous buffers may be required
+      in some environments.  In these situations, send-based DDP is not
+      an option.
+
+   o  Where large transfers are to be done, there will be limits to the
+      capacity of send-based DDP to provide the required functionality,
+      since the basic pattern using send/receive is to allocate a pool
+      of memory to contain receive buffers in advance of issuing
+      requests.  While this issue can be mitigated by use of message
+      continuation, tying up large numbers of credits for a single
+      request can cause difficult issues as well.  As a result, send-
+      based DDP may be restricted to "small" IO's although the
+      definition of "small" in this context is inevitably somewhat
+      elastic.
+
+
+
+
+
+
+
+Noveck                  Expires October 19, 2016               [Page 10]
+
+Internet-Draft         RPC/RDMA Round-trip Issues             April 2016
+
+
+6.  Security Considerations
+
+   This document does not raise any security issues.
+
+7.  IANA Considerations
+
+   This document does not require any actions by IANA.
+
+8.  References
+
+8.1.  Normative References
+
+   [RFC2119]  Bradner, S., "Key words for use in RFCs to Indicate
+              Requirement Levels", BCP 14, RFC 2119,
+              DOI 10.17487/RFC2119, March 1997,
+              <http://www.rfc-editor.org/info/rfc2119>.
+
+   [rfc5666bis]
+              Lever, C., Ed., Simpson, W., and T. Talpey, "Remote Direct
+              Memory Access Transport for Remote Procedure Call", April
+              2016, <http://www.ietf.org/id/
+              draft-ietf-nfsv4-rfc5666bis-05.txt>.
+
+              Work in progress.
+
+8.2.  Informative References
+
+   [RFC5666]  Talpey, T. and B. Callaghan, "Remote Direct Memory Access
+              Transport for Remote Procedure Call", RFC 5666,
+              DOI 10.17487/RFC5666, January 2010,
+              <http://www.rfc-editor.org/info/rfc5666>.
+
+   [rpcrdmav2]
+              Lever, C., Ed. and D. Noveck, "RPC-over-RDMA Version Two",
+              April 2016, <http://www.ietf.org/id/
+              draft-cel-nfsv4-rpcrdma-version-two-00.txt>.
+
+              Work in progress.
+
+   [xcharext]
+              Noveck, D., "RPC-over-RDMA Extension to Manage Transport
+              Characterisitcs", April 2016, <http://www.ietf.org/id/
+              draft-dnoveck-nfsv4-rpcrdma-xcharext-00.txt>.
+
+              Work in progress.
+
+
+
+
+
+
+Noveck                  Expires October 19, 2016               [Page 11]
+
+Internet-Draft         RPC/RDMA Round-trip Issues             April 2016
+
+
+Appendix A.  Acknowledgements
+
+   The author gratefully acknowledges the work of Brent Callaghan and
+   Tom Talpey producing the original RPC-over-RDMA Version One
+   specification [RFC5666] and also Tom's work in helping to clarify
+   that specification.
+
+   The author also wishes to thank Chuck Lever for his work resurrecting
+   NFS support for RDMA in [rfc5666bis], and for helpful discussion
+   regarding RPC-over-RDMA latency issues.
+
+Author's Address
+
+   David Noveck
+   Hewlett Packard Enterprise
+   165 Dascomb Road
+   Andover, MA  01810
+   USA
+
+   Phone: +1 781-572-8038
+   Email: davenoveck@gmail.com
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Noveck                  Expires October 19, 2016               [Page 12]

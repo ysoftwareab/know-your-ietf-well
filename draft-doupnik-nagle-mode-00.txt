@@ -1,0 +1,802 @@
+  TCP Implementation Working Group                      Joe R. Doupnik
+  Internet Draft                                 Utah State University
+  Expiration Date: December 1999                             June 1999
+  draft-doupnik-nagle-mode-00.txt
+
+            A new TCP transmission policy replacing Nagle mode
+
+  Status of this Memo
+
+  This document is an Internet-Draft and is in full conformance with
+  all provisions of Section 10 of RFC2026.
+
+  Internet-Drafts are working documents of the Internet Engineering
+  Task Force (IETF), its areas, and its working groups.  Note that
+  other groups may also distribute working documents as Internet-
+  Drafts.
+
+  Internet-Drafts are draft documents valid for a maximum of six months
+  and may be updated, replaced, or obsoleted by other documents at any
+  time.  It is inappropriate to use Internet-Drafts as reference
+  material or to cite them other than as "work in progress."
+
+  The list of current Internet-Drafts can be accessed at
+  http://www.ietf.org/ietf/1id-abstracts.txt
+
+  The list of Internet-Draft Shadow Directories can be accessed at
+  http://www.ietf.org/shadow.html.
+
+  Abstract
+
+  Both Nagle mode and delayed ACKs attempt to conserve network and host
+  machine resources by delaying transmissions in the expectation that
+  the current material can be piggybacked onto a future transmission.
+  Unfortunately when both mechanisms are active at the same time on
+  either end of a connection a deadlock can exist, which is broken by
+  arrival of new data for transmission or firing of the delayed ACK
+  timer. This produces classical timer based ACKing, which for the
+  common 200ms ACK delay yields five exchanges per second.
+
+  A new TCP transmission policy is discussed in this memo which uses
+  information known only to the transmitter about when to send
+  segments. It groups octets based on filling segments and sending a
+  small segment when the application indicates no more data are
+  immediately available, not on arrival of ACKs. It works well with and
+  avoids deadlocks with delayed ACKs. It is automatic and does not need
+  to be turned off. It is a suitable replacement for Nagle mode.
+
+  A new TCP transmission policy replacing Nagle mode          [Page 2]
+
+  Table of Contents
+
+  1.0 Introduction.................................................2
+  1.1 Maximum Segment Size, MSS....................................3
+  1.2 Nagle mode...................................................3
+  1.3 Strict Nagle mode............................................3
+  1.4 Strict Nagle example.........................................4
+  1.5 Liberal Nagle mode...........................................5
+  1.6 Delayed ACKs.................................................5
+  2.0 New transmission policy......................................6
+  2.1 Formal statement of new policy...............................7
+  2.2 Discussion...................................................8
+  2.3 Operation between like and unlike TCP stacks.................9
+  3.0 Experimental results........................................10
+  4.0 Conclusions.................................................13
+  5.0 Security Considerations.....................................14
+  6.0 Acknowledgments.............................................14
+  7.0 References..................................................14
+  8.0 Author's address............................................14
+
+  1.0 Introduction
+
+  Nagle mode [TCP:1] and delayed ACKs are TCP heuristics designed to
+  reduce network traffic, and the consequent load on both originating
+  and receiving hosts. They perform this by slightly different means,
+  but the common factor is to delay a transmission in the expectation
+  that another will be required quickly and hence the present and next
+  transmissions may be combined into one (piggybacking).
+
+  When both modes are active, as they should be to conserve resources,
+  then they may interact to hold data at the transmitter while the
+  receiver holds/delays the ACKs until a very slow (200ms) timer forces
+  out the ACKs. The delay is of major importance when the conversation
+  is alternating between hosts, where one side makes requests, the
+  other responds, and the pattern repeats. The response is delayed
+  until the entire request has arrived at the receiver. Yet the next to
+  last packet of the request can result in a delayed ACK which in turn
+  delays release of the last packet being held by the Nagle condition.
+
+  A delay in sending all octets from one side or the other can slow the
+  conversation to about 1/delayed_ack_time exchanges per second
+  (typically 5 exchanges per second). Such patterns are common for web
+  serving, SMTP mail queues, and other modern applications.
+
+  Today many application programmers turn off Nagle mode to overcome
+  the interaction. They cannot control delayed ACKs which are often
+  turned on or off on a system-wide basis. Unfortunately, turning off
+  Nagle mode increases network traffic, host machine workload, and
+  router workload. If applications cannot turn off Nagle mode to avoid
+  the delayed ACK effect then UDP is the next candidate, and that means
+  no regard for the network and little regard (or lots of work in the
+  application) for lost packets. Today's growing request/reply work
+  would be better served by responsive TCP based communications.
+
+  Doupnik                                                       Page 2
+
+  A new TCP transmission policy replacing Nagle mode          [Page 3]
+
+  1.1 Maximum Segment Size, MSS
+
+  In the following discussion we will use MSS, Maximum Segment Size, as
+  a test criteria for full segments. What is meant is the full capacity
+  for TCP data after allowing for IP and TCP headers and options, which
+  RFC1122 [TCP:2] represents as Eff.snd.MSS. Also some hosts use a
+  power of two buffer sizes as a full segment although the MSS is
+  larger. Nevertheless, we will employ the term MSS, Maximum Segment
+  Size, to be the host's concept of its largest segment size at one
+  moment.
+
+  1.2 Nagle mode
+
+  The current definition of Nagle mode is found in RFC1122, [TCP:2],
+  section 4.2.3.4 When to Send Data:
+     (start quote)
+      The Nagle algorithm is generally as follows:
+          If there is unacknowledged data (i.e., SND.NXT > SND.UNA),
+          then the sending TCP buffers all user data (regardless of the
+          PSH bit), until the outstanding data has been acknowledged or
+          until the TCP can send a full-sized segment (Eff.snd.MSS
+          bytes; see Section 4.2.2.6).
+     (end quote)
+
+  Nagle mode has been implemented in at least two different forms,
+  leading to different behaviors. Each is discussed below. The
+  different forms result from answering the question: if more than one
+  Eff.snd.MSS of data has accumulated, how much beyond full segments
+  may be sent at once?
+
+  The strict approach answers the question above by sending only full
+  segments. A last short segment will be retained for later release. A
+  liberal approach answers it by sending all available data including a
+  possible (very likely) short ending component. The labels strict
+  Nagle and liberal Nagle are used in this paper for purposes of
+  discussion. As a matter of interest, TCP/IP stacks derived from BSD
+  sources often use the strict Nagle mechanism.
+
+  1.3 Strict Nagle form
+
+  The strict Nagle form transmits only full sized segments while
+  awaiting ACKs for previously sent data. A partial segment of unsent
+  data remaining afterward is retained in the transmit buffer as unsent
+  data until all preceding data have been ACKed, or until more
+  application data arrives to compose full length segments. Window size
+  and congestion avoidance criteria of Van Jacobson [TCP:3] may cause
+  even these to remain unsent for some time.
+
+  Holding back the last partial segment leads to grouping with later
+  new application data and hence sending full segments when possible.
+  Delayed ACKs assist grouping in the transmitter by allowing time for
+  the application to add more octets, assuming there is more data and
+  the receiver's window is large enough. But they also introduce the
+
+  Doupnik                                                       Page 3
+
+  A new TCP transmission policy replacing Nagle mode          [Page 4]
+
+  problem of delaying release of the held tail octets. Prior to the
+  tail segment, strict Nagle mode is doing a fine job of forming full-
+  length segments for transmission. Timely release of held tail octets
+  is the essence of the interaction problem discussed in this document.
+
+  1.4 Strict Nagle example
+
+  As an example, suppose the TCP buffer is empty and the application
+  writes 3.5 MSS worth of data to it. Remote host window size and
+  congestion avoidance criteria are applied to determine the size of
+  the candidate transmission. We may consider two cases, one where all
+  data are allowed and a second where less is allowed.
+
+  The first case is all octets are allowed. A full MSS of data is
+  fetched from the buffer and the Nagle test is applied. It passes
+  because the size is a full MSS. The data is sent. The transmitter
+  loops back for a second fetch. The Nagle test finds a full segment
+  and transmits it although unACKed data exist from the first
+  transmission. This repeats until it fetches the last piece, 0.5 MSS.
+
+  The Nagle test fails for it because it is smaller than a full segment
+  and there is unACKed data in transit. The test will fail again until
+  there is no unACKed data (or enough application data arrives). The
+  small tail piece is held until all preceding octets have been ACKed,
+  not just the first or second segments. Thus up to three ACKs may be
+  required to release the tail. This is a "held tail" effect.
+
+  The second case is windowing and congestion avoidance allows only a
+  few octets to be transmitted, say two MSS worth. The first two
+  segments are full length and are sent promptly. Nothing more can be
+  sent until either a fresh write from the application or arrival of a
+  packet creates another transmission opportunity. 1.5 MSS of data
+  remain blocked and invisible to Nagle tests. Suppose the application
+  does not write more data. The transmitter awaits a packet from the
+  receiver that results in calling the transmission code again. At that
+  time as many full segments permitted by windowing and congestion
+  avoidance are sent. A partial segment remainder blocks by strict
+  Nagle rules because it is smaller than a full segment and unACKed
+  data are in transit. Up to three ACKs may be required to release the
+  trailer. This is a "held tail" effect.
+
+  Unfortunately, the last ACK may be delayed and thus the last piece
+  may not go onto the wire for the duration of the receiver's delayed
+  ACK timer. The receiver does not know that the transmitter has data
+  blocked waiting for the final ACK (rather than say data being forced
+  out by new writes from the application). Waiting for the last ACK can
+  involve the full delayed ACK interval, often 200ms; and that results
+  in timer based ACKing.
+
+  Doupnik                                                       Page 4
+
+  A new TCP transmission policy replacing Nagle mode          [Page 5]
+
+  1.5 Liberal Nagle mode
+
+  The second form of Nagle mode applies the full segment rule from
+  RFC1122 but interprets it as saying a trailing partial segment may be
+  transmitted with full segments during the blocked condition. In
+  essence, the size determination is made on all allowed unsent data
+  rather than testing each candidate segment individually as in the
+  strict Nagle case. The test should be on all unsent data after being
+  reduced by remote host window capacity and congestion avoidance
+  limits. The test is really on the minimum of "allowed" (by window
+  size and congestion avoidance) and "available" (the number of unsent
+  octets visible to the TCP transmitter at that moment. Strict Nagle
+  mode of course experiences the same size filtering before data reach
+  it.
+
+  The liberal Nagle form reduces but does not eliminate incidence of
+  held tails, as the following example illustrates, whereas strict
+  Nagle mode creates such incidences at almost each application write
+  event. Liberal Nagle blocks with a partial segment when the window
+  size and congestion avoidance combine to hold back data during the
+  next to last transmission opportunity and only a fraction of an MSS
+  of data remain for the last transmission opportunity. The initial
+  hold back is invisible to Nagle mode at that time so the small piece
+  is not available to be included with the full segments. UnACKed data
+  may exist from the previous send and the small segment remains
+  blocked until preceding octets have been ACKed. Large transmitter and
+  small receiver TCP window sizes and slow comms contribute markedly to
+  this held tail effect with liberal Nagle mode.
+
+  One may infer that liberal Nagle mode was created in part to reduce
+  incidence of the held tail problem. Alas, it does reduce but not
+  eliminate it, and in the process it may send small segments within
+  application data.
+
+  1.6 Delayed ACKs
+
+  Delayed ACKs are a popular mechanism of TCP to avoid sending an ACK
+  for each received segment. Typically, every other arrival generates
+  an ACK. The mechanism is to create a delayed ACK queue which will be
+  flushed to the wire as a single ACK when either a delayed ACK timer
+  expires, or the queue length reaches a certain value (such as two
+  entries), or the local machine sends data. Although ACKs are tiny-
+  grams they do take time and CPU resources to create and to receive,
+  and the routing load is the same as full-length segments. Even on a
+  local wire without routers sending an ACK for each arriving segment
+  creates noticeable additional load on both machines and on network
+  capacity. Thus delaying to coalesce two or more ACKs is a good
+  concept and is the same philosophy as grouping octets into full
+  packets rather than many smaller ones.
+
+  Delaying ACKs is guessing, to paraphrase private communications by
+  John Nagle, that there will be either more data arriving immediately,
+  or there will be a transmission by the receiver in a very short time,
+
+  Doupnik                                                       Page 5
+
+  A new TCP transmission policy replacing Nagle mode          [Page 6]
+
+  or that the receiver doesn't care about immediacy, and thus
+  delaying will be a good tactic. Unfortunately, the receiver has
+  little basis for making the guess: the sending machine provides no
+  hints, the local receiving application provides no notice of data
+  about to be delivered. The delay time is fixed, which will be a
+  mismatch for either local or long distance communications. And the
+  PUSH bit isn't available to act as a hint because the last held
+  segment gets the PUSH bit. At best, a receiver may infer tiny
+  arrivals might be from human typing where the operating system will
+  provide an immediate echo.
+
+  Delayed ACKs would be more effective if the receiver were to adjust
+  the delay time to match the session, say in a manner similar to
+  making round trip timing estimates. One or two round trip times seems
+  appropriate, where that information is available. One way transfers
+  such as the FTP data channel make this approach impractical. In
+  addition, fine scale timers for crisp responses are a burden for the
+  operating system and may not be available for the short intervals of
+  local area networking. For example, the 200ms delay of the fast timer
+  in many BSD systems is very long on even many of today's long
+  distance links. Thus the concept of dynamic delay time is difficult
+  at this time and becomes more so at increasingly higher network
+  speeds.
+
+  2.0 New transmission policy
+
+  This document proposes a new TCP transmission policy that allows
+  delayed ACKs to work as present, thus retaining their advantages. It
+  groups octets similar to Nagle algorithms and yet avoids deadlocks.
+
+  Two terms need to be defined to simplify discussion. These are
+  "available" data and "allowed" capacity. "Available" data are all the
+  data from the application which are not yet sent. It is what a single
+  write or output statement would provide. The TCP stack may see only a
+  portion of this data on each invocation, or it may see it all. This
+  implies the TCP stack knows such a length either explicitly or
+  through an indicator from its caller. Current TCP stacks already
+  perform this test to properly set the PUSH (PSH) bit.
+
+  "Allowed" capacity is the number of octets permitted to be sent based
+  on calculated receiver window size and congestion avoidance limits.
+  It is the minimum of these two constraints. Calculated receiver
+  window size is the usual value of the last announced window size
+  minus the sent but unACKed data. It does not necessarily yield even
+  MSS values. Heuristics in the transmitter may modify the calculation.
+  Congestion avoidance is the normal Van Jacobson congestion window
+  [TCP:3] and this normally yields full MSS values.
+
+  The new policy acts after the window size and congestion avoidance
+  size restrictions are applied.
+
+  The transmitting side has a transmission policy designed to group
+  data into full segments and to not hold the very last segment. This
+  may be stated ambiguously as transmit now if a full segment is
+
+  Doupnik                                                       Page 6
+
+  A new TCP transmission policy replacing Nagle mode          [Page 7]
+
+  available (after limitations of receiver window size and congestion
+  avoidance are applied). A small segment candidate should be sent
+  immediately only if it exhausts all data from the application;
+  otherwise it should be held for joining by more application data.
+
+  Two parts of the above paragraph are unclear. First, "transmit now"
+  does not state how much can be transmitted at one time, a problem
+  seen with the Nagle algorithm. The policy can be strict: transmit
+  whole segments only and withhold a final small segment until an
+  indicator of "no more data will follow" has been obtained. It can be
+  liberal: transmit a partially full segment if one or more full
+  segments immediately precede it, even though this leads to smaller
+  segments on the wire than the strict case. These two policies mimic
+  strict and liberal Nagle modes used today, but minus ACKs and
+  consideration for unACKed data.
+
+  What the policy should not be: hold back a small segment because
+  unACKed data is present. That creates the held tail deadlock seen
+  with Nagle mode combined with delayed ACKs.
+
+  The second ambiguous part is the size of the transmission buffer.
+  Some systems expose the entire application buffer to the protocol
+  stack. In such systems TCP may easily decide when the current
+  candidate for transmission will empty the buffer. Other systems may
+  divide the application buffer into many smaller intermediate buffers
+  and expose only an intermediate buffer to TCP, one for each call upon
+  the transmitter. The latter requires the operating system to provide
+  an indicator of end of application data, a flag or variable or
+  equivalent, marking the current buffer as the last in a series and
+  thus no more data will follow it. In either case, the TCP stack knows
+  how much data is "available" and thus it knows when to properly set
+  the PUSH (PSH) bit.
+
+  2.1 Formal statement of new policy
+
+  Stated formally the new transmission policy is as follows:
+
+     Rule 1. Transmit all full segments in min(available, allowed).
+
+     Rule 2. If a partial segment occurs in min(available, allowed)
+     then transmit it now if it includes the end of application data;
+     otherwise retain it.
+
+     And optionally
+
+     Rule 3. If a partial segment occurs in min(available, allowed)
+     then transmit it now if min(available, allowed) is larger than a
+     full segment. This modifies phrase "otherwise retain it" above.
+
+  min(a, b) represents the smaller value of a or b.
+  Available is the total amount of unsent application data at the time
+  of transmission.
+  Allowed is the smaller of receiver apparent window size and
+  congestion avoidance constraints.
+
+  Doupnik                                                       Page 7
+
+  A new TCP transmission policy replacing Nagle mode          [Page 8]
+
+  2.2 Discussion
+
+  We see that Rule 2 represents a policy of strict grouping until the
+  end of application data. Rules 1 and 2 are necessary and sufficient
+  for good network behavior and good application response.
+
+  Key points of the new policy are the release conditions are generated
+  by the transmitter rather than the receiver, and the conditions are a
+  full segment or indication of end of application data. For Nagle
+  modes, the release is generated by transmitter and receiver, and the
+  conditions are a full segment or all previous data have been ACKed.
+
+  Optional Rule 3 is a liberal policy to permit sending small segments
+  from data immediately available but not at the end of application
+  data. Rule 3 is presented only because some existing TCP/IP stacks
+  are designed for the liberal Nagle approach.
+
+  In practice, the above rules can be overlaid upon current Nagle mode
+  code. The full segment test is performed, and the case where a small
+  segment is to be delayed is modified to be: transmit a small segment
+  if end of application data is reached, else delay it as before.
+
+  At this point, we must discuss a useful and important side effect of
+  using the new policy: the network will do what the application asks!
+
+  When an application does small immediate mode writes, then it largely
+  controls the size of segments sent onto the wire. This is because
+  each output statement implies its own end of application data (give
+  or take whatever the operating system may do between it and the
+  protocol stack). In an extreme case the application may perform
+  single octet writes in massive succession before reading a response.
+  If the network can drain data faster than the application can create
+  data (a classical queueing problem) then massive quantities of tiny
+  segments will appear on the network. That imposes a very heavy load
+  on both hosts and network communications. Slower draining yields
+  larger segments, naturally, but erratically from erratic delays.
+
+  By way of contrast, Nagle mode will send small segments if ACKs
+  arrive promptly. When they don't then Nagle mode strongly groups
+  data. A difference between Nagle mode and the new policy is timing
+  affects Nagle mode and end of application data affects the new
+  policy. The new policy strongly groups bytes that are within the
+  application data set, independent of ACKs. One method uses network
+  delays to group data and the other uses the application and local
+  operating system.
+
+  Non-Nagle mode waits for neither ACKs nor indication from the
+  application. Liberal Nagle mode will behave like strict or non-Nagle
+  modes, depending on whether all unsent data are smaller than a full
+  segment, respectively.
+
+  In the above case of one octet writing by the application, new policy
+  and non-Nagle modes behave alike: send tinygrams. Nagle modes group
+  data to the extent that ACKs are delayed.
+
+  Doupnik                                                       Page 8
+
+  A new TCP transmission policy replacing Nagle mode          [Page 9]
+
+  To remove the uncertain element of ACK time of arrival, and its
+  consequences for held tails and timer based ACKing, as well as bring
+  the small segment problem under control the best strategy is for the
+  application to write large components. This is readily accomplished
+  by the application programmer. For example, rather than using
+  immediate mode writing operations, such as Unix function write(),
+  one may use equivalents which are buffered automatically in the
+  application, such as Unix functions fwrite() or printf(). Unix
+  functions are only illustrative here, as is BSD sockets. With
+  buffered functions the protocol stack sees large buffer amounts even
+  if data are generated in small increments by the application. Then
+  the issue becomes one of using ACK time or application indication.
+
+  Buffering is often accompanied by a buffer flush function, such as
+  fflush() in Unix, to ensure all data are released at that time rather
+  than waiting for the data pathway to be formally closed. A buffer flush
+  function also serves as an indirect signal to the protocol stack that
+  application data writing is complete, without there being a need to
+  invent a special programmer's equivalent to flush TCP transmit data.
+  The new policy is closely analogous to this file system buffering.
+
+  It seems to the author that data aggregation at the application
+  level makes best sense because the natural end of writing is known
+  only at that level. Trying to predict the end of writing at the
+  protocol stack level by either transmitter or receiver, in
+  expectation of avoiding held tails from delayed ACKs and yet
+  delaying transmission to form full length segments, is a very
+  difficult task. It probably has no solution in the general case
+  because a stack does not know when the application is truly finished
+  writing. At best the stack is told when a portion of the output has
+  been prepared. The new policy uses that information, as does the
+  stack to set the PUSH bit.
+
+  The new policy provides immediate response by the network when the
+  application so indicates, which as noted is a double edged sword;
+  otherwise it groups independently of network timing.
+
+  The alternatives seem to be we must endure the delayed ACK effect of
+  Nagle modes, or risk sending many small segments by poorly designed
+  applications, or application writers will turn to UDP and bypass
+  network protection mechanisms.
+
+  2.3 Operation between like and unlike TCP stacks
+
+  The new transmission policy proposed here resides entirely on the
+  transmitting host. Receivers remain unchanged. Clearly, with
+  bilateral exchanges both sides should implement the policy for best
+  speed. The new policy sends the trailing segment of a series without
+  waiting for ACKs to previous data, the same as non-Nagle mode. The
+  new policy groups data into full segments (strict Rule 2), or does so
+  most of the time (Rule 2 plus optional Rule 3), whereas non-Nagle
+  mode and liberal Nagle mode may send short segments as each portion
+
+  Doupnik                                                       Page 9
+
+  A new TCP transmission policy replacing Nagle mode         [Page 10]
+
+  of application data is delivered to the TCP stack. The PUSH bit
+  should be set at end of application data by all policies.
+
+  The receiver and network are ready to deal with the data, because
+  window size and congestion avoidance criteria are still effective and
+  are applied before either Nagle or new policy mechanisms. New policy
+  transmitters send the trailing segment when the network and remote
+  host is ready, whereas Nagle mode transmitters may wait for one or
+  more ACKs to arrive.
+
+  The new policy works well with the classical case of write(small),
+  write(small), read(). Each write() creates a new application data set
+  and each is sent immediately. Both strict and liberal Nagle
+  transmitter holds the second write's data; that is the held tail
+  effect. The new policy transmitter does not hold the second write's
+  data, nor does non-Nagle mode.
+
+  The new policy results in more tinygrams when a user is typing by
+  hand, because each keystroke constitutes an entire application
+  buffer. In practice this is a non-problem because people don't type
+  that fast compared to even 200ms delayed ACKs. Thus in practice for
+  human typing all three approaches and non-Nagle are about the same on
+  the wire. Please see above on data aggregation by applications.
+
+  Let us compare the three approaches for longer data transmissions.
+  Strict Nagle induces a held-tail for each application buffer longer
+  than one segment. Liberal Nagle can also, but only when windowing or
+  congestion avoidance hold back octets. New policy and non-Nagle
+  transmitters do not hold tails. During sending of the application
+  buffer liberal Nagle, liberal new policy, and non-Nagle transmitters
+  may send short segments if the data are delivered to the transmitter
+  in small pieces. Strict Nagle and strict new policy transmitters join
+  interior small pieces into full segments. However, small segments may
+  arise naturally if the application buffer is short and/or its filling
+  is slower than its draining by the network.
+
+  In summary, new policy transmitters should work well with existing
+  TCP/IP stacks and should produce no known side effects.
+
+  3.0 Experimental results
+
+  Four machines were used in a test configuration to examine serving
+  web page activity with and without Nagle mode, and with the new
+  transmission policy.
+
+  Operating System Descriptions:
+  UnixWare 7.0.1
+          400MHz AMD cpu, 200ms delayed ACK, strict Nagle mode.
+          32KB receive window. Source code was not available.
+  FreeBSD v3.2
+          233MHz AMD cpu, 200ms delayed ACK, strict Nagle mode.
+          Source code was modified for new policy. Note indication
+          of TCP receive window size, rwnd, in tests.
+
+  Doupnik                                                      Page 10
+
+  A new TCP transmission policy replacing Nagle mode         [Page 11]
+
+  Solaris 7/Intel
+          350MHz AMD cpu, 50ms delayed ACK, liberal Nagle mode.
+          8KB receive window. Source code was modified for new policy.
+  Linux 2.2.5-15
+          350MHz AMD cpu, 10ms dynamically adjusted delayed ACK,
+          liberal Nagle mode. 16KB receive window. Source code was
+          modified for new policy.
+
+  Interconnections were via a 100Mbps Ethernet hub. This has
+  implications for the tests. The fast network is able to drain TCP
+  data faster than the application can supply it. Thus protocol
+  behavior is exposed that otherwise would be hidden by forced holding
+  back from congestion avoidance and window size constraints.
+
+  The test procedure employs a web request client to request a web
+  page, receive and discard it without reading the content, request it
+  again, and so on, and provide timing results. The client sends a
+  short one packet GET request, it reads the server's HTTP headers and
+  then it counts in the following data file. Once all data file octets
+  have been read then the original request is repeated.
+
+  Each Unix machine runs a simplified web server that replies to the
+  request with two short packets, HTTP web server identification and
+  the HTTP document description, followed by the document itself. Thus
+  there are two short write()'s followed by a succession of 4KB
+  write()'s for the file body. The client counts file octets and when
+  done initiates the next request. Keep-alive connections were used to
+  create a succession of request and replies on the same TCP
+  connection. The serial nature of the request and reply means the
+  longer the file the fewer requests occur per second.
+
+  The web client produces delayed ACKs to all servers. Its use or not
+  of Nagle mode has no influence because each request is only one
+  segment and occurs after each long response from the server. Thus the
+  server's protocol behavior is being examined in the presence of
+  delayed ACKs.
+
+  The web server is run as a single process without threads, to
+  simplify the experiment and to emphasize serialized request and
+  response interaction. Requests were repeated as fast as the systems
+  could perform, up to 60 seconds or 50000 requests.
+
+  The short file is smaller than window size and congestion avoidance
+  limits, as well as fitting into a single Unix write() statement.  The
+  longer file may encounter the window size limit, and it will be
+  expressed as a sequence of Unix write statements. Both files have
+  tails to be held (should we name this the monkey effect?).
+
+  The interaction between Nagle mode and 200ms delayed ACKs is evident.
+  Also present is a case where liberal Nagle mode is caught by delayed
+  ACKs when window size constraints leave a small segment without
+  preceding large segments to drag it out.
+
+  Doupnik                                                      Page 11
+
+  A new TCP transmission policy replacing Nagle mode         [Page 12]
+
+  What the results show is the new policy works. It works better than
+  strict Nagle. It works as well as both liberal Nagle (but without the
+  held tail effect) and non-Nagle (but without sending small segments
+  gratuitously). It does not require control at the application layer.
+  However, as discussed previously, applications can abuse the swift
+  responsiveness of the network by performing many small writes in
+  succession without buffering at the applications layer.
+
+  Table 1. Web page test results, requests and bytes per second.
+
+  Client        Server        2.2KB file      33KB file
+  ------       --------       ----------      ----------
+
+  UW7          FreeBSD         5 req/sec        5 req/sec
+               Nagle on       12 KB/sec       165 KB/sec
+
+  UW7          FreeBSD      1249 req/sec      222 req/sec
+               Nagle off    2914 KB/sec      7142 KB/sec
+
+  UW7          FreeBSD      1247 req/sec      228 req/sec
+               new policy   2909 KB/sec      7324 KB/sec
+
+  UW7          Solaris7      991 req/sec      221 req/sec
+               Nagle on     2311 KB/sec      7112 KB/sec
+
+  UW7          Solaris7      935 req/sec      219 req/sec
+               Nagle off    2181 KB/sec      7041 KB/sec
+
+  UW7          Solaris7      993 req/sec      219 req/sec
+               new policy   2317 KB/sec      7041 KB/sec
+
+  FreeBSD      UW7             5 req/sec        5 req/sec
+  16KB rwnd    Nagle on       12 KB/sec       177 KB/sec
+
+  FreeBSD      UW7          1508 req/sec      264 req/sec
+  16KB rwnd    Nagle off    3519 KB/sec      8478 KB/sec
+
+  FreeBSD      UW7             5 req/sec        5 req/sec
+  4KB rwnd     Nagle on       12 KB/sec       166 KB/sec
+
+  FreeBSD      UW7          1421 req/sec      235 req/sec
+  4KB rwnd     Nagle off    3315 KB/sec      7553 req/sec
+
+  FreeBSD      Linux        1665 req/sec      277 req/sec
+  16KB rwnd    Nagle on     3912 KB/sec      8876 KB/sec
+
+  FreeBSD      Linux        1709 req/sec      279 req/sec
+  16KB rwnd    Nagle off    3987 KB/sec      8970 KB/sec
+
+  FreeBSD      Linux        1665 req/sec      277 req/sec
+  16KB rwnd    new policy   3883 KB/sec      8894 KB/sec
+
+  Doupnik                                                      Page 12
+
+  A new TCP transmission policy replacing Nagle mode         [Page 13]
+
+  FreeBSD      Linux        1685 req/sec       55 req/sec
+  4KB rwnd     Nagle on     3930 KB/sec      1776 KB/sec
+
+  FreeBSD      Linux        1692 req/sec      238 req/sec
+  4KB rwnd     Nagle off    3946 KB/sec      7634 KB/sec
+
+  FreeBSD      Linux        1699 req/sec      241 req/sec
+  4KB rwnd     new policy   3964 KB/sec      7740 KB/sec
+
+  FreeBSD      Solaris7     1104 req/sec      180 req/sec
+  4KB rwnd     Nagle on     2575 KB/sec      5795 KB/sec
+
+  FreeBSD      Solaris7     1090 req/sec      180 req/sec
+  4KB rwnd     Nagle off    2544 KB/sec      5772 KB/sec
+
+  FreeBSD      Solaris7     1090 req/sec      165 req/sec
+  4KB rwnd     new policy   2543 KB/sec      5290 KB/sec
+
+  FreeBSD      Solaris7     1151 req/sec      233 req/sec
+  16KB rwnd    Nagle on     2685 KB/sec      7474 KB/sec
+
+  FreeBSD      Solaris7     1186 req/sec      239 req/sec
+  16KB rwnd    Nagle off    2768 KB/sec      7669 KB/sec
+
+  FreeBSD      Solaris7     1206 req/sec      237 req/sec
+  16KB rwnd    new policy   2813 KB/sec      7634 KB/sec
+
+  Solaris7 as a client produced erratic results from long variable
+  delays preceding each request. This occurred for stock and modified
+  Solaris7. There is suspicion that its server performance may be
+  influenced too.
+
+  4.0 Conclusions
+
+  The new TCP transmission policy solves the problem of Nagle mode
+  deadlocking with delayed ACKs. It retains data grouping but
+  operates with only transmitter information. It accommodates those
+  systems which wish to implement a liberal sending policy regarding
+  partial segments not at the end of application data, and those which
+  prefer the stronger grouping of a strict sending policy.
+
+  The new policy works well with delayed ACKs and sending into small
+  receiver windows. Its performance is essentially the same as non-Nagle
+  mode, yet it retains grouping which non-Nagle mode does not. It does
+  not need an on/off control visible to applications. The new
+  transmission policy is a suitable replacement for Nagle mode.
+
+  The warning is the same as for non-Nagle mode: what is sent by the
+  application to the protocol stack is also what the network tries to
+  send. Thus grouping of data in applications and/or operating systems
+  remains a good idea.
+
+  Doupnik                                                      Page 13
+
+  A new TCP transmission policy replacing Nagle mode         [Page 14]
+
+  5.0 Security Considerations
+
+  There are no security considerations in this memo.
+
+  6.0 Acknowledgements
+
+  Special thanks to John Nagle for candid discussions on the problem
+  and reviewing the draft document. Thanks to Gehri Grimaud at Utah
+  State University for introducing the author to FreeBSD and helping to
+  run experiments. And to Miles Johnson at USU, Richard J. Letts at
+  Salford University in the UK and Diana Osborn at San Diego State
+  University for reading the rough draft of this document.
+
+  7.0 References
+
+  [TCP:1] "Congestion Control in IP/TCP," J. Nagle, RFC-896, January
+  1984.
+
+  [TCP:2] "Requirements for Internet Hosts -- Communication Layers", R.
+  Brandon RFC-1122, October 1989.
+
+  [TCP:3] "Congestion Avoidance and Control," V. Jacobson, ACM SIGCOMM-
+  88, August 1988.
+
+  8.0 Author's address
+
+  Joe R. Doupnik
+  Dept of Electrical and Computer Engineering
+  Utah State University
+  Logan, Utah 84322
+  Phone: (801) 797-2982
+  Email: jrd@cc.usu.edu
+
+  Full Copyright Statement
+
+  "Copyright (C) The Internet Society (1999). All Rights Reserved. This
+  document and translations of it may be copied and furnished to
+  others, and derivative works that comment on or otherwise explain it
+  or assist in its implementation may be prepared, copied, published
+  and distributed, in whole or in part, without restriction of any
+  kind, provided that the above copyright notice and this paragraph are
+  included on all such copies and derivative works. However, this
+  document itself may not be modified in any way, such as by removing
+  the copyright notice or references to the Internet Society or other
+  Internet organizations, except as needed for the purpose of
+  developing Internet standards in which case the procedures for
+  copyrights defined in the Internet Standards process must be
+  followed, or as required to translate it into languages other than
+  English.
+
+  The limited permissions granted above are perpetual and will not be
+  revoked by the Internet Society or its successors or assigns.
+
+  Doupnik                                                      Page 14
+
+  A new TCP transmission policy replacing Nagle mode         [Page 15]
+
+  This document and the information contained herein is provided on an
+  "AS IS" basis and THE INTERNET SOCIETY AND THE INTERNET ENGINEERING
+  TASK FORCE DISCLAIMS ALL WARRANTIES, EXPRESS OR IMPLIED, INCLUDING
+  BUT NOT LIMITED TO ANY WARRANTY THAT THE USE OF THE INFORMATION
+  HEREIN WILL NOT INFRINGE ANY RIGHTS OR ANY IMPLIED WARRANTIES OF
+  MERCHANTABILITY OR FITNESS FOR A PARTICULAR PURPOSE."
+
+  Doupnik                                                      Page 15
