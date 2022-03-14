@@ -1,0 +1,280 @@
+
+
+
+
+Transport Working Group                                        J. Morton
+Internet-Draft                                                          
+Intended status: Informational                                  P. Heist
+Expires: 22 August 2020                                 19 February 2020
+
+
+               Controlled Delay Approximate Fairness AQM
+                draft-morton-tsvwg-codel-approx-fair-00
+
+Abstract
+
+   This note presents CodelAF, or Controlled Delay Approximate Fairness
+   in full, as an alternative to single-queue AQM or Fair Queue
+   implementations in the low-cost or high-speed network hardware
+   spaces.  It builds on the seminal work in Codel [RFC8289], and guides
+   multiple competing flows towards similar throughputs by differential
+   congestion signalling, whilst requiring only a single FIFO queue.  It
+   may also be combined with CNQ [I-D.morton-tsvwg-cheap-nasty-queueing]
+   to provide a latency optimisation for sparse flows.
+
+Status of This Memo
+
+   This Internet-Draft is submitted in full conformance with the
+   provisions of BCP 78 and BCP 79.
+
+   Internet-Drafts are working documents of the Internet Engineering
+   Task Force (IETF).  Note that other groups may also distribute
+   working documents as Internet-Drafts.  The list of current Internet-
+   Drafts is at https://datatracker.ietf.org/drafts/current/.
+
+   Internet-Drafts are draft documents valid for a maximum of six months
+   and may be updated, replaced, or obsoleted by other documents at any
+   time.  It is inappropriate to use Internet-Drafts as reference
+   material or to cite them other than as "work in progress."
+
+   This Internet-Draft will expire on 22 August 2020.
+
+Copyright Notice
+
+   Copyright (c) 2020 IETF Trust and the persons identified as the
+   document authors.  All rights reserved.
+
+   This document is subject to BCP 78 and the IETF Trust's Legal
+   Provisions Relating to IETF Documents (https://trustee.ietf.org/
+   license-info) in effect on the date of publication of this document.
+   Please review these documents carefully, as they describe your rights
+   and restrictions with respect to this document.  Code Components
+   extracted from this document must include Simplified BSD License text
+
+
+
+Morton & Heist           Expires 22 August 2020                 [Page 1]
+
+Internet-Draft                   codelaf                   February 2020
+
+
+   as described in Section 4.e of the Trust Legal Provisions and are
+   provided without warranty as described in the Simplified BSD License.
+
+Table of Contents
+
+   1.  Introduction  . . . . . . . . . . . . . . . . . . . . . . . .   2
+   2.  Background  . . . . . . . . . . . . . . . . . . . . . . . . .   2
+   3.  The Algorithm . . . . . . . . . . . . . . . . . . . . . . . .   3
+   4.  Security Considerations . . . . . . . . . . . . . . . . . . .   4
+   5.  IANA Considerations . . . . . . . . . . . . . . . . . . . . .   4
+   6.  Informative References  . . . . . . . . . . . . . . . . . . .   4
+   Authors' Addresses  . . . . . . . . . . . . . . . . . . . . . . .   5
+
+1.  Introduction
+
+   For some years, the solution of choice for improving network
+   performance as been the combination of Fair Queuing (FQ) with Active
+   Queue Management (AQM) as demonstrated in FQ-Codel [RFC8290].
+   However, concerns are legitimately raised over the difficulty of
+   implementing FQ in hardware, making it a weak proposition for very
+   low-cost and very high-speed network devices alike.  There is some
+   evidence to suggest that implementing multiple AQM instances is not
+   very difficult in hardware, but implementing multiple FIFOs can be
+   prohibitive.
+
+   CodelAF addresses this design space with a straightforward extension
+   to the Codel AQM, allowing its target to be biased according to
+   relative queue occupancy of a particular flow, and its signals
+   applied only to that flow.  An arbitrary number of independent flows
+   can then be signalled to more independently than a single AQM can,
+   allowing convergence towards a fair-throughput state.
+
+   This approach also successfully addresses the problem of allowing
+   flows responding to dissimilar congestion signals to share the same
+   FIFO queue without excessive bias.  In particular, it applies to Some
+   Congestion Experienced [I-D.morton-tsvwg-sce] flows sharing a queue
+   with conventional ECN [RFC3168] and Not-ECT flows.
+
+   It is likely that a similar AF technique can also be applied to other
+   AQMs that employ a target queue sojourn time, such as PIE and BLUE.
+
+2.  Background
+
+   A brief summary of the basic Codel algorithm follows.  For full
+   details, see [RFC8289].
+
+   Codel is parameterised by a target setpoint, indicating the amount of
+   tolerable standing queue (default 5 ms) and an initial signalling
+
+
+
+Morton & Heist           Expires 22 August 2020                 [Page 2]
+
+Internet-Draft                   codelaf                   February 2020
+
+
+   interval which is set to an estimate of the typical path latency
+   (default 100 ms).  The principle dynamic state elements are a flag
+   indicating whether Codel is in the "marking" state or not, a timer
+   indicating when the next mark is due, and a counter indicating how
+   many marks have been set since entering the marking state.
+
+   Since Codel was designed at a time when ECN was not commonly used,
+   the "marking" state is often described as the "dropping" state,
+   including by the original authors.  Here the term "marking" state is
+   used to match the increased deployment of ECN today.
+
+   Codel enters the "marking" state when the sojourn time of a packet
+   within its queue first exceeds its target setpoint.  At this time,
+   the counter is initialised to 1 and the timer is set for interval/
+   sqrt(counter) time in the future.  This first packet, therefore, is
+   not marked, as it may be an outlier belonging to an isolated and
+   temporary burst of traffic.  Only if the sojourn times of all
+   subsequent packets (until the timer expires) also exceed the target
+   will ECN marking (or dropping of Not-ECT packets) begin.  Marking is
+   always performed at the head of the queue, where the sojourn time of
+   individual packets is precisely known.
+
+   After each mark (or drop), the counter is incremented and the timer
+   advanced, again, by interval/sqrt(counter).  This causes a linear
+   increase of marking frequency over time, until the queue is brought
+   under control.  This is signified by the sojourn times of packets
+   dropping below the target, at which time marking immediately stops
+   and Codel exits the marking state.
+
+   When Codel exits the marking state, the counter is not immediately
+   reset, as further control of an aggressive flow may still be needed.
+   The reference implementation pauses for some multiple of the interval
+   and then resets the counter.  The COBALT variant instead decrements
+   the counter and resets the timer on the same linear frequency ramp,
+   run in reverse, the benefit of which can be seen in [COBALT].
+
+   The reference CodelAF implementation is built around a combination of
+   COBALT with CNQ [I-D.morton-tsvwg-cheap-nasty-queueing], to which
+   only small code changes were required.
+
+3.  The Algorithm
+
+   In CodelAF, a separate instance of the Codel state variables (marking
+   flag, timer, and counter) are kept for each flow.  In addition, an
+   account of the instantaneous queue occupancy of each flow is
+   maintained, as well as the total queue occupancy, and the number of
+   "active flows" which have traffic in the queue.
+
+
+
+
+Morton & Heist           Expires 22 August 2020                 [Page 3]
+
+Internet-Draft                   codelaf                   February 2020
+
+
+   Flows may be distinguished by whichever means is convenient, for
+   example a hash function over the traditional 5-tuple of protocol
+   number, source/destination addresses and port numbers.  Some
+   deployments may prefer to use a smaller set of packet header
+   information, or to distinguish based on subscriber ID metadata.  The
+   result in any case is an index into a flow table containing the queue
+   occupancy data and AQM state mentioned above.
+
+   The Codel parameters (interval, target) are common to all flows.
+   However, when evaluating the AQM state for a packet, the target
+   parameter is locally adjusted based on the actual queue occupancy by
+   that packet's flow, compared to the fair-share queue occupancy based
+   on dividing the total occupancy between all active flows.  Hence a
+   sparser flow, with lower than average occupancy, will receive more
+   leniency from the AQM.
+
+   The basic Codel criterion:
+
+   if(sojourn > target):
+           enter_dropping_state;
+
+   becomes:
+
+   if(sojourn * flow occupancy * active flows > target * total occupancy):
+           enter_dropping_state;
+
+   This is sufficient to guide flows that are responsive to AQM signals
+   towards throughput fairness.
+
+4.  Security Considerations
+
+   No particular security concerns are anticipated.
+
+5.  IANA Considerations
+
+   There are no IANA considerations.
+
+6.  Informative References
+
+   [I-D.morton-tsvwg-cheap-nasty-queueing]
+              Morton, J. and P. Heist, "Cheap Nasty Queueing", Work in
+              Progress, Internet-Draft, draft-morton-tsvwg-cheap-nasty-
+              queueing-01, 4 November 2019,
+              <https://tools.ietf.org/html/draft-morton-tsvwg-cheap-
+              nasty-queueing-01>.
+
+   [RFC8290]  Hoeiland-Joergensen, T., McKenney, P., Taht, D., Gettys,
+              J., and E. Dumazet, "The Flow Queue CoDel Packet Scheduler
+
+
+
+Morton & Heist           Expires 22 August 2020                 [Page 4]
+
+Internet-Draft                   codelaf                   February 2020
+
+
+              and Active Queue Management Algorithm", RFC 8290,
+              DOI 10.17487/RFC8290, January 2018,
+              <https://www.rfc-editor.org/info/rfc8290>.
+
+   [I-D.morton-tsvwg-sce]
+              Morton, J. and R. Grimes, "The Some Congestion Experienced
+              ECN Codepoint", Work in Progress, Internet-Draft, draft-
+              morton-tsvwg-sce-01, 4 November 2019,
+              <https://tools.ietf.org/html/draft-morton-tsvwg-sce-01>.
+
+   [RFC3168]  Ramakrishnan, K., Floyd, S., and D. Black, "The Addition
+              of Explicit Congestion Notification (ECN) to IP",
+              RFC 3168, DOI 10.17487/RFC3168, September 2001,
+              <https://www.rfc-editor.org/info/rfc3168>.
+
+   [COBALT]   Palmei, J., Gupta, S., Imputato, P., Morton, J.,
+              Tahiliani, M.P., Avallone, S., and D. Taht, "Design and
+              Evaluation of COBALT Queue Discipline", September 2019,
+              <https://ieeexplore.ieee.org/abstract/document/8847054>.
+
+   [RFC8289]  Nichols, K., Jacobson, V., McGregor, A., Ed., and J.
+              Iyengar, Ed., "Controlled Delay Active Queue Management",
+              RFC 8289, DOI 10.17487/RFC8289, January 2018,
+              <https://www.rfc-editor.org/info/rfc8289>.
+
+Authors' Addresses
+
+   Jonathan Morton
+   Kokkonranta 21
+   FI-31520 Pitkajarvi
+   Finland
+
+   Phone: +358 44 927 2377
+   Email: chromatix99@gmail.com
+
+
+   Peter G. Heist
+   Redacted
+   463 11 Liberec 30
+   Czech Republic
+
+   Email: pete@heistp.net
+
+
+
+
+
+
+
+
+
+Morton & Heist           Expires 22 August 2020                 [Page 5]

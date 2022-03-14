@@ -1,0 +1,2609 @@
+
+Network Working Group                         Jeffrey Mogul, Compaq WRL,
+Internet-Draft                          Balachander Krishnamurthy, AT&T,
+Expires: 25 September 2000                           Fred Douglis, AT&T,
+                                   Anja Feldmann, Univ. of Saarbruecken,
+                                                Yaron Goland, Microsoft,
+                                                Arthur van Hoff, Marimba
+                                                           10 March 2000
+                         Delta encoding in HTTP
+
+                     draft-mogul-http-delta-03.txt
+
+
+STATUS OF THIS MEMO
+
+        This document is an Internet-Draft and is in full
+        conformance with all provisions of Section 10 of RFC2026.
+
+        Internet-Drafts are working documents of the Internet
+        Engineering Task Force (IETF), its areas, and its working
+        groups. Note that other groups may also distribute working
+        documents as Internet-Drafts.
+
+        Internet-Drafts are draft documents valid for a maximum of
+        six months and may be updated, replaced, or obsoleted by
+        other documents at any time. It is inappropriate to use
+        Internet-Drafts as reference material or to cite them other
+        than as "work in progress."
+
+        The list of current Internet-Drafts can be accessed at
+        http://www.ietf.org/ietf/1id-abstracts.txt
+
+        The list of Internet-Draft Shadow Directories can be
+        accessed at http://www.ietf.org/shadow.html.
+
+        Distribution of this document is unlimited.  Please send
+        comments to the authors.
+
+
+ABSTRACT
+
+        Many HTTP requests cause the retrieval of slightly modified
+        instances of resources for which the client already has a
+        cache entry.  Research has shown that such modifying
+        updates are frequent, and that the modifications are
+        typically much smaller than the actual entity.  In such
+        cases, HTTP would make more efficient use of network
+        bandwidth if it could transfer a minimal description of the
+        changes, rather than the entire new instance of the
+        resource.  This is called ``delta encoding.''  This
+        document describes how delta encoding can be supported as a
+        compatible extension to HTTP/1.1.
+
+
+
+
+Mogul, Krishnamurthy, Douglis, Feldmann, Goland, van Hoff       [Page 1]
+
+
+Internet-Draft               Delta encoding          10 March 2000 09:57
+
+
+                           TABLE OF CONTENTS
+
+1 Introduction                                                         4
+     1.1 Related research and proposals                                5
+2 Goals                                                                6
+3 Terminology                                                          7
+4 Relationship between content-coding, transfer-coding, and ranges     8
+     4.1 Ordering of transformations in the same phase                11
+5 Basic mechanisms                                                    11
+     5.1 Background: an overview of HTTP cache validation             12
+     5.2 Requesting the transmission of deltas                        13
+     5.3 Content-coding or Transfer-coding?                           14
+     5.4 Choice of delta algorithm and format                         15
+     5.5 Identification of delta-encoded responses                    16
+     5.6 Transmission of delta-encoded responses                      17
+     5.7 Examples of requests combing Range and delta encoding        18
+6 Encoding algorithms and formats                                     20
+     6.1 IANA Considerations                                          21
+7 Management of base instances                                        21
+     7.1 Multiple entity tags in the If-None-Match header             22
+     7.2 Hints for managing the client cache                          23
+8 Delta-encoding and clustering                                       25
+9 Use of templates                                                    27
+10 Deltas and intermediate caches                                     30
+11 Digests for data integrity                                         30
+12 Specification                                                      31
+     12.1 Protocol parameter specifications                           31
+     12.2 Status code specifications                                  32
+          12.2.1 226 Delta                                            32
+          12.2.2 227 Range of Delta                                   32
+     12.3 Header specifications                                       33
+          12.3.1 Delta-Base                                           33
+          12.3.2 DCluster                                             34
+          12.3.3 DTemplate                                            34
+13 New requirements for existing headers                              35
+     13.1 Accept-Encoding                                             35
+     13.2 TE                                                          35
+     13.3 Use of compression with delta encoding                      36
+     13.4 Delta encoding and multipart/byteranges                     36
+14 New Cache-control directives                                       37
+15 Quantifying the protocol overhead                                  38
+16 Security Considerations                                            39
+     16.1 Spoofing attacks using the DCluster header                  39
+17 History                                                            40
+     17.1 draft-mogul-http-delta-01.txt                               40
+     17.2 draft-mogul-http-delta-02.txt                               40
+     17.3 draft-mogul-http-delta-03.txt                               41
+18 Acknowledgements                                                   41
+19 References                                                         41
+20 Authors' addresses                                                 43
+
+
+Mogul, Krishnamurthy, Douglis, Feldmann, Goland, van Hoff       [Page 2]
+
+
+Internet-Draft               Delta encoding          10 March 2000 09:57
+
+
+Index                                                                 45
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Mogul, Krishnamurthy, Douglis, Feldmann, Goland, van Hoff       [Page 3]
+
+
+Internet-Draft               Delta encoding          10 March 2000 09:57
+
+
+1 Introduction
+
+   The World Wide Web is a distributed system, and so often benefits
+   from caching to reduce retrieval delays.  Retrieval of a Web resource
+   (such as document, image, icon, or applet) over the Internet or other
+   wide-area network usually takes enough time that the delay is over
+   the human threshold of perception.  Often, that delay is measured in
+   seconds.  Caching can often eliminate or significantly reduce
+   retrieval delays.
+
+   Many Web resources change over time, so a practical caching approach
+   must include a coherency mechanism, to avoid presenting stale
+   information to the user.  Originally, the Hypertext Transfer Protocol
+   (HTTP) provided little support for caching, but under operational
+   pressures, it quickly evolved to support a simple mechanism for
+   maintaining cache coherency.
+
+   In HTTP/1.0 [2], the server may supply a ``last-modified'' timestamp
+   with a response.  If a client stores this response in a cache entry,
+   and then later wishes to re-use the response, it may transmit a
+   request message with an ``If-modified-since'' field containing that
+   timestamp; this is known as a conditional retrieval.  Upon receiving
+   a conditional request, the server may either reply with a full
+   response, or, if the resource has not changed, it may send an
+   abbreviated reply, indicating that the client's cache entry is still
+   valid.  HTTP/1.0 also includes a means for the server to indicate,
+   via an ``Expires'' timestamp, that a response will be valid until
+   that time; if so, a client may use a cached copy of the response
+   until that time, without first validating it using a conditional
+   retrieval.
+
+   HTTP/1.1 [10] adds many new features to improve cache coherency and
+   performance.  However, it preserves the all-or-none model for
+   responses to conditional retrievals: either the server indicates that
+   the resource value has not changed at all, or it must transmit the
+   entire current value.
+
+   Common sense suggests (and traces confirm), however, that even when a
+   Web resource does change, the new instance is often substantially
+   similar to the old one.  If the difference, or ``delta'', between the
+   two instances could be sent to the client instead of the entire new
+   instance, a client holding a cached copy of the old instance could
+   apply the delta to construct the new version.  In a world of finite
+   bandwidth, the reduction in response size and delay could be
+   significant.
+
+   One can think of deltas as a way to squeeze as much benefit as
+   possible from client and proxy caches.  Rather than treating an
+   entire response as the ``cache line,'' with deltas we can treat
+   arbitrary pieces of a cached response as the replaceable unit, and
+   avoid transferring pieces that have not changed.
+
+Mogul, Krishnamurthy, Douglis, Feldmann, Goland, van Hoff       [Page 4]
+
+
+Internet-Draft               Delta encoding          10 March 2000 09:57
+
+
+   This document proposes a set of compatible extensions to HTTP/1.1
+   that allow clients and servers to use delta encoding with minimal
+   overhead.
+
+   We assume that the reader is familiar with the HTTP/1.1
+   specification.
+
+1.1 Related research and proposals
+   The idea of delta-encoding to reduce communication or storage costs
+   is not new.  For example, the MPEG-1 video compression standard
+   transmits occasional still-image frames, but most of the frames sent
+   are encoded (to oversimplify) as changes from an adjacent frame.  The
+   SCCS and RCS [26] systems for software version control represent
+   intermediate versions as deltas; SCCS starts with an original version
+   and encodes subsequent ones with forward deltas, whereas RCS encodes
+   previous versions as reverse deltas from their successors.
+   Jacobson's technique for compressing IP and TCP headers over slow
+   links [17] uses a clever, highly specialized form of delta encoding.
+
+   In spite of this history, it appears to have taken several years
+   before anyone thought of applying delta encoding to HTTP, perhaps
+   because the development of HTTP caching has been somewhat haphazard.
+   The first published suggestion for delta encoding appears to have
+   been by Williams et al. in a paper about HTTP cache removal
+   policies [28], but these authors did not elaborate on their design
+   until later [27].
+
+   The WebExpress project [15] appears to be the first published
+   description of an implementation of delta encoding for HTTP (which
+   they call ``differencing'').  WebExpress is aimed specifically at
+   wireless environments, and includes a number of orthogonal
+   optimizations.  Also, the WebExpress design does not propose changing
+   the HTTP protocol itself, but rather uses a pair of interposed
+   proxies to convert the HTTP message stream into an optimized form.
+   The results reported for WebExpress differencing are impressive, but
+   are limited to a few selected benchmarks.
+
+   Banga et al. [1] describe the use of optimistic deltas, in which a
+   layer of interposed proxies on either end of a slow link collaborate
+   to reduce latency.  If the client-side proxy has a cached copy of a
+   resource, the server-side proxy can simply send a delta (or a 304
+   [Not Modified] response).  If only the server-side proxy has a cached
+   copy, it may optimistically send its (possibly stale) copy to the
+   client-side proxy, followed (if necessary) by a delta once the
+   server-side proxy has validated its own cache entry with the origin
+   server.  The use of optimistic deltas, unlike delta encoding,
+   actually increases the number of bytes sent over the network, in an
+   attempt to improve latency by anticipating a ``Not Modified''
+   response from the origin server.  The optimistic delta paper, like
+   the WebExpress paper, did not propose a change to the HTTP protocol
+   itself, and reported results only for a small set of selected URLs.
+
+Mogul, Krishnamurthy, Douglis, Feldmann, Goland, van Hoff       [Page 5]
+
+
+Internet-Draft               Delta encoding          10 March 2000 09:57
+
+
+   Mogul et al. [23] collected lengthy traces, at two different sites,
+   of the full contents of HTTP messages, to quantify the potential
+   benefits of delta-encoded responses.  They showed that delta encoding
+   can provide remarkable improvements in response-size and
+   response-delay for an important subset of HTTP content types.  They
+   proposed a set of HTTP extensions, but without the level of detail
+   required for a specification.  Douglis et al. [8] used the same sets
+   of full-content traces to quantify the rate at which resources change
+   in the Web.
+
+   The HTTP Distribution and Replication Protocol (DRP), proposed to W3C
+   by Marimba, Netscape, Sun, Novell, and At Home, aims to provide a
+   collection of new features for HTTP, to support ``the efficient
+   replication of data over HTTP'' [13].  One aspect of the DRP proposal
+   is the use of ``differential downloading,'' which is essentially a
+   form of delta encoding.  The original DRP proposal uses a different
+   approach than is described here, but a forthcoming revision of DRP
+   will be revised to conform to the proposal in this document.
+
+
+2 Goals
+
+   The goals of this proposal are:
+
+      1. Reduce the mean size of HTTP responses, thereby improving
+         latency and network utilization.
+
+      2. Avoid any extra network round trips.
+
+      3. Minimize the amount of per-request and per-response
+         overheads.
+
+      4. Support a variety of encoding algorithms and formats.
+
+      5. Interoperate with HTTP/1.0 and HTTP/1.1.
+
+      6. Be fully optional for clients, proxies, and servers.
+
+      7. Allow moderately simple implementations.
+
+   The goals do not include:
+
+      - Reducing the number of HTTP requests sent to an origin
+        server.
+
+      - Reducing the size of every HTTP message.
+
+      - Increasing the cache-hit ratio of HTTP caches.
+
+      - Allowing excessively simplistic implementations of delta
+        encoding.
+
+Mogul, Krishnamurthy, Douglis, Feldmann, Goland, van Hoff       [Page 6]
+
+
+Internet-Draft               Delta encoding          10 March 2000 09:57
+
+
+      - Delta encoding of request messages, or of responses to
+        methods other than GET.
+
+      Nothing in this specification specifically precludes the use of
+      a delta encoding for the body of a PUT request.  However, no
+      mechanism currently exists for the client to discover if the
+      server can interpret such messages, and so we do not attempt to
+      specify how they might be used.
+
+
+3 Terminology
+
+   HTTP/1.1 [10] defines the following terms:
+
+   resource         A network data object or service that can be
+                   identified by a URI, as defined in section 3.2.
+                   Resources may be available in multiple
+                   representations (e.g. multiple languages, data
+                   formats, size, resolutions) or vary in other ways.
+
+   entity           The information transferred as the payload of a
+                   request or response.  An entity consists of
+                   metainformation in the form of entity-header fields
+                   and content in the form of an entity-body, as
+                   described in section 7.
+
+   variant          A resource may have one, or more than one,
+                   representation(s) associated with it at any given
+                   instant. Each of these representations is termed a
+                   `variant.' Use of the term `variant' does not
+                   necessarily imply that the resource is subject to
+                   content negotiation.
+
+   The dictionary definition for ``entity'' is ``something that has
+   separate and distinct existence and objective or conceptual
+   reality'' [21].  Unfortunately, the definition for ``entity'' in
+   HTTP/1.1 is similar to that used in MIME [12], based on an entirely
+   false analogy between MIME and HTTP.
+
+   In MIME, electronic mail messages do have distinct and separate
+   existences, so the MIME definition of ``entity'' as something that
+   ``refers specifically to the MIME-defined header fields and contents
+   of either a message or one of the parts in the body of a multipart
+   entity'' makes sense.
+
+   In HTTP, however, a response message to a GET does not have a
+   distinct and separate existence.  Rather, it is describing the
+   current state of a resource (or a variant, subject to a set of
+   constraints).  The HTTP/1.1 specification provides no term to
+   describe ``the value that would be returned in response to a GET
+   request at the current time for the selected variant of the specified
+
+Mogul, Krishnamurthy, Douglis, Feldmann, Goland, van Hoff       [Page 7]
+
+
+Internet-Draft               Delta encoding          10 March 2000 09:57
+
+
+   resource.''  This leads to awkward wordings in the HTTP/1.1
+   specification in places where this concept is necessary.
+
+   It is too late to fix the terminological failure in the HTTP/1.1
+   specification, so we instead define a new term, for use in this
+   document:
+
+   instance         The entity that would be returned in a status-200
+                   response to a GET request, at the current time, for
+                   the selected variant of the specified resource, but
+                   without the application of any content-coding or
+                   transfer-coding.
+
+   One can think of an instance as a snapshot in the life of a resource.
+
+   It is convenient to think of an entity tag, in HTTP/1.1, as being
+   associated with an instance, rather than an entity.  That is, for a
+   given resource, two different response messages might include the
+   same entity tag, but two different instances of the resource should
+   never be associated with the same (strong) entity tag.
+
+   We will informally use the term ``delta,'' in this document, to mean
+   an HTTP response encoded as the difference between two instances.
+
+   We define one more term, whose implications will be discussed in
+   section 8:
+
+   uniqueness scope
+                   The uniqueness scope of an entity tag is the set of
+                   resources across which this entity tag is unique for
+                   all time.  That is, within this set of resources, if
+                   two instances share an entity tag, then the values of
+                   these instances (including their instance bodies and
+                   their instance headers) are equal.
+
+   In unmodified HTTP/1.1, the uniqueness scope of an entity tag is
+   always a single resource.  In this proposal, we provide a means to
+   extend the uniqueness scope to include multiple resources.
+
+
+4 Relationship between content-coding, transfer-coding, and ranges
+
+   HTTP/1.1 supports a number of different transformations on the body
+   of a value:
+
+   Content-coding   According to the specification, ``Content coding
+                   values indicate an encoding transformation that has
+                   been or can be applied to an entity. Content codings
+                   are primarily used to allow a document to be
+                   compressed or otherwise usefully transformed without
+                   losing the identity of its underlying media type and
+
+Mogul, Krishnamurthy, Douglis, Feldmann, Goland, van Hoff       [Page 8]
+
+
+Internet-Draft               Delta encoding          10 March 2000 09:57
+
+
+                   without loss of information. Frequently, the entity
+                   is stored in coded form, transmitted directly, and
+                   only decoded by the recipient.''  Content-codings are
+                   normally end-to-end transformations; i.e., once
+                   applied at the sender, they are not removed except at
+                   the ultimate recipient.  An intermediate server may
+                   apply a content-coding, in appropriate circumstances.
+
+   Transfer-coding  According to the specification, ``Transfer coding
+                   values are used to indicate an encoding
+                   transformation that has been, can be, or may need to
+                   be applied to an entity-body in order to ensure "safe
+                   transport" through the network.  This differs from a
+                   content coding in that the transfer coding is a
+                   property of the message, not of the original
+                   entity.''  Transfer-codings are explicitly hop-by-hop
+                   transformations (although, as an optimization, an
+                   intermediate proxy may store the transfer-coded
+                   version of a message if this behavior is not
+                   inconsistent with its externally visible function.)
+
+   Ranges           An HTTP client, using the Range header, may request
+                   that the server return one or more subranges of the
+                   instance, rather than the entire instance value.
+                   HTTP/1.1 only supports byte-ranges, although there is
+                   some possibility that future extensions will allow
+                   for other kinds of range-specifiers (such as chapters
+                   of a document).
+
+   A client signals its willingness to receive a content-coding by
+   sending an ``Accept-Encoding'' header, listing the set of
+   content-codings that it understands.  It may optionally include
+   information about which content-codings it prefers.  If a server uses
+   any non-identity content-coding(s), it includes a
+   ``Content-Encoding'' header field in the response, listing these
+   content-codings in their order of application.
+
+   RFC2616 [10] did not include an analogous mechanism for negotiating
+   the use of transfer-codings, although it does include an analogous
+   ``Transfer-Encoding'' header for marking the response.  A new ``TE''
+   header has since been added to HTTP/1.1 [10], analogous to the
+   ``Accept-Encoding'' header.
+
+   One must understand the relationship between these transformations in
+   order to see how delta encoding applies to HTTP responses.
+
+   Conceptually, the various transformations are related as follows:
+
+      1. Upon receiving a GET request, the server uses the URI in
+         the request to identify the requested resource.
+
+
+Mogul, Krishnamurthy, Douglis, Feldmann, Goland, van Hoff       [Page 9]
+
+
+Internet-Draft               Delta encoding          10 March 2000 09:57
+
+
+      2. Optionally, it uses information from the request (and
+         perhaps additional information) to select a variant of
+         that resource.
+
+      3. The result of the first two steps, at the time when the
+         request is processed, is an instance.  The instance
+         includes a body (possibly empty) and possibly some
+         instance headers.
+
+      4. At this point, the server may apply a non-identity
+         content-coding to the instance, or one might have been
+         inherent in its generation.  This also results in a
+         Content-Encoding header.
+
+      5. If the request included a Range header, the server may
+         optionally produce a range response, consisting of the
+         original set of headers, a Content-Range header, and the
+         appropriate range(s) from the (possibly encoded) body.
+
+      6. The result of the fifth step becomes the entity,
+         consisting of entity headers and an entity body.
+
+      7. The server may then apply a non-identity transfer-coding;
+         on-the-fly compression would be done in this step.  If so,
+         a Transfer-Encoding header is added to the message.
+
+      8. The results of the seventh step is the message, consisting
+         of a message body (the transfer-encoded version of the
+         entity body), the entity headers, and additional response
+         and general headers.
+
+   The distinction between transfer-coding and content-coding is most
+   visible when a Range is also involved, because Range selections are
+   applied after content-codings and before transfer-codings.  Ranges
+   are used for two main purposes:
+
+      1. to complete a partial response after a premature
+         termination of a message
+
+      2. to obtain just selected sections of an instance.
+
+   The former use of Range is consistent with the use of delta encoding
+   as a content-coding; the latter requires the use of delta encoding as
+   a transfer-coding.  (This proposal supports the use of delta encoding
+   as either a content-coding or a transfer-coding.)
+
+   Although it is possible to use delta encoding as a transfer-coding,
+   it is more likely to be useful as a content-coding.  Since
+   transfer-coding is done hop-by-hop, using a delta encoding is only
+   feasible if each caching proxy along the path has a cache entry for
+   both instances involved.  Otherwise, a caching proxy could not meet
+
+Mogul, Krishnamurthy, Douglis, Feldmann, Goland, van Hoff      [Page 10]
+
+
+Internet-Draft               Delta encoding          10 March 2000 09:57
+
+
+   the formal requirement that a transfer-coding is removed on each hop.
+   However, a proxy can always act as a ``tunnel'' when forwarding a
+   request which might elicit a response transfer-encoded with a delta
+   encoding; this removes the requirement that the proxy delete
+   transfer-codings.
+
+   It does not seem to make sense to apply delta encodings as both a
+   content-coding and transfer-coding for the same message.
+
+4.1 Ordering of transformations in the same phase
+   Another apparent ambiguity is whether, if both are applied as
+   content-codings (or both are applied as transfer-codings), should a
+   delta encoding be applied before or after compression?  Some
+   experience suggests that computing the delta between two different
+   compressed files can yield a relatively small result, if the files
+   are large and the differences are either very small, or near the end
+   of the files.  Similarly, some simple differencing algorithms (such
+   as the UNIX ``diff'' command) require post-compression of their
+   output to yield the best results.
+
+   However, HTTP's mechanism for negotiating the use of content-codings
+   (and the proposed mechanism for negotiating the use of
+   transfer-codings) does not specify a means for the client to request
+   that the transformations be applied in a specified order.  This is
+   not impossible; for example, the specification could be changed to
+   require that if multiple transformations are applied, then they are
+   applied in the order in which they appear in the ``Accept-Encoding''
+   header field (or in the ``TE'' header field).
+
+   A general requirement for preserving coding orderings would not be
+   compatible with deployed implementations of HTTP/1.1.  However, by
+   making such a requirement apply only when a delta encoding is listed,
+   we can avoid incompatibility, because delta encoding is not yet
+   deployed.  Therefore, this proposal requires that if any delta
+   encoding is used, either as a transfer-coding or as a content-coding,
+   then any other codings applied by the server must be applied in the
+   same order as they appear in the TE or Accept-Encoding header.  See
+   sections 13.1 and 13.2 for a formal specification of this
+   requirement.
+
+      Note that the HTTP/1.1 specification [10] requires that "if
+      multiple encodings have been applied to an entity, the
+      [content- or transfer-] codings MUST be listed in the order in
+      which they were applied."  This implies that clients will
+      remove these encodings in the opposite order.
+
+
+5 Basic mechanisms
+
+   In this section, we explain the concepts behind delta encoding.  This
+   is not meant as a formal specification of the proposed extensions;
+   see section 12 for that.
+Mogul, Krishnamurthy, Douglis, Feldmann, Goland, van Hoff      [Page 11]
+
+
+Internet-Draft               Delta encoding          10 March 2000 09:57
+
+
+5.1 Background: an overview of HTTP cache validation
+   When a client has a response in its cache, and wishes to ensure that
+   this cache entry is current, HTTP/1.1 allows the client to do a
+   ``conditional GET'', using one of two forms of ``cache validators.''
+   In the traditional form, available in both HTTP/1.0 and in HTTP/1.1,
+   the client may use the ``If-Modified-Since'' request-header to
+   present to the server the ``Last-Modified'' timestamp (if any) that
+   the server provided with the response.  If the server's timestamp for
+   the resource has not changed, it may send a response with a status
+   code of 304 (Not Modified), which does not transmit the body of the
+   resource.  If the timestamp has changed, the server would normally
+   send a response with a status code of 200 (OK), which carries a
+   complete copy of the resource, and a new Last-Modified timestamp.
+
+   This timestamp-based approach is prone to error because of the lack
+   of timestamp resolution: if a resource changes twice during one
+   second, the change might not be detectable.  Therefore, HTTP/1.1 also
+   allows the server to provide an entity tag with a response.  An
+   entity tag is an opaque string, constructed by the server according
+   to its own needs; the protocol specification imposes a bare minimum
+   of requirements on entity tags.  (In particular, a ``strong'' entity
+   tag must change if the value of the resource changes.) In this case,
+   the client may validate its cache entry by sending its conditional
+   request using the ``If-None-Match'' request-header, presenting the
+   entity tag associated with the cached response.  (The protocol
+   defines several other ways to transmit entity tags, such as the
+   ``If-Range'' header, used for short-circuiting an otherwise necessary
+   round trip.) If the presented entity tag matches the server's current
+   tag for the resource, the server should send a 304 (Not Modified)
+   response.  Otherwise, the server should send a 200 (OK) response,
+   along with a complete copy of the resource.
+
+   In the existing HTTP protocol (HTTP/1.0 or HTTP/1.1), a client
+   sending a conditional request can expect either of two responses:
+
+      - status = 200 (OK), with a full copy of the resource,
+        because the server's copy of the resource is presumably
+        different from the client's cached copy.
+
+      - status = 304 (Not Modified), with no body, because the
+        server's copy of the resource is presumably the same as the
+        client's cached copy.
+
+   Informally, one could think of these as ``deltas'' of 100% and 0% of
+   the resource, respectively.  Note that these deltas are relative to a
+   specific cached response.  That is, a client cannot request a delta
+   without specifying, somehow, which two instances of a resource are
+   being differenced.  The ``new'' instance is implicitly the current
+   instance that the server would return for an unconditional request,
+   and the ``old'' instance is the one that is currently in the client's
+   cache.  The cache validator (last-modified time or entity tag) is
+
+Mogul, Krishnamurthy, Douglis, Feldmann, Goland, van Hoff      [Page 12]
+
+
+Internet-Draft               Delta encoding          10 March 2000 09:57
+
+
+   what is used to communicate to the server the identity of the old
+   instance.
+
+5.2 Requesting the transmission of deltas
+   In order to support the transmission of actual deltas, an extension
+   to HTTP/1.1 needs to provide these features:
+
+      1. A way to mark a request as conditional.
+
+      2. A way to specify the old instance, to which the delta will
+         be applied by the client.
+
+      3. A way to indicate that the client is able to apply one or
+         more specific forms of delta encoding.
+
+      4. A way to mark a response as being delta-encoded in a
+         particular format.
+
+   The first two features are already provided by HTTP/1.1: the presence
+   of a conditional request-header (such as ``If-Modified-Since'' or
+   ``If-None-Match'') marks a request as conditional, and the value of
+   that header uniquely specifies the old instance (ignoring the problem
+   of last-modified timestamp granularity).
+
+   We defer discussion of the fourth feature, until section 5.6.
+
+   The third feature, a way for the client to indicate that it is able
+   to apply deltas (aside from the trivial 0% and 100% deltas), can be
+   accomplished by transmitting a list of acceptable delta-encoding
+   formats in a request-header field.  The presence of this list in a
+   conditional request indicates that the client is able to apply
+   delta-encoded cache updates.
+
+   A client that wishes to have a delta encoding used as a
+   content-coding does so by listing the name of one or more delta
+   encoding formats as content-codings in an ``Accept-Encoding'' header
+   field.
+
+   Similarly, a client that wishes to have a delta encoding used as a
+   transfer-coding does so by listing the name of one or more delta
+   encoding formats as content-codings in an ``TE'' header field.
+
+   In other words, we propose extending the the set of content-codings
+   and the set of transfer-codings to include a number of standard delta
+   encoding formats.
+
+   For example, a client might send this request:
+
+      GET /foo.html HTTP/1.1
+      If-None-Match: "123xyz"
+
+
+Mogul, Krishnamurthy, Douglis, Feldmann, Goland, van Hoff      [Page 13]
+
+
+Internet-Draft               Delta encoding          10 March 2000 09:57
+
+
+      Accept-Encoding: vcdiff, diffe, gzip
+
+   The meaning of this request is that:
+
+      - The client wants to obtain the current value of /foo.html.
+
+      - It already has a cached response for that resource, whose
+        entity tag is ``123xyz''.
+
+      - It is willing to accept delta-encoded updates using either
+        of two formats, ``diffe'' (i.e., output from the UNIX
+        ``diff -e'' command), and ``vcdiff''.  (Encoding algorithms
+        and formats, such as ``vcdiff'', are described in section
+        6.)
+
+      - It is willing to accept responses that have been compressed
+        using ``gzip,'' whether or not these are delta-encoded.
+        (However, based on the new ordering constraint proposed in
+        section 4.1, if both delta encoding and compression are
+        applied, then this request header specifies that
+        compression should be done last.)
+
+   If, in this example, the server's current entity tag for the resource
+   is still ``123xyz'', then it should simply return a 304 (Not
+   Modified) response, as would a traditional server.
+
+   If the entity tag has changed, presumably but not necessarily because
+   of a modification of the resource, the server could instead compute
+   the delta between the instance whose entity tag was ``123xyz'' and
+   the current instance.
+
+   We defer discussion of what the server needs to store, in order to
+   compute deltas, until section 7.
+
+   We note that if a client indicates it is willing to accept deltas,
+   but the server does not support this form of content-coding, the
+   HTTP/1.1 specification for ``Accept-Encoding'' allows the server to
+   simply ignore this.  Such a server acts as if the client had not
+   requested a delta-encoded response: it generates a status-200
+   response.
+
+5.3 Content-coding or Transfer-coding?
+   Since a delta encoding could be either a content-coding or a
+   transfer-coding, delta-capable clients have a choice to make when
+   constructing a request that might be answered with a delta.  That is,
+   should a client use Accept-Encoding or TE to indicate its willingness
+   to accept a delta-encoded response?
+
+   Since content-codings, unlike transfer-codings, are end-to-end (that
+   is, do not depend on support by intermediate proxies), in simple
+   cases, clients should probably request delta-encoded responses using
+
+Mogul, Krishnamurthy, Douglis, Feldmann, Goland, van Hoff      [Page 14]
+
+
+Internet-Draft               Delta encoding          10 March 2000 09:57
+
+
+   Accept-Encoding.  This maximizes the utility of delta encoding at the
+   origin server, since any delta-capable proxy along the request chain
+   is still free to make any appropriate use of delta-encoded responses
+   that it forwards.
+
+   However, if the origin server does not support delta encoding, but
+   the next-hop proxy both supports delta encoding and has the necessary
+   instances in its cache, then the client might gain some benefit from
+   requesting delta-encoded responses using TE.
+
+   A client wishing to maximize its likelihood of receiving a
+   delta-encoded response should send both Accept-Encoding and TE header
+   fields listing delta-encoding formats.  This does increase the size
+   of the request, so it is not necessarily the optimal approach.
+
+   The situation becomes more complex when the client is requesting a
+   Range of the instance.  As discussed in section 4, if the client's
+   purpose in requesting a Range is to complete a partial response after
+   a premature termination of a message, then it should use
+   Accept-Encoding to request a delta-encoded response.  (Presumably,
+   the interrupted response used the same delta encoding, if any.)
+
+   However, if the client's purpose in requesting a Range is to obtain
+   just a selected portion of the instance, and if it wants the response
+   to be delta-encoded against the same portion of another instance, it
+   should use TE to request a delta-encoded response.
+
+   A client sending a Range request SHOULD NOT list delta encoding
+   formats in both Accept-Encoding and TE request header fields, since
+   this amounts to an ambiguous declaration of the client's wishes with
+   respect to the Range selection.  If a server receives such an
+   ambiguous request, it MAY use either a delta content-coding, or a
+   delta transfer-coding; it SHOULD NOT use both.
+
+5.4 Choice of delta algorithm and format
+   The server is not required to transmit a delta-encoded response.  For
+   example, the result might be larger than the current size of the
+   resource.  The server might not be able to compute a delta for this
+   type of resource (e.g., a compressed binary format); the server might
+   not have sufficient CPU cycles for the delta computation; the server
+   might not support any of the delta formats supported by the client;
+   or, the network bandwidth might be high enough that the delay
+   involved in computing the delta is not worth the delay avoided by
+   sending a smaller response.
+
+   However, if the server does want to compute a delta, and the set of
+   encodings its supports has more than one encoding in common with the
+   set offered by the client, which encoding should it use?  This is
+   mostly at the option of the server, although the client can express
+   preferences using ``Quality Values'' (or ``qvalues'') in the
+   ``Accept-Encoding'' or ``TE'' header.  The HTTP/1.1
+
+Mogul, Krishnamurthy, Douglis, Feldmann, Goland, van Hoff      [Page 15]
+
+
+Internet-Draft               Delta encoding          10 March 2000 09:57
+
+
+   specification [10] describes qvalues in more detail.  (Clients may
+   prefer one delta encoding format over another that generates a
+   smaller encoding, if the decoding costs for the first format are
+   lower and the client is resource-constrained.)
+
+   Server implementations have a number of possible approaches.  For
+   example, if CPU cycles are plentiful and network bandwidth is scarce,
+   the server might compute each of the possible encodings and then send
+   the smallest result.  Or the server might use heuristics to choose an
+   encoding format, based on things such as the content-type of the
+   resource, the current size of the resource, and the expected amount
+   of change between instances of the resource.
+
+   Note that it might pay to cache the deltas internally to the server,
+   if a resource is typically requested by several different
+   delta-capable clients between modifications.  In this case, the cost
+   of computing a delta may be amortized over many responses, and so the
+   server might use a more expensive computation.
+
+5.5 Identification of delta-encoded responses
+   A response using delta encoding as either a content-coding or a
+   transfer-coding must be identified as such.  This is done using the
+   ``Content-Encoding'' or ``Transfer-Encoding'' headers defined in
+   HTTP/1.1.
+
+   However, a simplistic application of this approach would cause
+   serious problems if a content-coded delta response flows through an
+   intermediate (proxy) cache that is not cognizant of the delta
+   mechanism.  Because the Internet is full of HTTP/1.0 caches, which
+   might never be entirely replaced, and because the HTTP specifications
+   insist that message recipients ignore any header field that they do
+   not understand, a non-delta-capable proxy cache that receives a
+   delta-encoded response might store that response, and might later
+   return it to a non-delta-capable client that has made a request for
+   the same resource.  This naive client would believe that it has
+   received a valid copy of the entire resource, with predictably
+   unpleasant results.
+
+   This problem does not apply to responses using delta encoding only as
+   a transfer-coding, since ``Transfer-Encoding'' is a hop-by-hop header
+   field.
+
+   To solve this problem, we propose that delta-encoded responses (when
+   using a content-coding) be identified as such using a new HTTP status
+   code.  For specificity in the discussion that follows, we will use
+   the (currently unassigned) code of 226, with a reason phrase of
+   ``Delta''.  There is some precedent for this approach:  the HTTP/1.1
+   specification introduces the 206 (Partial Content) status code, for
+   the transmission of sub-ranges of a resource.  Existing proxies
+   apparently forward responses with unknown status codes, and do not
+   attempt to cache them.
+
+Mogul, Krishnamurthy, Douglis, Feldmann, Goland, van Hoff      [Page 16]
+
+
+Internet-Draft               Delta encoding          10 March 2000 09:57
+
+
+   An alternative to using a new status code would be to use the
+   ``Expires'' header to prevent HTTP/1.0 caches from storing the
+   response, then use ``Cache-control: max-age'' (defined in HTTP/1.1)
+   to allow more modern caches to store delta-encoded responses.  This
+   adds many bytes to the response headers, and so would reduce the
+   effectiveness of delta encoding.  It is also not entirely clear that
+   this approach suppresses all caching by all HTTP/1.0 proxies.  Most
+   importantly, it would not prevent incorrect caching by HTTP/1.1
+   shared caches that do not understand delta-encoded responses; this
+   implies that such responses would also have to be protected using the
+   Vary header.  E.g.:
+
+              HTTP/1.1 200 OK
+              Expires: Tue, 01 Jan 1970 00:00:01 GMT
+              Date: Wed, 24 Dec 1997 14:00:00 GMT
+              Cache-control: max-age=3600
+              Content-Encoding: vcdiff
+              Vary: Accept-Encoding, If-None-Match
+
+   Unfortunately, unless we were to also specify a complex new set of
+   rules for the interpretation of the Vary header, this would
+   significantly reduce the ability of a proxy cache that does
+   understand delta-encoding to optimize the responses it sends to
+   delta-capable clients.
+
+   Additionally, when a response both uses a delta encoding as a
+   content-coding, and carries a Range of an entity, one cannot simply
+   use a status code of 206 (Partial Content), because there are
+   HTTP/1.1 proxy caches that understand Ranges but not deltas.  One
+   could perhaps use 226 (Delta) and expect that all delta-capable
+   proxies also understand Content-Range; i.e., such a proxy would
+   realize from the presence of the Content-Range header that a partial
+   content is involved.  However, because it might make proxy
+   implementation simpler, we also introduce an additional status code
+   (provisionally, 227) with a reason phrase of ``Range of Delta''.
+
+      We were reluctant to define additional status codes as part of
+      the support for delta encoding.  However, we see no other way
+      to remain compatible with the present design of HTTP status
+      codes, and the deployed base of HTTP/1.1 cache implementations.
+
+5.6 Transmission of delta-encoded responses
+   A delta-encoded response differs from a standard response in three
+   ways:
+
+      1. It carries a status code of 226 (Delta), or 227 (Range of
+         Delta), if the delta encoding is a content-coding (but not
+         if is a transfer-coding).
+
+      2. It carries a ``Content-encoding'' header field, or a
+         ``Transfer-encoding'' header field, indicating which delta
+         encoding is used in this response.
+Mogul, Krishnamurthy, Douglis, Feldmann, Goland, van Hoff      [Page 17]
+
+
+Internet-Draft               Delta encoding          10 March 2000 09:57
+
+
+      3. Its message-body is a delta-encoding of the current
+         instance, rather than a full copy of the instance.
+
+   For example, a response to the request given in section 5.2 might
+   look like:
+
+      HTTP/1.1 226 Delta
+      ETag: "489uhw"
+      Content-Encoding: vcdiff
+      Date: Tue, 25 Nov 1997 18:30:05 GMT
+
+      ...
+
+   (We do not show the actual contents of the response body, since this
+   is a binary format.)
+
+      Note, when using a delta encoding as a transfer-coding, that
+      the HTTP/1.1 specification [10] requires that ``[whenever] a
+      transfer-coding is applied to a message-body, the set of
+      transfer-codings MUST include "chunked", unless the message is
+      terminated by closing the connection.''
+
+5.7 Examples of requests combing Range and delta encoding
+   We used this example in section 5.2: the client sends:
+
+      GET /foo.html HTTP/1.1
+      If-None-Match: "123xyz"
+      Accept-Encoding: vcdiff, diffe, gzip
+
+   and the server either responds with a 304 (Not Modified) response, or
+   with the appropriate delta encoding.
+
+   Here are a few more examples, to clarify how the client request
+   should be interpreted.
+
+   If the client sends
+
+      GET /foo.html HTTP/1.1
+      If-None-Match: "123xyz"
+      Accept-Encoding: vcdiff, diffe, gzip
+      Range: 0-99
+
+   then the meaning is the same as in the example above, except that
+   after the delta encoding (and compression, if any) is created, the
+   server then returns only the first 100 bytes of the output of the
+   delta encoding.  (If it is shorter than 100 bytes, the entire delta
+   encoding is returned.)
+
+   The interaction between the If-Range mechanism and delta encoding is
+   somewhat complex.  (If-Range means, informally, ``if the entity is
+   unchanged, send me the part(s) that I am missing; otherwise, send me
+
+Mogul, Krishnamurthy, Douglis, Feldmann, Goland, van Hoff      [Page 18]
+
+
+Internet-Draft               Delta encoding          10 March 2000 09:57
+
+
+   the entire new entity.'')  Here is an example that should clarify the
+   use of this combination.
+
+   Suppose that the client wants to have the complete current instance
+   of http://bar.example.net/foo.html.  It already has a (complete)
+   cache entry for this URI, with entity tag "A", so it issues this
+   request:
+
+      GET /foo.html HTTP/1.1
+      host: bar.example.net
+      If-None-Match: "A"
+      Accept-Encoding: vcdiff
+
+   Suppose that the server's current instance has entity tag "B", and
+   that the server also has retained a copy of the instance with entity
+   tag "A". Then, the server could compute the difference between "B"
+   and "A", and respond with:
+
+      HTTP/1.1 226 Delta
+      Etag: "B"
+      Content-Encoding: vcdiff
+      Date: Tue, 25 Nov 1997 18:30:05 GMT
+      Content-Length: 1000
+
+      ...
+
+   but the network connection is terminated after the client has
+   received exactly 900 bytes of the message body for the delta-encoded
+   content.
+
+   The client wants to retrieve the remaining 100 bytes of the
+   delta-encoding that was being sent in the interrupted response.  It
+   therefore should send:
+
+      GET /foo.html HTTP/1.1
+      host: bar.example.net
+      If-None-Match: "A"
+      If-Range: "B"
+      Accept-Encoding: vcdiff
+      Range: 900-
+
+   This rather elaborate request has a well-defined meaning, which
+   depends on the current entity tag Tcur of the instance when the
+   server receives the request:
+
+   Tcur = "A"       (i.e., for some reason, the instance has reverted to
+                   the value already in the client's cache).  The server
+                   must return a 304 (Not Modified) response, as
+                   required by the HTTP/1.1 specification for
+                   ``If-None-Match''.
+
+
+Mogul, Krishnamurthy, Douglis, Feldmann, Goland, van Hoff      [Page 19]
+
+
+Internet-Draft               Delta encoding          10 March 2000 09:57
+
+
+   Tcur = "B"       (i.e., the instance has not changed again).  The
+                   HTTP/1.1 specification for ``If-None-Match'', in this
+                   case, is that the header field is ignored (by a
+                   server that does not understand delta encoding).
+                   Therefore, this is equivalent to the client's
+                   previous request, except that the Range selection is
+                   applied after content-coding.  So the (delta-aware)
+                   server again computes the delta between the "A"
+                   instance and the "B" instance (or uses a cached
+                   computation of the delta), then applies the Range
+                   selection, and returns a 227 (Range of Delta)
+                   response, with an entity body containing bytes 900 to
+                   999 of the result of the vcdiff encoding.
+
+   Tcur = "C"       (i.e., the instance has changed again).  In this
+                   case, the HTTP/1.1 specification for
+                   ``If-None-Match'' again means that this is equivalent
+                   to an unconditional request for the current instance.
+                   The specification for ``If-Range'' requires the
+                   server to return the entire current entity.  However,
+                   a delta-aware server can construct the delta between
+                   the "A" instance described by the ``If-None-Match''
+                   field and the current ("C") instance, and return a
+                   226 (Delta) response.
+
+   If the client's request had not included the ``If-None-Match: "A"''
+   header field, the server could not have computed a delta, since it
+   would not have known which entire instance was already available to
+   the client.  If the request had not included the ``If-Range: "B"''
+   header field, the server could not have distinguished between the
+   latter two cases (Tcur = "B" or Tcur = "C") and would not have been
+   able to apply the Range selection to the result of delta encoding.
+
+
+6 Encoding algorithms and formats
+
+   A number of delta encoding algorithms and formats have been described
+   in the literature:
+
+   diff -e          The UNIX ``diff'' program is ubiquitously available,
+                   and is relatively fast for both encoding and decoding
+                   (decoding is actually done using the ``ed'' program).
+                   However, the size of the resulting deltas is
+                   relatively large.  This algorithm can only be used on
+                   text-format files.
+
+   diff -e | gzip   Running the output of ``diff'' through a compression
+                   algorithm such as ``gzip'' [5] (or, perhaps better,
+                   ``deflate'' [7, 6]) yields a more compact encoding,
+                   but the costs of encoding and decoding are much
+                   higher than for ``diff'' by itself.  This algorithm
+                   can only be used on text-format files.
+Mogul, Krishnamurthy, Douglis, Feldmann, Goland, van Hoff      [Page 20]
+
+
+Internet-Draft               Delta encoding          10 March 2000 09:57
+
+
+   vcdiff (vdelta)  The algorithm that generates the ``vcdiff''
+                   format [19, 20] inherently compresses its output, and
+                   generally produces smaller results than the
+                   combination of ``diff'' and ``gzip''.  The algorithm
+                   also runs much faster, and can be applied to
+                   binary-format input.  The ``vcdiff'' format is based
+                   on previous work on an algorithm named ``vdelta.''
+                   (Note that the ``vcdiff'' format can be used either
+                   for delta encoding or as a compressed format, so two
+                   different coding names would have to be defined in
+                   HTTP to distinguish these two uses.)  A recent study
+                   suggests that ``vdelta'' is the best overall delta
+                   algorithm [16].
+
+   gdiff            The gdiff format [14] was specified as a generic,
+                   algorithm-independent format for expressing deltas.
+                   Because it is more generic it is easy to implement,
+                   but it may not be the most compact encoding format.
+
+   Our proposal does not recommend any specific algorithm or format, but
+   rather encourages client and server implementors to choose the most
+   appropriate one(s).  However, to avoid the possibility of excessively
+   long ``Accept-Encoding'' (or ``TE'') headers, we suggest that, after
+   some period of experimentation, it might be reasonable to specify a
+   ``recommended'' set of delta formats for general-purpose HTTP
+   implementations.
+
+   We suspect that it should be possible to devise a delta encoding
+   algorithm appropriate for use on typical image encodings, such as GIF
+   and JPEG.  Although experiments with vdelta have not shown much
+   potential [23], this may simply be because these experiments used
+   vdelta directly on the already-compressed forms of these encodings.
+   However, it might be necessary to devise a delta encoding algorithm
+   that is aware of the two-dimensional nature of images.  We have some
+   expectation that this is possible, since MPEG compression relies on
+   computing deltas between successive frames of a video stream.
+
+6.1 IANA Considerations
+   The Internet Assigned Numbers Authority (IANA) administers the name
+   spaces for HTTP content-coding and transfer-coding values.  The sets
+   of delta-content-coding values and delta-transfer-coding values are
+   subsets, respectively, of the sets of HTTP content-coding and
+   transfer-coding values, and are therefore subject to the rules
+   established for these IANA registries by the HTTP/1.1
+   specification [10].
+
+
+7 Management of base instances
+
+   If the time between modifications of a resource is less than the
+   typical eviction time for responses in client caches, this means that
+
+Mogul, Krishnamurthy, Douglis, Feldmann, Goland, van Hoff      [Page 21]
+
+
+Internet-Draft               Delta encoding          10 March 2000 09:57
+
+
+   the ``old instance'' indicated in a client's conditional request
+   might not refer to the most recent prior instance.  This raises the
+   question of how many old instances of a resource should be maintained
+   by the server, if any.  We call these old instances ``base
+   instances.''
+
+   There are many possible options for server implementors.  For
+   example:
+
+      - The server might not store any old instances, and so would
+        never respond with a delta.
+
+      - The server might only store the most recent prior instance;
+        requests attempting to validate this instance could be
+        answered with a delta, but requests attempting to validate
+        older instances would be answered with a full copy of the
+        resource.
+
+      - The server might store all prior instances, allowing it to
+        provide a delta response for any client request.
+
+      - The server might store only a subset of the prior
+        instances.  The use of a Least Recently Used (LRU)
+        algorithm to determine this kind of subset has proved
+        effective in some similar circumstances, such as cache
+        replacement.
+
+   The server might not have to store prior instances explicitly.  It
+   might, instead, store just the deltas between specific base instances
+   and subsequent instances (or the inverse deltas between base
+   instances and prior instances).  This approach might be integrated
+   with a cache of computed deltas.
+
+   None of these approaches necessarily requires additional protocol
+   support.  However, if a server administrator wants to store only a
+   subset of the prior instances, but would like the server to be able
+   to respond using deltas as often as possible, then the client needs
+   some additional information.  Otherwise, the client's
+   ``If-None-Match'' header might specify a base instance not stored at
+   the server, even though an appropriate base instance is held in the
+   client's cache.
+
+   We identify two additional protocol changes to help solve this
+   problem.
+
+7.1 Multiple entity tags in the If-None-Match header
+   Although the examples we have given so far show only one entity tag
+   in an ``If-None-Match'' header, the HTTP/1.1 specification allows the
+   header to carry more than one entity-tag.  This feature was included
+   in HTTP/1.1 to support efficient caching of multiple variants of a
+   resource, but it is not restricted to that use.
+
+Mogul, Krishnamurthy, Douglis, Feldmann, Goland, van Hoff      [Page 22]
+
+
+Internet-Draft               Delta encoding          10 March 2000 09:57
+
+
+   Suppose that a client has kept more than one instance of a resource
+   in its cache.  That is, not only does it keep the most recent
+   instance, but it also holds onto copies of one or more prior, invalid
+   instances.  (Alternatively, it might retain sufficient delta or
+   inverse-delta information to reconstruct older instances.)  In this
+   case, it could use its conditional request to tell the server about
+   all of the instances it could apply a delta to.  For example, the
+   client might send:
+
+      GET /foo.html HTTP/1.1
+      host: bar.example.net
+      If-None-Match: "123xyz", "337pey", "489uhw"
+      Accept-Encoding: vcdiff
+
+   to indicate that it has three instances of this resource in its
+   cache.  If the server is able to generate a delta from any of these
+   prior instances, it can select the appropriate base instance, compute
+   the delta, and return the result to the client.
+
+   In this case, however, the server must also tell the client which
+   base instance to use, and so we need to define a response header,
+   named ``Delta-base'', for this purpose.  For example, the server
+   might reply:
+
+      HTTP/1.1 226 Delta
+      ETag: "1acl059"
+      Content-Encoding: vcdiff
+      Delta-base: "337pey"
+      Date: Tue, 25 Nov 1997 18:30:05 GMT
+
+   This response tells the client to apply the delta to the cached
+   response with entity tag ``337pey'', and to associate the entity tag
+   ``1acl059'' with the result.
+
+   Of course, if the server has retained more than one of the prior
+   instances identified by the client, this could complicate the problem
+   of choosing the optimal delta to return, since now the server has a
+   choice not only of the delta format, but also of the base instance to
+   use.
+
+7.2 Hints for managing the client cache
+   Support for multiple entity tags in choosing the base instance
+   implies that a client might benefit from storing multiple old
+   instances of a resource in its cache.  A client with finite space
+   would not want to keep all old instances, so it must manage its cache
+   for maximal effectiveness by saving those instances most likely to be
+   useful for future deltas.  Although this could be accomplished using
+   information purely local to the client (e.g., an LRU algorithm),
+   certain ``hint'' information from the server could improve the
+   client's ability to manage its cache.  The use of hints for improving
+   Web cache performance has been described previously [22, 4].
+
+Mogul, Krishnamurthy, Douglis, Feldmann, Goland, van Hoff      [Page 23]
+
+
+Internet-Draft               Delta encoding          10 March 2000 09:57
+
+
+   If the server intends to retain certain instances and not others, it
+   can label the responses that transmit the retained instances.  This
+   would help the client manage its cache, since it would not have to
+   retain all prior instances on the possibility that only some of them
+   might be useful later.  The label is a hint to the client, not a
+   promise that the server will indefinitely retain an instance.
+
+   We propose adding a new directive to the existing ``Cache-control''
+   header for this purpose, named ``retain''.  For example, in response
+   to an unconditional request, the server might send:
+
+      HTTP/1.1 200 OK
+      ETag: "337pey"
+      Date: Tue, 25 Nov 1997 18:30:05 GMT
+      Cache-control: retain
+
+   to suggest that a delta-capable client should retain this instance.
+   The ``retain'' directive could also appear in a delta response:
+
+      HTTP/1.1 226 Delta
+      ETag: "1acl059"
+      Date: Tue, 25 Nov 1997 18:30:05 GMT
+      Cache-control: retain
+      Content-Encoding: vcdiff
+      Delta-base: "337pey"
+
+   The ``retain'' directive includes an optional timeout parameter,
+   which the server can use if it expects to delete an old base instance
+   at a particular time.  For example,
+
+      HTTP/1.1 200 OK
+      ETag: "337pey"
+      Date: Tue, 25 Nov 1997 18:30:05 GMT
+      Cache-control: retain=3600
+
+   means that the server intends to retain this base instance for one
+   hour.
+
+   Another situation where a server can provide a hint to a client is
+   where the server supports the delta mechanism in general, but does
+   not intend to provide delta-encoded responses for a particular
+   resource.  By sending a ``retain=0'' directive, it indicates that the
+   client should not waste request-header bytes attempting to obtain a
+   delta-encoded response using this base instance (and, by implication,
+   for this resource).  It also indicates that the client ought not
+   waste cache space on this instance after it has become stale.  To
+   avoid wasting response-header bytes, a server ought not send
+   ``retain=0'' except in reply to a request that attempts to obtain a
+   delta-encoded response.
+
+
+
+Mogul, Krishnamurthy, Douglis, Feldmann, Goland, van Hoff      [Page 24]
+
+
+Internet-Draft               Delta encoding          10 March 2000 09:57
+
+
+   Note that the ``retain'' directive is orthogonal to the ``max-age''
+   directive.  The ``max-age'' directive indicates how long a cache
+   entry remains fresh (i.e.,can be used without contacting the origin
+   server for revalidation); the ``retain'' directive is of interest to
+   a client after the cache entry has become stale.
+
+   In practice, the ``Cache-control'' response-header field might
+   already be present, so the cost (in bytes) of sending this directive
+   might be smaller than these examples implies.
+
+
+8 Delta-encoding and clustering
+
+   The basic delta-encoding model assumes that deltas are computed
+   between two instances of a specific resources; i.e., both deltas are
+   associated with a single URL.  However, the WebExpress project [15]
+   suggested that by treating a query URL (that is, a URL with an
+   embedded ``?'')  as a prefix followed by a set of parameters, one
+   could then profitably compute deltas between resource values whose
+   URLs have identical prefixes, but perhaps different parameters
+   (suffixes).  Our trace-based study confirmed this [23].  We believe
+   that this might be generalized to certain other patterns of URLs
+   (i.e., not just those using ``?'' as a separator).  We use the term
+   ``clustering'' for this approach.
+
+   For example, if a client has cached a response for a DEC stock quote
+   (``http://quote.yahoo.com/q?s=DEC&d=f''), and then requests a quote
+   for AT&T from the same server (``http://quote.yahoo.com/q?s=T&d=f''),
+   the prefix for the cluster would be ``http://quote.yahoo.com/q?''.
+
+   In order to support clustering, we need a mechanism for the server to
+   indicate to the client which URLs are eligible for clustering (since
+   it would be highly inefficient for the client to send the entity tags
+   of every resource in its cache on every request).
+
+   We propose a new, optional response header for this purpose, to
+   specify a URL-prefix for other resources that ``cluster'' with the
+   given response.  The header name is ``DCluster''.
+
+   Once a cluster-eligible response is cached, when the client is about
+   to make a subsequent request, it would match the request-URI against
+   all of the URL-prefixes in its cache.  The ``If-None-Match'' field in
+   its request could then list the entity tags for all of the matching
+   entries.  In some cases, it might be more efficient to list only a
+   subset (such as the most recently received cache entries), to avoid
+   excessive request header lengths.
+
+   For example, if a client makes this initial request:
+
+      GET /foo?p=1 HTTP/1.1
+
+
+Mogul, Krishnamurthy, Douglis, Feldmann, Goland, van Hoff      [Page 25]
+
+
+Internet-Draft               Delta encoding          10 March 2000 09:57
+
+
+      Host: bar.example.net
+
+   and receives this response:
+
+      HTTP/1.1 200 OK
+      Date: Sun, 06 Nov 1994 08:49:37 GMT
+      Etag: "abc"
+      DCluster: "//bar.example.net/foo?"
+
+   then when the client later makes a request for
+   ``http://bar.example.net/foo?p=2'', it can match the stored cluster
+   prefix in its cache, and generate this request:
+
+      GET /foo?p=2 HTTP/1.1
+      Host: bar.example.net
+      If-None-Match: "abc"
+      Accept-encoding: vcdiff
+
+   As a generalization, the DCluster header field may include multiple
+   URL-prefixes, to allow specification of a set of URIs that do not
+   share a single common prefix.
+
+   In order to use this approach to clustering, we need to impose one
+   important constraint.  HTTP/1.1 requires so-called ``strong'' entity
+   tags to be unique for a given URI, but does not impose any broader
+   uniqueness requirements.  However, if a server sends a ``DCluster''
+   header, this implies that the entity tag in the response is unique
+   not only for the Request-URI, but also for all URIs for which the
+   string given by ``DCluster'' is a prefix.
+
+   We call this set of URIs the ``uniqueness scope'' of the entity tag.
+   Note that a response might carry multiple ``DCluster'' header fields
+   (or, by the basic HTTP syntax rules, one such header field with a
+   comma-separated list of prefix strings).  This means that the
+   uniqueness scope is the union of the scopes specified by the set of
+   prefixes, plus the original Request-URI.  Because the URI in a
+   ``DCluster'' header field can be an absolute URI (i.e., contain a
+   host name), a uniqueness scope can span multiple servers.
+   Presumably, these servers have some out-of-band means to maintain the
+   uniqueness property.
+
+   A client making a request may have cache entries for many different
+   resources in the uniqueness scope of the Request-URI.  This is
+   another situation where the ability of ``If-None-Match'' to carry
+   multiple entity tags is employed.  Abstractly, when the client makes
+   a request for which it wants a delta-encoded response, it finds all
+   of its cache entries in the same uniqueness scope, then sends the
+   entity tags for these cache entries in an ``If-None-Match'' header.
+
+   It would not make sense to have an extremely broad uniqueness scope
+   (i.e., one that includes large numbers of resources), because this
+
+Mogul, Krishnamurthy, Douglis, Feldmann, Goland, van Hoff      [Page 26]
+
+
+Internet-Draft               Delta encoding          10 March 2000 09:57
+
+
+   would imply that a client that has cache entries for many of those
+   files would send lots of entity-tags in its request for a delta.
+   This would bloat the request message, obviating the transfer-time
+   reduction of the delta encoding.  Therefore, in actual use, the
+   ``DCluster'' header field value should represent not the entire
+   uniqueness scope, but a subset of the uniqueness scope that is most
+   likely to result in small deltas.
+
+   Client implementations, however, should be prepared to prune their
+   ``If-None-Match'' headers in case a server inadvertently (or
+   maliciously) specifies an over-broad uniqueness scope.
+
+   Server implementation that support clustering should minimize the
+   length of the entity tags that they generate, consistent with the
+   other requirements for entity tags, since the effect of overlong
+   entity on request-header size is potentially multiplied many times by
+   the use of clustering.
+
+   Note that the ``DCluster'' header can be used in a potential spoofing
+   attack.  This attack, and defenses against it, are discussed in
+   section 16.1.
+
+
+9 Use of templates
+
+   The model of delta encoding outlined so far requires the server to
+   compute a delta between the current instance of the resource and some
+   previous instance of that resource, or (if clustering is used) a
+   previous instance of some other resource.  This means that the base
+   instance is, in effect, a moving target, since we do not want to
+   require servers or clients to retain old instances for indefinite
+   periods.
+
+   Douglis et al. describe an approach to dynamically-generated
+   documents in which the document is broken down into separate static
+   and dynamic parts [9].  The static part is a macro with unbound
+   variables, and the dynamic part is a set of bindings between
+   variables and specific values.  In their mechanism, the client
+   retains the static part, called a ``template'' in its cache.  It
+   repeatedly requests, as needed, a new instance of the dynamic part,
+   and then reevaluates the template macro, with its variables bound as
+   specified in the dynamic part, in order to generate the current
+   instance of the entire document.  Their macro language is an
+   extension to HTML, although other languages (such as Java) might be
+   just as suitable.
+
+   The WebExpress project [15] adopted the concept of a designated
+   ``base object'', which is nearly identical to the template concept
+   described here.  WebExpress included a mechanism for ``rebasing'' a
+   client (providing it with a new base object).  The primary difference
+   between the WebExpress approach and our approach is the time at which
+   a client discovers the identity of a (possibly new) template.
+Mogul, Krishnamurthy, Douglis, Feldmann, Goland, van Hoff      [Page 27]
+
+
+Internet-Draft               Delta encoding          10 March 2000 09:57
+
+
+   We can apply a similar template-based mechanism to substantially
+   simplify the use of delta encoding.  In this approach, the server
+   ``computes'' the delta between the current instance of a resource,
+   and a separately-identified template resource.  (Depending on the
+   encoding format, it might be possible to generate the delta directly,
+   rather than generating the current instance and then computing a
+   delta.)  The client then applies the delta to the template resource,
+   rather than to a previous instance of the requested resource.
+
+   Since this approach avoids the need to retain old instances of the
+   dynamic resource at either the client or the server, it greatly
+   simplifies the implementation and optimization of base instance
+   management at both client and server.  However, it requires a new
+   mechanism to inform the client of the appropriate template resource,
+   and its success may depend on the proper construction of the
+   template.
+
+   To support template-base deltas, therefore, we define a new response
+   header that the origin server uses as a ``hint'' to inform a client
+   of the URI of the template resource.  For example, if the client
+   request is
+
+      GET /foo.html HTTP/1.1
+      Host: bar.example.net
+      Accept-Encoding: vcdiff
+
+   the server might send:
+
+      HTTP/1.1 200 OK
+      Date: Sun, 06 Nov 1994 08:49:37 GMT
+      Etag: "abc"
+      DTemplate: "http://bar.example.net/foo.tplt"
+
+   The implication of the DTemplate header is that, on subsequent
+   requests for http://bar.example.net/foo.html, the client should ask
+   for a delta between http://bar.example.net/foo.tplt and the current
+   instance.  This means, of course, that the client would first have
+   obtained and cached an instance of http://bar.example.net/foo.tplt.
+   The client might retrieve the template either on demand (i.e., just
+   before making the new request for foo.html), or during an otherwise
+   idle moment, or not at all (since the use of deltas is fully
+   optional).
+
+   The DTemplate header implies that the specified URL is within the
+   uniqueness scope of the Request-URI (or else it would not be
+   meaningful to ask for a delta between the template and the
+   Request-URI).  For example, if the client requests the template:
+
+      GET /foo.tplt HTTP/1.1
+      Host: bar.example.net
+
+
+Mogul, Krishnamurthy, Douglis, Feldmann, Goland, van Hoff      [Page 28]
+
+
+Internet-Draft               Delta encoding          10 March 2000 09:57
+
+
+   and receives the response:
+
+      HTTP/1.1 200 OK
+      Date: Sun, 06 Nov 1994 08:49:47 GMT
+      Etag: "pqr"
+
+   then the client can make a subsequent request for foo.html as:
+
+      GET /foo.html HTTP/1.1
+      Host: bar.example.net
+      If-None-match: "pqr"
+      Accept-Encoding: vcdiff
+
+   Alternatively, the DTemplate header field can be used to specify that
+   a specific instance of a resource (rather than any available
+   instance) be used as a template, by including an entity tag in the
+   header field.  For example:
+
+      HTTP/1.1 200 OK
+      Date: Sun, 06 Nov 1994 08:49:37 GMT
+      Etag: "abc"
+      DTemplate: "http://bar.example.net/foo.tplt"/etag="pqr"
+
+   This form of the header further simplifies the instance-management
+   problem, by eliminating any ambiguity about which instances are worth
+   saving.  It might, however, reduce the possibilities for delta
+   encoding.
+
+   Finally, the DTemplate and DCluster headers can be combined.  For
+   example:
+
+      HTTP/1.1 200 OK
+      Date: Sun, 06 Nov 1994 08:49:37 GMT
+      Etag: "abc"
+      DTemplate: "http://bar.example.net/foo.tplt"
+      DCluster: "//bar.example.net/foo?"
+
+   This means that for any Request-URI matching the prefix specified in
+   the DCluster header field, the URI specified in the DTemplate field
+   is an appropriate template.
+
+   Note that an origin server ought not necessarily send a DTemplate
+   header field on every response; doing so could waste network
+   bandwidth, if the recipient is not delta-capable.  Instead, the
+   server should employ heuristics to decide whether to send this header
+   field.  For example, it might be worth sending it whenever the
+   client's request message indicates its willingness to accept a
+   delta-encoded response, and when the If-None-Match field in the
+   request does not already specify the entity-tag of the template
+   resource.
+
+
+Mogul, Krishnamurthy, Douglis, Feldmann, Goland, van Hoff      [Page 29]
+
+
+Internet-Draft               Delta encoding          10 March 2000 09:57
+
+
+10 Deltas and intermediate caches
+
+   Although we have designed the delta-encoded responses so that they
+   will not be stored by naive proxy caches, if a proxy does understand
+   the delta mechanism, it might be beneficial for it to participate in
+   sending and receiving deltas.
+
+   A proxy could participate in several independent ways:
+
+      - In addition to forwarding a delta-encoded response, the
+        proxy might store it, and then use it to reply to a
+        subsequent request with a compatible ``If-None-Match''
+        field (i.e., one that is either a superset of the
+        corresponding field of the request that first elicited the
+        response, or one that includes the ``Delta-base'' value in
+        the cached response), and with a compatible
+        ``Content-Encoding'' or ``Transfer-Encoding'' field (one
+        that includes the actual delta-encoding used in the
+        response.)  Of course, such uses are subject to all of the
+        other HTTP rules concerning the validity of cache entries.
+
+      - In addition to forwarding a delta-encoded response, the
+        proxy might apply the delta to the appropriate entry in its
+        own cache, which could then be used for later responses
+        (even from non-delta-capable clients).
+
+      - When the proxy receives a conditional request from a
+        delta-capable client, and the proxy has a complete copy of
+        an up-to-date (``fresh,'' in HTTP/1.1 terminology) response
+        in its cache, it could generate a delta locally and return
+        it to the requesting client.
+
+      - When the proxy receives a request from a non-delta-capable
+        client, it might convert this into a delta request before
+        forwarding it to the server, and then (after applying a
+        resulting delta response to one of its own cache entries)
+        it would return a full-body response to the client.
+
+   All of these optional techniques increase proxy software complexity,
+   and might increase proxy storage or CPU requirements.  However, if
+   applied carefully, they should help to reduce the latencies seen by
+   end users, and load on the network.  Generally, CPU speed and disk
+   costs are improving faster than network latencies, so we expect to
+   see increasing value available from complex proxy implementations.
+
+
+11 Digests for data integrity
+
+   When a recipient reassembles a complete HTTP response from several
+   individual messages, it might be necessary to check the integrity of
+   the complete response.  For example, the client's cache might be
+
+Mogul, Krishnamurthy, Douglis, Feldmann, Goland, van Hoff      [Page 30]
+
+
+Internet-Draft               Delta encoding          10 March 2000 09:57
+
+
+   corrupt, or the implementation of delta-encoding (either at client or
+   server) might have a bug, or a malicious server could have sent a
+   bogus ``Dcluster'' header.
+
+   HTTP/1.1 includes mechanisms for ensuring the integrity of individual
+   messages.  A message may include a ``Content-MD5'' response header,
+   which provides an MD5 message digest of the body of the message (but
+   not the headers).  The Digest Authentication mechanism [11] provides
+   a similar message-digest function, except that it includes certain
+   header fields.  Neither of these mechanisms makes any provision for
+   covering a set of data transmitted over several messages, as would be
+   the case for the result of applying a delta-encoded response (or, for
+   that matter, a Range response).
+
+   Data integrity for reassembled messages requires the introduction of
+   a new message header.  Such a mechanism is proposed in a separate
+   document [24].  One might still want to use the Digest Authentication
+   mechanism, or something stronger, to protect delta messages against
+   tampering.
+
+
+12 Specification
+
+   In this specification, the The key words "MUST", "MUST NOT",
+   "SHOULD", "SHOULD NOT", and "MAY" document are to be interpreted as
+   described in RFC2119 [3].
+
+12.1 Protocol parameter specifications
+   This specification defines no new HTTP parameter types.  It does,
+   however, extend the sets of content-codings and transfer-codings.
+
+   The set of content-coding values is extended:
+
+       content-coding = token | delta-content-coding
+       delta-content-coding = token
+
+   The set of delta-content-coding values is initially:
+
+      - vcdiff
+        A delta using the ``vcdiff'' encoding format [19, 20].
+
+      - diffe
+        The output of the UNIX ``diff -e'' command [25].
+
+      - gdiff
+        The GDIFF encoding format [14].
+
+   An HTTP implementation that supports any delta-content-coding values
+   SHOULD support the vcdiff format.  This provides an efficient ``least
+   common denominator'' delta-content-coding format.  This is not a
+   mandatory requirement of the specification.
+
+Mogul, Krishnamurthy, Douglis, Feldmann, Goland, van Hoff      [Page 31]
+
+
+Internet-Draft               Delta encoding          10 March 2000 09:57
+
+
+   The set of transfer-coding values is extended:
+
+       transfer-coding = token | delta-transfer-coding
+       delta-transfer-coding = token
+
+   The set of delta-transfer-coding values is initially:
+
+      - vcdiff
+        A delta using the ``vcdiff'' encoding format [19, 20].
+
+      - diffe
+        The output of the UNIX ``diff -e'' command [25].
+
+      - gdiff
+        The GDIFF encoding format [14].
+
+   An HTTP implementation that supports any delta-transfer-coding values
+   SHOULD support the vcdiff format.  This provides an efficient ``least
+   common denominator'' delta-transfer-encoding format.  This is not a
+   mandatory requirement of the specification.
+
+12.2 Status code specifications
+   The following new status codes are defined for HTTP.  (Note that the
+   precise 3-digit values for these codes may change, as a result of the
+   process now being considered for allocating HTTP status codes [18].)
+
+12.2.1 226 Delta
+   The server has fulfilled a GET request for the resource, and is
+   returning a delta between the current instance of the resource and a
+   previous instance.  The request MUST have included an Accept-Encoding
+   header field listing at least one delta-content-coding.  The response
+   MUST include an Etag header field giving the entity tag of the
+   current instance, and SHOULD include a Delta-Base header field giving
+   the entity tag of the previous instance.
+
+   A response received with a status code of 226 MAY be stored by a
+   cache and used in reply to a subsequent request (subject to the HTTP
+   expiration mechanism and any Cache-control headers), if
+   content-coding is consistent with the Accept-Encoding field of the
+   subsequent request, and if that request does not include a Range
+   header.
+
+   A response received with a status code of 226 MAY be used by a cache,
+   in conjunction with a cache entry for the base instance, to create a
+   cache entry for the current instance.
+
+12.2.2 227 Range of Delta
+   The server has fulfilled a partial GET request for the resource, and
+   is using, as a content-coding, a delta between the current instance
+   of the resource and a previous instance.  The request MUST have
+   included an Accept-Encoding header field listing at least one
+
+Mogul, Krishnamurthy, Douglis, Feldmann, Goland, van Hoff      [Page 32]
+
+
+Internet-Draft               Delta encoding          10 March 2000 09:57
+
+
+   delta-content-coding.  The response MUST include an Etag header field
+   giving the entity tag of the current instance, and SHOULD include a
+   Delta-Base header field giving the entity tag of the previous
+   instance.  Except for its status code, the response meets the
+   requirements for a 206 (Partial Content) response.
+
+   A response received with a status code of 227 MAY be may be stored by
+   a cache and used in reply to a subsequent request (subject to the
+   HTTP expiration mechanism and any Cache-control headers), if
+   content-coding is consistent with the Accept-Encoding field of the
+   subsequent request, and if that request includes a Range header
+   consistent with the Content-Range header(s) in the response, and if
+   the cache meets the requirements stated for caching of 206 (Partial
+   Contents) responses.
+
+   A response received with a status code of 227 MAY be used by a cache,
+   in conjunction with a cache entry for the base instance, to create or
+   update a partial cache entry for the current instance, if the cache
+   supports the Content-Range header.
+
+12.3 Header specifications
+   The following headers are defined, for use as entity-headers.  (Due
+   to the terminological confusion discussed in section 3, some
+   entity-headers are more properly associated with instances than with
+   entities.)
+
+12.3.1 Delta-Base
+   The Delta-Base entity-header field is used in a delta-encoded
+   response to specify the entity tag of the base instance.  A
+   delta-encoded response has a status code of 226 (Delta) or 227 (Range
+   of Delta).  A delta-encoded response encodes the difference between
+   the current instance of the requested resource, and some other
+   instance of the same resource, or of a different resource in the same
+   uniqueness scope.
+
+       Delta-Base = "Delta-Base" ":" entity-tag
+
+   A Delta-Base header field MUST be included in a 226 (Delta) or 227
+   (Range of Delta) response, or in a response that uses a delta
+   transfer-coding, if the request included more than one entity tag in
+   its If-None-Match header field, or if the uniqueness scope for an
+   entity tag of any instance of the requested resource has ever
+   included another resource.
+
+   Any 226 or 227 response MAY include a Delta-base header.  A
+   Delta-Base header MAY be included in a response using a delta
+   transfer-coding, but if so, and if a forwarding agent also removes
+   the delta transfer-coding, the Delta-Base header MUST be removed
+   before the message is forwarded.
+
+
+
+Mogul, Krishnamurthy, Douglis, Feldmann, Goland, van Hoff      [Page 33]
+
+
+Internet-Draft               Delta encoding          10 March 2000 09:57
+
+
+      ---------
+      We are not aware of other cases where a delta-encoded response
+      MUST or SHOULD include a Delta-base header, but we have not
+      done an exhaustive or formal analysis.  Implementors might be
+      wise to include a Delta-base header in every delta-encoded
+      response.
+      ---------
+
+12.3.2 DCluster
+   The DCluster entity-header field is used in a response to specify a
+   subset of the uniqueness scope of the entity tag given in the Etag
+   header field of the response.  The uniqueness scope is the set of
+   URIs across which this strong entity tag is guaranteed to be unique,
+   for all time.  A uniqueness scope is specified by providing one or
+   more prefixes for other URIs in the set.
+
+       DCluster = "DCluster" ":" #( <"> uri-prefix <">)
+       uri-prefix = scheme ":" "//" host [ ":" port ] [ abs_path ]
+               | abs_path
+               | rel_path
+
+   If the uri-prefix is an abs_path or rel_path, the implied scheme is
+   the scheme used in the Request-URI.  (Typically, the scheme would be
+   "http".)  If the uri-prefix is an abs_path, it is interpreted
+   relative to the origin server host name.  If the uri-prefix is a
+   rel_path, it is interpreted relative to the Request-URI.
+
+   The uniqueness scope of a strong entity tag in an ETag header field
+   always includes the Request-URI of the corresponding request, and the
+   union of all URIs matching one or more of the uri-prefix strings in
+   the DCluster header field of the response.  It may include other URIs
+   not described in a DCluster header field.  That is, the set of URIs
+   for which a uri-prefix in a DCluster header field is a prefix MUST be
+   a subset of the uniqueness scope, and MAY be a proper subset.
+
+   Generally, the DCluster header does not necessarily describe the
+   entire uniqueness scope of an entity tag.  Rather, it describes a
+   subset of the uniqueness scope whose members are likely to differ by
+   small deltas.
+
+   The uniqueness scope specified by a DCluster header is valid for use
+   by the client only for entity tags received in the same response or
+   in subsequent responses, never for entity tags received in previous
+   responses.
+
+12.3.3 DTemplate
+   The DTemplate entity-header field is used in a response to specify
+   another resource that the origin server prefers to use as the base
+   instance for computing deltas for the Request-URI, or for other
+   resources in the uniqueness scope specified by a DCluster header
+   field in the response.
+
+Mogul, Krishnamurthy, Douglis, Feldmann, Goland, van Hoff      [Page 34]
+
+
+Internet-Draft               Delta encoding          10 March 2000 09:57
+
+
+       DTemplate = "DTemplate" ":"
+                        #( <"> dt-uri <"> [ "/" dt-param])
+       dt-uri = absoluteURI | abs_path
+       dt-param = "etag" "=" entity-tag
+
+   If the dt-uri is an abs_path, it is interpreted relative to the
+   origin server host name.
+
+   A URI specified in a DTemplate header field is, by definition, in the
+   uniqueness scope of the Request-URI.
+
+   If a client has received a DTemplate header field within a given
+   uniqueness scope, the client SHOULD use an instance of the specified
+   template resource(s) as the base instance for any future delta
+   requests for other resources in the uniqueness scope.
+
+   If the DTemplate header field includes an entity tag with a URI, then
+   the client SHOULD use only the specified instance of the template
+   resource base instance for any future delta requests for other
+   resources in the uniqueness scope.
+
+   The URI specified by a DTemplate header is valid for use by the
+   client only with entity tags received in the same response or in
+   subsequent responses, never for use with entity tags received in
+   previous responses.
+
+
+13 New requirements for existing headers
+
+13.1 Accept-Encoding
+   When an Accept-Encoding request-header field includes one or more
+   delta-content-coding values, the request MUST contain an
+   If-None-Match header field, listing one or more entity tags from URIs
+   in the uniqueness scope of an entity tag from a prior response for
+   the request-URI.
+
+   If a response uses a delta-content-coding as a content-coding, and
+   the response uses more than one non-identity content-coding, the
+   content-codings MUST be applied in the order in which they appear in
+   the Accept-Encoding request-header field.
+
+   A server MUST NOT use a delta-content-coding for a response unless
+   the delta-content-coding is listed in an Accept-Encoding header in
+   the request.
+
+13.2 TE
+   When a TE request-header field includes one or more
+   delta-transfer-coding values, the request MUST contain an
+   If-None-Match header field, listing one or more entity tags from URIs
+   in the uniqueness scope of an entity tag from a prior response for
+   the request-URI.
+
+Mogul, Krishnamurthy, Douglis, Feldmann, Goland, van Hoff      [Page 35]
+
+
+Internet-Draft               Delta encoding          10 March 2000 09:57
+
+
+   If a response uses a delta-transfer-coding as a transfer-coding, and
+   the response uses more than one non-identity transfer-coding, the
+   transfer-codings MUST be applied in the order in which they appear in
+   the TE request-header field.
+
+   A server MUST NOT use a delta-transfer-coding for a response unless
+   the delta-transfer-coding is listed in a TE header in the request.
+
+13.3 Use of compression with delta encoding
+   The application of data compression to the diffe and gdiff delta
+   codings has been shown to greatly reduce the size of the resulting
+   message bodies, in many cases.  (The vcdiff coding, on the other
+   hand, is inherently compressed and does not benefit from further
+   compression.)  Therefore, it is strongly recommended that
+   implementations that support the diffe and/or gdiff delta codings
+   also support the gzip and/or deflate compression codings.  (The
+   deflate coding provides a more compact result.)  However, this is not
+   a requirement for the use of delta encoding, primarily because the
+   CPU-time costs associated with compression and decompression may be
+   excessive in some environments.
+
+   A client that supports both delta encoding and compression as
+   content-codings signals this by, for example
+
+      Accept-Encoding: diffe, deflate
+
+   The ordering rule stated in section 13.1 requires that, if the server
+   uses both content-codings in the response, that compression is
+   applied to the result of the delta encoding, rather than vice versa.
+   I.e., the response in this case would include
+
+      Content-Encoding: diffe, deflate
+
+   If the client is willing to accept a variety of delta
+   content-codings, and is also willing to accept compression of the
+   results, its Accept-Encoding header would list the delta
+   content-codings before the compression content-codings.  For example,
+
+      Accept-Encoding: diffe, vcdiff, gdiff, deflate, gzip
+
+   is an appropriate (if lengthy) listing.
+
+   For transfer-codings, analogous guidelines apply.
+
+13.4 Delta encoding and multipart/byteranges
+   A client may request multiple, non-contiguous byte ranges in a single
+   request.  The server's response uses the ``multipart/byteranges''
+   media type (section 19.2 of [10]) to convey multiple ranges in a
+   response.  If a multipart/byteranges response is delta-encoded (using
+   either a content-coding or a transfer-coding), the delta-related
+   headers are associated with the entire response, not with the
+
+Mogul, Krishnamurthy, Douglis, Feldmann, Goland, van Hoff      [Page 36]
+
+
+Internet-Draft               Delta encoding          10 March 2000 09:57
+
+
+   individual parts.  (This is because there is only one base instance
+   and one current instance involved.)  A delta-encoded response with
+   multiple ranges MUST use the same delta-content-coding or
+   delta-transfer-coding for all of the ranges.
+
+   A server MAY choose not to use a delta encoding for a
+   multipart/byteranges response, but if it does use such an encoding,
+   it MUST generate a response in accordance with the following rules.
+
+   When a multipart/byteranges response uses a delta content-coding,
+   this coding is applied prior to the selection of the byte ranges (see
+   section 4).  In other words, the server firsts generates a sequence
+   of bytes representing the difference (delta) between the two
+   instances, then selects the specified ranges of bytes, and transmits
+   each such range in a part of the multipart/byteranges media type.
+
+   When a multipart/byteranges response uses a delta transfer-coding,
+   however, this coding is applied after the selection of the byte
+   ranges (see section 4).  In other words, the server first selects the
+   specified ranges from the current instance, and also selects the
+   specified ranges from the base instance.  (Some of these selected
+   ranges might be the empty sequence, if the instance is not long
+   enough.)  The server then generates the individual differences
+   (deltas) between the pairs of ranges, and transmits each such
+   difference in a part of the multipart/byteranges media type.
+
+
+14 New Cache-control directives
+
+   The set of cache-response-directive values is augmented to include
+   the retain directive.
+
+               | "retain" [ "=" delta-seconds ]
+
+   A retain directive is always a ``hint'' from a server to a client; it
+   never specifies a mandatory action for the recipient.
+
+   The presence of a retain directive indicates that a delta-capable
+   client ought to retain the instance in the response in its cache,
+   space permitting, and ought to use the corresponding entity tag in a
+   future request for a delta-encoded response.  I.e., the server is
+   likely to provide delta-encoded responses using the corresponding
+   instance as a base instance.  By implication, if a client has
+   retrieved and cached several instances of a resource, some of which
+   are marked with ``retain'' and some not, then there is no point in
+   caching the instances not marked with ``retain''.
+
+   If the retain directive includes a delta-seconds value, then the
+   server is likely to stop using the corresponding instance as a base
+   instance after the specified number of seconds.  A client ought not
+   use the corresponding entity tag in a future request for a
+
+Mogul, Krishnamurthy, Douglis, Feldmann, Goland, van Hoff      [Page 37]
+
+
+Internet-Draft               Delta encoding          10 March 2000 09:57
+
+
+   delta-encoded response after that interval ends.  The interval is
+   measured from the time that the response is generated, so a client
+   ought to include the response's Age in its calculations.
+
+   If the retain directive includes a delta-seconds value of zero, a
+   client SHOULD NOT use the corresponding entity tag in a future
+   request for a delta-encoded response.  A server SHOULD NOT send
+   ``retain=0'' except in reply to a request that attempts to obtain a
+   delta-encoded response.
+
+
+15 Quantifying the protocol overhead
+
+   The proposed protocol changes increase the size of the HTTP message
+   headers slightly.  In the simplest case, a conditional request (i.e.,
+   one for a URI for which the client already has a cache entry) would
+   include one more header, e.g.:
+
+       Accept-Encoding:vcdiff
+
+   This is about 24 extra bytes.  A recent study [23] reports mean
+   request sizes from two different traces of 281 and 306 bytes, so the
+   net increase in request size would be between 8% and 9%.  Smaller
+   increases would result for requests that already include an
+   Accept-Encoding header field, or if the TE request header field were
+   used instead (assuming that the TE header is not the only one needing
+   to be listed in a Connection header.)
+
+   Because a client must have an existing cache entry to use as a base
+   for a delta-encoded response, it would never send ``Accept-encoding:
+   vcdiff'' (or listing other delta encoding formats) for its
+   unconditional requests.  The same study showed that at least 46% of
+   the requests in lengthy traces were for URLs not seen previously in
+   the trace; this means that no more than about half of typical client
+   requests could be conditional (and the actual fraction is likely to
+   be smaller, given the finite size of real caches).
+
+   The study also showed that 64% of the responses in a lengthy trace
+   were for image content-types (GIF and JPEG).  As noted in section 6,
+   we do not currently know of a delta-encoding format suitable for such
+   image types.  Unless a client did support such a delta-encoding
+   format, it would presumably not ask for a delta when making a
+   conditional request for image content-types.
+
+   Taken together, these factors suggest that the mean increase in
+   request header size would be much less than 9%, and probably closer
+   to 2%.
+
+   Delta-encoded responses carry slightly longer headers.  In the
+   simplest case, a response carries one more header, e.g.:
+
+
+Mogul, Krishnamurthy, Douglis, Feldmann, Goland, van Hoff      [Page 38]
+
+
+Internet-Draft               Delta encoding          10 March 2000 09:57
+
+
+       Content-Encoding:vcdiff
+
+   This is about 25 bytes.  If a delta-transfer-coding is used instead
+   (with a ``TE'' header), the increase is smaller.  Other headers (such
+   as ``Delta-Base'' and ``DCluster'') might also be included.  However,
+   none of these extra headers would be included except in cases where a
+   delta encoding is actually employed, and the sender of the response
+   can avoid sending a delta encoding if this results in a net increase
+   in response size.  Thus, a delta-encoded response should never be
+   larger than a regular response for the same request.
+
+   Simulations suggest that, when delta-encoding pays off at all, it
+   saves several thousand bytes [23].  Thus, adding a few dozen bytes to
+   the response headers should almost never obviate the savings in the
+   message-body size.
+
+   Finally, the use of the ``retain'' Cache-control directive and the
+   ``DCluster'' header in non-delta-encoded responses might cause some
+   additional overhead.  Some server heuristics might be successful in
+   limiting the use of these headers to situations where they would
+   probably optimize future responses.  Neither of these headers is
+   necessary for the simpler uses of delta encoding.
+
+
+16 Security Considerations
+
+16.1 Spoofing attacks using the DCluster header
+   We have identified a potential spoofing attack via the ``DCluster''
+   header. In this scenario, a malicious server (e.g.,
+   malicious.example.org) generates a response (e.g., for
+   http://malicious.example.org/trap.html) with a ``DCluster'' header
+   indicating that the uniqueness scope of the entity tag in the
+   response includes another server (e.g., victim.example.com).  Suppose
+   that the response includes the entity tag "abc".  Now suppose that
+   the client makes this request:
+
+      GET /foo.html HTTP/1.1
+      host: victim.example.com
+      If-None-Match: "abc"
+      Accept-Encoding: vcdiff
+
+   If the victim.example.com server does actually have an instance with
+   entity tag "abc", either for http://victim.example.com/foo.html or
+   for a resource that really is in the same uniqueness scope, then the
+   server will generate a delta.  However, if the client applies this
+   delta to the cached response for
+   http://malicious.example.org/trap.html, it will end up either with
+   garbage, or (more perniciously) with an apparently genuine result
+   that actually contains bogus information inserted by
+   malicious.example.org.  (The response for
+   http://malicious.example.org/trap.html might contain the bogus
+   information concealed in HTML comments.)
+Mogul, Krishnamurthy, Douglis, Feldmann, Goland, van Hoff      [Page 39]
+
+
+Internet-Draft               Delta encoding          10 March 2000 09:57
+
+
+   Protection against this attack can be accomplished by the use of
+   end-to-end digests on the instances, as described in another
+   proposal [24].  (Message digests, such as provided by ``Content-MD5''
+   or by Digest Authentication, are not sufficient, since none of the
+   individual messages are tampered with in this attack.)
+
+   Note that protection against spoofing via the ``DCluster'' header
+   does not inherently require a keyed digest.  Since the delta encoded
+   response for http://victim.example.com/foo.html is not itself
+   generated by malicious.example.org, an end-to-end digest included
+   with this response by victim.example.com is sufficient to prove that
+   the client's reconstruction of foo.html is correct.  However, if
+   message tampering is also a possibility, then the server should also
+   provide a keyed message digest.
+
+   Another defense against such an attack is for the client to ignore a
+   ``DCluster'' header that specifies a different server.  However, this
+   defense is only effective if servers that generate delta-encoded
+   responses are not shared among multiple, possibly mutually
+   untrustworthy, content providers.  It also reduces the potential
+   effectiveness of clustering, especially for large sites split across
+   multiple servers.
+
+   Note that because the DTemplate header field also adds one or more
+   URIs to the uniqueness scope of an entity tag, the same spoofing
+   attack is possible using the DTemplate header, and the same defenses
+   apply.
+
+   We recommend that if a client receives a delta-encoded response
+   without an accompanying Digest, and if the client's view of the
+   uniqueness scope for the Request-URI includes more than one server
+   hostname, then the response should either be discarded, or presented
+   to the user as potentially corrupt.
+
+
+17 History
+
+17.1 draft-mogul-http-delta-01.txt
+   Renamed ``vdcode'' to ``vcdiff'', and corrected some of the
+   references to vcode/vcdiff/vdelta.  Recommended use of vcdiff.
+
+   Added section 13.4 on using delta encoding with multipart/byteranges
+   responses.
+
+   Updated IANA Considerations in section 6.1.
+
+17.2 draft-mogul-http-delta-02.txt
+   Updated references from RFC2068 to RFC2616.
+
+   Added restrictions on timeframe for use of values from DCluster and
+   DTemplate.
+
+Mogul, Krishnamurthy, Douglis, Feldmann, Goland, van Hoff      [Page 40]
+
+
+Internet-Draft               Delta encoding          10 March 2000 09:57
+
+
+   Minor clarifications in the text.
+
+17.3 draft-mogul-http-delta-03.txt
+   Replaced incorrect references to "diff-e" token with "diffe".
+
+   Explicitly allow the use of the Delta-Base header in responses using
+   a delta transfer-coding.
+
+
+18 Acknowledgements
+
+   Phong Vo has provided a great deal of guidance in the choice of delta
+   encoding algorithms and formats.
+
+   Daniel Hellerstein provided extensive comments on drafts of this
+   document.
+
+
+19 References
+
+   NOTE TO RFC EDITOR: many of the references here might be out of date.
+   Please verify these with the primary author of this Internet-Draft
+   before issuing this document as an RFC.
+
+   1.  Gaurav Banga, Fred Douglis, and Michael Rabinovich.  Optimistic
+   Deltas for WWW Latency Reduction.  Proc. 1997 USENIX Technical
+   Conference, Anaheim, CA, January, 1997, pp. 289-303.
+
+   2.  T. Berners-Lee, R. Fielding, and H. Frystyk.  Hypertext Transfer
+   Protocol -- HTTP/1.0.  RFC 1945, HTTP Working Group, May, 1996.
+
+   3.  S. Bradner.  Key words for use in RFCs to Indicate Requirement
+   Levels.  RFC 2119, Harvard University, March, 1997.
+
+   4.  Edith Cohen, Balachander Krishnamurthy, and Jennifer Rexford.
+   Improving End-to-End Performance of the Web Using Server Volumes and
+   Proxy Filters.  Proc. SIGCOMM '98, September, 1998, pp. 241-253.
+
+   5.  P. Deutsch.  GZIP file format specification version 4.3.  RFC
+   1952, Network Working Group, May, 1996.
+
+   6.  P. Deutsch.  DEFLATE Compressed Data Format Specification version
+   1.3.  RFC 1951, Network Working Group, May, 1996.
+
+   7.  P. Deutsch and J-L. Gailly.  ZLIB Compressed Data Format
+   Specification version 3.3.  RFC 1950, Network Working Group, May,
+   1996.
+
+   8.  Fred Douglis, Anja Feldmann, Balachander Krishnamurthy, and
+   Jeffrey Mogul.  Rate of Change and Other Metrics:  a Live Study of
+   the World Wide Web.  Proc. Symposium on Internet Technologies and
+   Systems, USENIX, Monterey, CA, December, 1997, pp. 147-158.
+Mogul, Krishnamurthy, Douglis, Feldmann, Goland, van Hoff      [Page 41]
+
+
+Internet-Draft               Delta encoding          10 March 2000 09:57
+
+
+   9.  Fred Douglis, Antonio Haro, and Michael Rabinovich.  HPP: HTML
+   Macro-Preprocessing to Support Dynamic Document Caching.  Proc.
+   USENIX Symposium on Internet Technologies and Systems, USENIX,
+   Monterey, CA, December, 1997, pp. 83-94.
+
+   10.  Roy T. Fielding, Jim Gettys, Jeffrey C. Mogul, Henrik Frystyk
+   Nielsen, Larry Masinter, Paul Leach,and Tim Berners-Lee.  Hypertext
+   Transfer Protocol -- HTTP/1.1.  RFC 2616, HTTP Working Group, June,
+   1999.
+
+   11.  J. Franks, P. Hallam-Baker, J. Hostetler, P. Leach, A. Luotonen,
+   E. Sink, L. Stewart.  An Extension to HTTP: Digest Access
+   Authentication.  RFC 2069, HTTP Working Group, January, 1997.
+
+   12.  N. Freed and N. Borenstein.  Multipurpose Internet Mail
+   Extensions (MIME) Part One:  Format of Internet Message Bodies.  RFC
+   2045, Network Working Group, November, 1996.
+
+   13.  Arthur van Hoff, John Giannandrea, Mark Hapner, Steve Carter,
+   and Milo Medin.  The HTTP Distribution and Replication Protocol.
+   Technical Report NOTE-DRP, World Wide Web Consortium, August, 1997.
+   URL http://www.w3.org/TR/NOTE-drp-19970825.html.
+
+   14.  Arthur van Hoff and Jonathan Payne.  Generic Diff Format
+   Specification.  Technical Report NOTE-GDIFF, World Wide Web
+   Consortium, August, 1997. URL
+   http://www.w3.org/TR/NOTE-gdiff-19970901.html.
+
+   15.  Barron C. Housel and David B. Lindquist.  WebExpress: A System
+   for Optimizing Web Browsing in a Wireless Environment.  Proc. 2nd
+   Annual Intl. Conf. on Mobile Computing and Networking, ACM, Rye, New
+   York, November, 1996, pp. 108-116.
+   http://www.networking.ibm.com/art/artwewp.htm.
+
+   16.  James J. Hunt, Kiem-Phong Vo, and Walter F. Tichy.  An Empirical
+   Study of Delta Algorithms.  IEEE Soft. Config. and Maint. Workshop,
+   1996.
+
+   17.  Van Jacobson.  Compressing TCP/IP Headers for Low-Speed Serial
+   Links.  RFC 1144, Network Working Group, February, 1990.
+
+   18.  R. Khare and S. Lawrence.  Upgrading to TLS Within HTTP/1.1.
+   Internet-Draft draft-ietf-tls-http-upgrade-05.txt, IETF, January,
+   2000. Pending publication as an RFC.  This is a work in progress.
+   (NOTE: this draft defines an IANA registry for HTTP status codes.).
+
+   19.  David G. Korn and Kiem-Phong Vo.  A Generic Differencing and
+   Compression Data Format.  Technical Report HA1630000-021899-02TM,
+   AT&T Labs - Research, February, 1999.
+
+
+
+Mogul, Krishnamurthy, Douglis, Feldmann, Goland, van Hoff      [Page 42]
+
+
+Internet-Draft               Delta encoding          10 March 2000 09:57
+
+
+   20.  David G. Korn and Kiem-Phong Vo.  The VCDIFF Generic
+   Differencing and Compression Data Format.  Internet-Draft
+   draft-korn-vcdiff-01, IETF, March, 2000. This is a work in progress.
+
+   21.  Merriam-Webster.  Webster's Seventh New Collegiate Dictionary.
+   G. & C. Merriam Co., Springfield, MA, 1963.
+
+   22.  Jeffrey C. Mogul.  Hinted caching in the Web.  Proc. Seventh ACM
+   SIGOPS European Workshop, Connemara, Ireland, September, 1996, pp.
+   103-108. http://www-sor.inria.fr/sigops96/papers/mogul.ps.
+
+   23.  Jeffrey C. Mogul, Fred Douglis, Anja Feldmann, and Balachander
+   Krishnamurthy.  Potential benefits of delta encoding and data
+   compression for HTTP.  Research Report 97/4, DECWRL, July, 1997. URL
+   http://www.research.digital.com/wrl/techreports/abstracts/97.4.html.
+
+   24.  Jeffrey C. Mogul and Arthur Van Hoff.  Instance Digests in HTTP.
+   Internet-Draft draft-mogul-http-digest-02, IETF, March, 2000. This is
+   a work in progress.
+
+   25.  The Open Group.  The Single UNIX Specification, Version 2 - 6
+   Vol Set for UNIX 98.  Document number T912, The Open Group, February,
+   1997.
+
+   26.  W. Tichy.  "RCS - A System For Version Control".  Software -
+   Practice and Experience 15, 7 (July 1985), 637-654.
+
+   27.  Stephen Williams.  Personal communication.
+   http://ei.cs.vt.edu/~williams/DIFF/prelim.html.
+
+   28.  Stephen Williams, Marc Abrams, Charles R. Standridge, Ghaleb
+   Abdulla, and Edward A. Fox .  Removal Policies in Network Caches for
+   World-Wide Web Documents.  Proc. SIGCOMM '96, Stanford, CA, August,
+   1996, pp. 293-305.
+
+
+20 Authors' addresses
+
+   Jeffrey C. Mogul
+   Western Research Laboratory
+   Compaq Computer Corporation
+   250 University Avenue
+   Palo Alto, California, 94305, U.S.A.
+   Email: mogul@pa.dec.com
+   Phone: 1 650 617 3304 (email preferred)
+
+   Balachander Krishnamurthy
+   AT&T Labs - Research
+   180 Park Ave, Room D-229
+   Florham Park, NJ 07932-0971, U.S.A.
+   Email: bala@research.att.com
+
+Mogul, Krishnamurthy, Douglis, Feldmann, Goland, van Hoff      [Page 43]
+
+
+Internet-Draft               Delta encoding          10 March 2000 09:57
+
+
+   Fred Douglis
+   AT&T Labs - Research
+   180 Park Ave, Room B-137
+   Florham Park, NJ 07932-0971, U.S.A.
+   Email: douglis@research.att.com
+   Phone: 973-360-8775
+
+   Anja Feldmann
+   University of Saarbruecken, Germany,
+   Computer Science Department
+   Im Stadtwald, Geb. 36.1, Zimmer 310
+   D-66123 Saarbruecken, Germany
+   anja@cs.uni-sb.de
+
+   Yaron Y. Goland
+   Microsoft Corporation
+   1 Microsoft Way
+   Redmond, WA 98052, U.S.A
+   Email: yarong@microsoft.com
+
+   Arthur van Hoff
+   Marimba, Inc.
+   440 Clyde Avenue
+   Mountain View, CA 94043, U.S.A.
+   Email: avh@marimba.com
+   Phone: 1 (650) 930 5283
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Mogul, Krishnamurthy, Douglis, Feldmann, Goland, van Hoff      [Page 44]
+
+
+Internet-Draft               Delta encoding          10 March 2000 09:57
+
+
+INDEX
+
+          Open issues: see pages   34
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Mogul, Krishnamurthy, Douglis, Feldmann, Goland, van Hoff      [Page 45]

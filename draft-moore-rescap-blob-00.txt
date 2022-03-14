@@ -1,0 +1,1208 @@
+Network Working Group                                        Keith Moore
+Internet-Draft                                   University of Tennessee
+Expires: January 12, 2002                                  July 12, 2001
+
+
+          The Binary Low-Overhead Block Presentation Protocol
+
+                     draft-moore-rescap-blob-00.txt
+
+Status of this Memo
+
+This document is an Internet-Draft and is in full conformance with all
+provisions of Section 10 of RFC2026.
+
+Internet-Drafts are working documents of the Internet Engineering Task
+Force (IETF), its areas, and its working groups.  Note that other groups
+may also distribute working documents as Internet-Drafts.
+
+Internet-Drafts are draft documents valid for a maximum of six months
+and may be updated, replaced, or obsoleted by other documents at any
+time.  It is inappropriate to use Internet-Drafts as reference material
+or to cite them other than as "work in progress."
+
+The list of current Internet-Drafts can be accessed at
+http://www.ietf.org/ietf/1id-abstracts.txt
+
+The list of Internet-Draft Shadow Directories can be accessed at
+http://www.ietf.org/shadow.html
+
+This document is being submitted as a contribution to the IETF rescap
+working group.  Comments regarding this internet-draft should be sent to
+the rescap mailing list at rescap@cs.utk.edu, or to the author at the
+address listed below.  Requests to subscribe to the rescap mailing list
+should be sent to rescap-REQUEST@cs.utk.edu.
+
+This Internet-Draft will expire on January 12, 2001.
+
+Abstract
+
+This memo describes the Binary Low-Overhead Block (BLOB) protocol for
+on-the-wire presentation of data in the context of higher-level
+protocols.  BLOB is designed to encode and decode data with low overhead
+on most CPUs, to be reasonably space-efficient, and for its
+representation to be sufficiently precise that it is suitable as a
+canonical format for digital signatures.
+
+
+
+
+
+
+Moore                   Expires January 12, 2002                [Page 1]
+BLOB Protocol                Internet-Draft                 12 July 2001
+
+
+1. Introduction
+
+When designing applications-layer protocols there is sometimes a need to
+have an efficient means of encoding protocol elements or protocol data
+units.  Existing solutions in this space may be deemed inadequate, for
+various reasons.  For example:
+
+-    ASN.1 [1] and BER [2] are baroque both in terms of the abstract
+     syntax and available on-the-wire representations, and complex to
+     implement.
+
+-    ONC XDR [3] requires a stub generator and support libraries which
+     are not easily available on all platforms, and there are subtle
+     differences between the APIs provided by different implementations.
+     XDR is large enough that it's not usually feasible to write your
+     own implementation, and it's difficult to write portable code that
+     can work with the various implementations that are deployed.  Many
+     XDR implementations have significant unnecessary processing
+     overhead.  This impairs performace of applications based on XDR and
+     gives the protocol itself a worse reputation than it otherwise
+     deserves.
+
+-    The design of MIME [4] was heavily influenced by the need to be
+     able to operate over existing text-based mail systems which imposed
+     a number of constraints.  This worked out well for email, but for
+     other applications, MIME is neither efficient in terms of storage
+     density nor easy to parse.
+
+-    XML [5] is easier to parse than MIME, but still requires
+     significant processing overhead.  There is also a large and growing
+     body of "culture" regarding how XML should be used, which
+     paradoxically imposes a significant barrier to use of XML.  (To be
+     fair, MIME also has a fair amount of "culture" associated with it.)
+     Finally, for small and regular data structures XML imposes a lot of
+     overhead.
+
+BLOB was designed to serve as an alternative to these presentation
+layers for use in representing relatively simple strucutres, consisting
+of a limited set of primitive data types, and where the structures can
+reasonably be contained within a single protocol data unit.
+
+BLOB is designed with the following considerations:
+
+-    It should be easy and efficient to generate the encoded form.
+
+-    The encoded form should require minimal processing to decode,
+     ideally being usable in-place (without allocating memory or
+     copying) on most platforms.
+
+
+
+Moore                   Expires January 12, 2002                [Page 2]
+BLOB Protocol                Internet-Draft                 12 July 2001
+
+
+-    It should be easy to write programs which mainpulate and exchange
+     BLOBs, without needing significant external support in the form of
+     libraries or stub generators.
+
+-    The structure should be easy and efficient to verify for internal
+     consistency.
+
+-    For any structure to be represented there should be a unique
+     (canonical) on-the-wire encoding which is always used.
+
+-    It should be reasonably space-efficient.  However, this is
+     secondary to minimizing processing overhead.
+
+The BLOB approach is more feasible now than in years past because data
+representations have become more uniform across different computing
+platforms.  Essentially all widely-used computers now support 32-bit
+integers, can address 32-bit integers which are not aligned on any
+larger boundary, use word sizes which are a multiple of 8 bits, and can
+directly address strings of 8-bit characters which are not aligned on
+any boundary larger than an octet.  Such computers are termed "well-
+behaved" with respect to BLOB.  BLOB is designed to be usable on
+machines which do not have these characteristics, but such machines will
+necessarily incur more data conversion overhead.
+
+2. Data Types
+
+A "blob" is a linear (octet-stream) encoding of a data structure (or
+"struct"), which is a sequence of heterogeneous data types.  The data
+types which can appear as members of a struct are:
+
+-    unsigned integer (32-bit)
+
+-    string (variable-length sequence of arbitrary octets)
+
+-    integer array (variable-length sequence of unsigned integers)
+
+-    string array (variable-length sequence of strings)
+
+-    struct (heterogeneous sequence of any of these types)
+
+These primitive types were chosen because they are directly usable on
+most hardware, they represent the vast majority of data types used in
+networking protocols, and because data types outside of this set are
+often specific to the higher-level protocol anyway.  Having a limited
+set of data types allows for a more compact encoding, which is easier to
+decode, and which doesn't need separate marshalling routines for each
+individual structure.
+
+
+
+
+Moore                   Expires January 12, 2002                [Page 3]
+BLOB Protocol                Internet-Draft                 12 July 2001
+
+
+"Variable-length" here means that the lengths of arrays need not be pre-
+determined by the protocol using BLOB.  However the maximum lengths of
+strings and arrays are constrained by the use of a 32-bit integer for
+the length of the blob, and the representation of offsets within the
+blob as 32-bit integers.  They may be further constrained by the higher-
+level protocol's choice of transmission medium - for instance, if the
+blob must fit into a UDP datagram.  The number of members of a struct is
+considerably more constrained (as will become clear below), but should
+be adequate for most data structures encountered in protocols.
+
+When other data types are needed by a protocol, they must be represented
+in terms of the above primitive types. The higher-level protocol must
+choose the representation, and the conversion between the blob
+representation and the native format must be explicitly managed by the
+applications.  For instance:
+
+-    A signed 32-bit integer may be transmitted as an unsigned 32-bit
+     integer by encoding the signed integer in twos-complement format.
+     On most modern machines no conversion will be necessary; however on
+     machines for which the smallest integer represenation is larger
+     than 32 bits it will be necessary for the application to sign-
+     extend the result.
+
+-    A 64-bit integer may be transmitted as two consecutive 32-bit
+     integers (with the most significant word first), which would
+     require that the receiving application arrange those two integers
+     according to its native byte ordering.  Alternatively a 64-bit
+     integer may be transmitted as eight consecutive octets within a
+     string (most significant byte first), which would require that the
+     receiving application re-arrange those octets according to its
+     local byte ordering.
+
+-    A multi-dimensional array may be represented as a single-
+     dimensional array with the sizes of the dimensions passed as
+     integer parameters;
+
+-    Floating point numbers may be encoded in IEEE format and
+     transmitted as either integers or strings (modulo sign-extension
+     issues),
+
+-    A small dense set may be represented as bits within an integer.
+     Slightly larger dense sets may be encoded as bit offsets into an
+     integer array. Larger or sparse sets may be represented by encoding
+     them in a string.
+
+
+
+
+
+
+
+Moore                   Expires January 12, 2002                [Page 4]
+BLOB Protocol                Internet-Draft                 12 July 2001
+
+
+3. BLOB Protocol
+
+The basic unit of BLOB encoding is a "struct".  A "blob" is a sequence
+of octets which forms the on-the-wire representation of a struct.
+
+At the most basic level, the blob consists of an integer portion
+followed by a string portion.  The integer portion consists of a header,
+an argument list, and an integer pool.  Each of these is a sequence of
+integers, all of which are 4 octets in length and represented on-the-
+wire in network byte (big-endian) order.  The string portion is a
+sequence of octets; order of octets is preserved within the string
+portion.
+
+The blob is separated into string and integer portions in order to
+facilitate easy decoding.  In order for the blob to be usable on a
+little-endian cpu, each integer of the integer portion will need to have
+its octets reversed.  By contrast, the string portion has the same
+representation on both big-endian and little-endian platforms.  Thus on
+a "well-behaved" little-endian machine the blob can be converted from
+on-the-wire format to a format which is usable locally, merely by
+reversing the order of the octets within each of the first
+(string_pool_offset / 4) 32-bit integers of the blob.  No conversion is
+necessary in order to use a blob on a "well-behaved" big-endian machine.
+
+Since a blob is the on-the-wire representation of a struct, if a blob
+contains one or more structs as components of the outer struct, they
+will themselves be represented as blobs.  Those blobs will be stored in
+the string pool.  Inner blobs must be explicitly decoded/converted by
+the receiving application; they are not automatically decoded when the
+outer blob is decoded.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Moore                   Expires January 12, 2002                [Page 5]
+BLOB Protocol                Internet-Draft                 12 July 2001
+
+
+3.1 Structure of a blob
+
+The structure of a blob is as follows:
+
+       octet offset                name
+
+                  0 +--------------------------------+ \
+                    |          blob_length           | |
+                  4 +--------------------------------+ |
+                    |      integer_pool_offset       | |
+                  8 +--------------------------------+ |
+                    |      string_pool_offset        | |
+                 12 +--------------------------------+ |
+                    |        argument_counts         | |
+                 16 +--------------------------------+ + integer portion
+                    :                                : |
+                    :          argument list         : |
+                    :                                : |
+integer_pool_offset +--------------------------------+ |
+                    :                                : |
+                    :          integer_pool          : |
+                    :                                : /
+ string_pool_offset +--------------------------------+ \
+                    :                                : |
+                    :           string_pool          : + string portion
+                    :                                : |
+        blob length +--------------------------------+/
+
+
+blob_length
+     The blob_length is the length of the entire blob in octets.  The
+     length includes the space occupied by blob_length.
+
+integer_pool_offset
+     The integer_pool_offset is the octet offset (relative to the start
+     of the blob) of the integer_pool portion of the blob.
+     integer_pool_offset must be a multiple of four, greater than or
+     equal to 16, and less than or equal to string_pool_offset.  If the
+     length of integer_pool is zero, integer_pool_offset will be equal
+     to string_pool_offset.
+
+string_pool_offset
+     The string_pool_offset is the offset (relative to the start of the
+     blob) of the string_pool portion of the blob.  It must be greater
+     than or equal to integer_pool_offset and less than or equal to
+     blob_length.  If the length of the string_pool is zero,
+     string_pool_offset will be equal to blob_length.
+
+
+
+
+Moore                   Expires January 12, 2002                [Page 6]
+BLOB Protocol                Internet-Draft                 12 July 2001
+
+
+argument_counts
+     The argument_counts field indicates the number of each kind of
+     argument.  This field is calculated as follows:
+
+          argument_counts = (num_int_args) +
+                            (num_int_array_args << 8) +
+                            (num_string_or_struct_args << 16) +
+                            (num_string_or_struct_array_args << 24)
+
+     where num_xxx_args is the number of arguments of type xxx, and
+     num_xxx_array_args is the number of arguments of type array of xxx.
+
+argument_list
+     The argument_list contains a list of integers which represent the
+     members of the struct.  In order that the blob may be sanity
+     checked for internal consistency without wasting lots of space, the
+     arguments within the argument_list are arranged so that similar
+     types of arguments are consecutive.  Within the argument_list, the
+     arguments appear in the following order:
+
+     1.   int arguments
+
+     2.   int array arguments
+
+     3.   string or struct arguments
+
+     4.   string or struct array arguments
+
+integer_pool
+     The integer_pool contains integers in the following order:
+
+     1.   The elements of integer arrays, in the order that these arrays
+          appear in the argument list.
+
+     2.   Offsets of strings and structs within string and struct
+          arrays, in the order that the offsets of these arrays appear
+          in the argument list.  These offsets are offsets from the
+          beginning of the blob, and point into the string_pool.
+
+string_pool
+     The string_pool begins at string_pool_offset and contains strings
+     and embedded structs which are referenced within the outer struct.
+     The strings and structs appear in the following order:
+
+     1.   Contents of strings or structs that are referenced in the
+          argument list, in the order that those offsets appear in the
+          argument list.
+
+
+
+
+Moore                   Expires January 12, 2002                [Page 7]
+BLOB Protocol                Internet-Draft                 12 July 2001
+
+
+     2.   Contents of strings or structs that are elements of arrays, in
+          the order that their offsets appear in the integer_pool.
+
+For compatibility with programming languages which terminate strings
+with a zero octet, a zero octet is automatically appended to each string
+in the string_pool.
+
+3.2 Struct Member Encoding
+
+The members of a struct are encoded as follows:
+
+     -    An "int" is represented as a 32-bit integer in big-endian
+          format.
+
+     -    An "int array" is represented as an integer offset relative to
+          the beginning of the blob, which points to the elements of the
+          array.  The elements of the array are stored in the
+          integer_pool, in increasing order, in big-endian format.  The
+          offset of an integer array must therefore be greater than or
+          equal to integer_pool_offset and less than or equal to
+          string_pool_offset.
+
+          Consecutive int arrays are stored in consecutive locations
+          within the integer_pool.  Thus the length of an integer array
+          N (where N is less than the number of integer arrays, minus 1)
+          can be determined by subtracting the offset of integer array N
+          from the offset of integer array N+1, and dividing the result
+          by 4.  The length of the last integer array can be determined
+          by subtracting the offset of that integer array from the
+          offset of the first string array, or if there are no string
+          arrays, from string_pool_offset.
+
+     -    A "string" is represented as an integer offset relative to the
+          beginning of the blob, which points to the contents of the
+          string.  The contents of the string are stored in the
+          string_pool.  The offset of any string must therefore be
+          greater than or equal to the string_pool_offset and less than
+          or equal to blob_length.
+
+          String arguments, and elements of string arrays, are stored
+          consecutively in the string pool. Each string is followed in
+          the string_pool by a zero octet which is not part of the
+          string.  Thus the length of any string argument (other than
+          the last) can be calculated by subtracting its offset from the
+          offset of the subsequent string argument, minus 1.  The length
+          of the last string argument can be calculated by subtracting
+          its offset from the offset of the first element of the first
+          string array, or if there are no string arrays, from
+
+
+
+Moore                   Expires January 12, 2002                [Page 8]
+BLOB Protocol                Internet-Draft                 12 July 2001
+
+
+          blob_length.
+
+          Strings can be of zero length, in which case the corresponding
+          offset points to a zero octet which is immediately followed by
+          the next string in the string_pool.  Strings can also be
+          'missing' or NULL, in which case the offset is zero.
+
+     -    A "string array" is represented as an integer offset (relative
+          to the beginning of the blob) which points to an array of
+          integers (stored in the integer pool), each element of which
+          points to the offset of a string (within the string pool).
+
+          The length of any string array element (other than the last
+          one in that array) can be calculated by subtracting its offset
+          from the offset of the subsequent element, minus 1.  The
+          length of the last element in a string array (other than the
+          last string array) can be calculated by subtracting its offset
+          from the offset of the first element of the subsequent string
+          array, minus 1.  The length of the last element in the last
+          string array can be calculated by subtracting its offset from
+          blob_length, minus 1.
+
+     -    A "struct" is represented as an integer offset (relative to
+          the beginning of the blob) which points to the beginning of an
+          inner blob (stored in the string portion of the outer blob),
+          which contains the inner struct.
+
+     -    A "struct array" is represented as an integer offset (relative
+          to the beginning of the blob), which points to an array of
+          integers (stored in the integer pool), each element of which
+          points to the offset of a blob (within the string pool) that
+          represents a struct.
+
+4. Use of BLOBs by higher-level protocols
+
+Higher-level protocols using BLOB as an encoding mechanism need to
+define their protocol data units in terms of BLOB "structs".  Since BLOB
+groups all similarly-typed data together within the blob (for ease of
+conversion), and since BLOB rigidly defines the order in which data must
+appear, applications generally cannot refer to protocol elements within
+a blob by a fixed offset.  Instead, the application code references
+protocol elements in terms of "the second string parameter", "the third
+integer parameter" or "the second element of the fourth integer array
+parameter".  Macros which allow these elements to be accessed from a
+decoded blob structure are easily constructed.
+
+It is possible to define a simple specification language which allows
+the elements of a struct to be specified in the order that makes the
+
+
+
+Moore                   Expires January 12, 2002                [Page 9]
+BLOB Protocol                Internet-Draft                 12 July 2001
+
+
+most sense to an application, and which produces a list of macros which
+map from protocol data element names to routines which can access those
+data elements.  This hides the details of BLOB's reordering from the
+application without significantly impairing efficiency.  An example of
+such a language is given in Appendix B.
+
+If higher-level protocols employ data types other than the BLOB
+primitive data types, they must define how the application-specific data
+types are represented as one or more BLOB primitive types, and
+implementations of the protocol will be responsible for conversion.
+Applications which require a canonical form (say for signing) should
+specify the conversion from application data types to BLOB types so that
+there is exactly one possible representation of each application data
+type within BLOB.
+
+Since a single blobs cannot encode arbitrarily complex structures, and
+since nesting blobs add a bit of overhead, protocol designers should
+avoid deep nesting of structures.  For instance, what to the application
+is conceptually an array of structs may be better represented within
+BLOB as a set of parallel arrays.  At the same time, nesting of structs
+is useful when it is desired that an inner blob be opaque to the layer
+of a protocol that decodes the outer blob.
+
+5. Encoding Issues
+
+Most blobs will contain at least one variable-length data structure.
+This implies that a program that encodes a blob will usually be unable
+to generate the elements of a blob in-place. Instead, the program will
+need to copy the elements of a blob from their various locations into a
+contiguous location in memory, in ther order prescribed by the BLOB
+specification.  A sample implementation is given in Appendix C.
+
+6. Decoding Issues
+
+On "well-behaved" machines it should be possible to use blobs in-place
+after converting the integer portion of the blob to the local byte
+order.  The protocol elements within the blob can then be accessed with
+macros.
+
+It is necessary to check the blob for consistency before using it.  In
+particular:
+
+-    The blob_length must be consistent with the length of the PDU or
+     buffer in which the blob was received.  (For instance, it must not
+     be less than the length of data received).
+
+-    The blob_length must be at least 16 (which would be the length of
+     an empty blob with no arguments).
+
+
+
+Moore                   Expires January 12, 2002               [Page 10]
+BLOB Protocol                Internet-Draft                 12 July 2001
+
+
+-    The integer_pool_offset must be equal to the the number of
+     arguments (decoded from argument_counts) multiplied by 4, plus 16.
+
+-    The string_pool_offset must be greater than or equal to
+     integer_pool_offset.
+
+-    The string_pool_offset must be less than or equal to blob_length.
+
+-    The offset of each integer array must be a multiple of 4.
+
+-    The offset of the first integer array (if any) must be equal to
+     integer_pool_offset.
+
+-    Each subsequent non-null integer array offset must be greater than
+     or equal to the previous integer array offset, and less than
+     string_pool_offset.
+
+-    The offset of the first element of the first string array must be
+     greater than or equal to the offset of the last non-null integer
+     array.
+
+-    The offset of the first element of each subsequent string array
+     must be greater than or equal to the offset of the first element of
+     the previous string array.
+
+-    The first string argument must have an offset equal to string_pool.
+
+-    Each subsequent non-null string argument must have an offset
+     greater (by at least 1) than that of the previous string argument.
+
+-    The first element of the first string array must have an offset
+     greater (by at least 1) than the offset of the last string
+     argument.
+
+-    The first element of any subsequent string array must have an
+     offset which is greater (by at least 1) than the last element of
+     the previous string array.
+
+-    Each element of a string array must have an offset greater (by at
+     least 1) than the offset of the previous element in that array.
+
+-    Except for the first string, there must be a zero octet preceding
+     each offset of each non-null string argument or non-null string
+     array element.
+
+-    The last octet in the string_pool must be a zero.
+
+
+
+
+
+Moore                   Expires January 12, 2002               [Page 11]
+BLOB Protocol                Internet-Draft                 12 July 2001
+
+
+A sample implementation is given in Appendix D.
+
+7. Security Considerations
+
+It is believed that the BLOB encoding is unique and can serve as a
+useful 'canonical form' for a data structure.  However, if higher-level
+protocols encode non-native data types as BLOB primitive types, they
+must also define a unique representation for each quantity to be stored
+in that data-type.
+
+In order to prevent possible attacks by transmission of blobs containing
+bogus offsets, it is essential to perform the bounds checks listed in
+section 6 while decoding blobs.  While such attacks could not easily
+overwrite memory with data chosen by an attacker, they could cause a
+server to malfunction.
+
+8. Author's Address
+
+Keith Moore
+University of Tennessee
+1122 Volunteer Blvd, Suite 203
+Knoxville TN 37996-3450
+email: moore@cs.utk.edu
+
+
+9. References
+
+[1]  "Specification of Basic Encoding Rules for Abstract Syntax Notation
+     One (ASN.1)", CCITT Recommendation X.209, January 1988.
+
+[2]  "Specification of ASN.1 encoding rules: Basic, Canonical, and
+     Distinguished Encoding Rules", ITU-T X.690, January 1994.
+
+[3]  Srinivasan, R., "XDR: External Data Representation Standard", RFC
+     1832, August 1995.
+
+[4]  Freed, N. and N. Borenstein, "Multipurpose Internet Mail Extensions
+     (MIME) Part One: Format of Internet Message Bodies", RFC 2045,
+     November 1996.
+
+[5]  "Extensible Markup Language (XML) 1.0 (Second Edition)", W3C
+     Recommendation, October 2000,
+     <http://www.w3.org/TR/2000/REC-xml-20001006>.
+
+[6]  Crocker, D. (ed.), Overell, P. "Augmented BNF for Syntax
+     Specifications: ABNF.".  RFC 2234, November 1997.
+
+
+
+
+
+Moore                   Expires January 12, 2002               [Page 12]
+BLOB Protocol                Internet-Draft                 12 July 2001
+
+
+Appendix A. ASCII-Art Picture of a BLOB
+
+This diagram attempts to illustrate the ordering of the various elements
+of a blob and the relationship of the offsets to the elements to which
+they point:
+
+             octet offset                name
+
+                        0 +--------------------------------+
+                          |          blob_length           |
+                        4 +--------------------------------+
+                          |      integer_pool_offset       |
+                        8 +--------------------------------+
+                          |      string_pool_offset        |
+                       12 +--------------------------------+
+                          |        argument_counts         |
+                       16 +--------------------------------+
+
+The argument list looks like this:
+
+                       16 +--------------------------------+
+                          |       1st scalar int arg       |
+                          +--------------------------------+
+                          |       2nd scalar int arg       |
+                          +--------------------------------+
+                          :                                :
+(16 + num_int_args / 4)   +--------------------------------+
+                          |  offset of 1st int array arg   |--+
+                          +--------------------------------+  |
+                          |  offset of 2nd int array arg   |--|--+
+                          +--------------------------------+  |  |
+ 16 + (num_int_args +     :                                :  |  |
+ num_int_array_args) / 4  +--------------------------------+  |  |
+                          | offset of 1st struct/string arg|--|--|---+
+                          +--------------------------------+  |  |   |
+                          | offset of 2nd string/string arg|--|--|---|-+
+                          +--------------------------------+  |  |   | |
+                          :                                :  |  |   | |
+    16 + (num_int_args +  :                                :  |  |   | |
+    num_int_array_args +  :                                :  |  |   | |
+numstr_or_strct_args) / 4 +--------------------------------+  |  |   | |
+                          |  offset of 1st str* array arg  |--|--|-+ | |
+                          +--------------------------------+  |  | | | |
+                          |  offset of 2nd str* array arg  |  |  | | | |
+                          +--------------------------------+  |  | | | |
+                          |  offset of 3rd str* array arg  |  |  | | | |
+      integer pool offset +--------------------------------+  |  | | | |
+                                                              |  | | | |
+
+
+
+Moore                   Expires January 12, 2002               [Page 13]
+BLOB Protocol                Internet-Draft                 12 July 2001
+
+
+                                                              |  | | | |
+                                                              |  | | | |
+The integer pool looks like this:                             |  | | | |
+                                                              |  | | | |
+        integer pool offset =                                 |  | | | |
+          offset of 1st   +--------------------------------+ <+  | | | |
+           int array arg  |     1st element of 1st array   |     | | | |
+                          +--------------------------------+     | | | |
+                          |     2nd element of 1st array   |     | | | |
+                          +--------------------------------+     | | | |
+                          :                                :     | | | |
+                          :                                :     | | | |
+                          :                                :     | | | |
+            offset of 2nd +--------------------------------+ <---+ | | |
+            int array arg |     1st element of 2nd array   |       | | |
+                          +--------------------------------+       | | |
+                          :                                :       | | |
+                          :                                :       | | |
+            offset of 1st +--------------------------------+ <-----+ | |
+           str* array arg | offset of 1st elem of 1st str* |         | |
+                          +--------------------------------+         | |
+                          | offset of 2nd elem of 1st str* |         | |
+                          +--------------------------------+         | |
+                          :                                :         | |
+            offset of 2nd +--------------------------------+         | |
+           str* array arg | offset of 1st elem of 2nd str* |         | |
+                          +--------------------------------+         | |
+                          | offset of 2nd elem of 2nd str* |         | |
+                          +--------------------------------+         | |
+                                                                     | |
+                                                                     | |
+The string pool looks like this:                                     | |
+                                                                     | |
+     string pool offset =                                            | |
+          offset of first +--------------------------------+ <-------+ |
+              string arg  |   S       T       R       I    |           |
+                          +--------------------------------+           |
+                          |   N       G       1      \0    |           |
+                          +--------------------------------+ <---------+
+         offset of second |   S       e       c       o    |
+               string arg +--------------------------------+
+                          |   n       d     \040      S    |
+                          +--------------------------------+
+                          |   t       r       i       n    |
+                          +--------------------------------+
+                          |   g      \0    |
+                          +----------------+
+
+
+
+
+Moore                   Expires January 12, 2002               [Page 14]
+BLOB Protocol                Internet-Draft                 12 July 2001
+
+
+Appendix B. Example Abstract Syntax
+
+This syntax used to describe BLOB structures is described below using
+the ABNF syntax from [6]:
+
+     file = *(block / comment-line)
+
+     block = "BEGIN" 1*space id [ 1*space comment ] CRLF
+             *element
+             END [ comment ] CRLF
+
+     element = "int" 1*space identifier [ comment ] CRLF /
+               "string" 1*space identifier [ comment ] CRLF /
+               "int<>" 1*space identifier [ comment ] CRLF /
+               "string<>" 1*space identifier [ comment ] CRLF /
+               "struct" 1*space identifier [ comment ] CRLF
+
+     comment = *space "#" *char
+
+     comment-line = comment CRLF
+
+     id = letter *(letter / digit / "_")
+
+     letter = "A".."Z" / "a".."z"
+
+     digit = "0".."9"
+
+     space = %20 / %09
+
+     char = %01..%09 / %0B / %0C / %0E..%FF
+
+     CRLF = 0*1%0D 0*1%0A
+
+
+Here is a simple awk program to interpret this syntax and produce a list
+of C #define macros.  The macros are of the form
+
+     #define structname_element_type number
+
+where 'structname' is the name of the structure, 'element' is the name
+of the element, and 'type' is a suffix indicating the type of the
+element (i = int, s = string/struct, ia = integer array, sa =
+struct/string array) for ease in visual type checking.
+
+This program is quite simplistic and performs no error checking.
+
+
+
+
+
+
+Moore                   Expires January 12, 2002               [Page 15]
+BLOB Protocol                Internet-Draft                 12 July 2001
+
+
+#!/bin/sh
+# the sed line deletes comments
+sed -e 's/[ ]*#.*//' | awk '
+$1 == "BEGIN" {
+        current_id = $2;
+        nint = nstr = ninta = nstra = 0;
+}
+$1 == "int" {
+        inames[nint] = $2;
+        nint++;
+        next;
+}
+$1 == "string" {
+        snames[nstr] = $2;
+        nstr++;
+        next;
+}
+$1 == "struct" {
+        snames[nstr] = $2;
+        nstr++;
+        next;
+}
+$1 == "int<>" {
+        ianames[ninta] = $2;
+        ninta++;
+        next;
+}
+$1 == "string<>" {
+        sanames[nstra] = $2;
+        nstra++;
+        next;
+}
+$1 == "struct<>" {
+        sanames[nstra] = $2;
+        nstra++;
+        next;
+}
+$1 == "END" {
+        for (i = 0; i < nint; ++i)
+                printf ("#define %s_%s_i %d\n", current_id, inames[i], i);
+        for (i = 0; i < nstr; ++i)
+                printf ("#define %s_%s_s %d\n", current_id, snames[i], i);
+        for (i = 0; i < ninta; ++i)
+                printf ("#define %s_%s_ia %d\n", current_id, ianames[i], i);
+        for (i = 0; i < nstra; ++i)
+                printf ("#define %s_%s_sa %d\n", current_id, sanames[i], i);
+        next;
+}'
+
+
+
+Moore                   Expires January 12, 2002               [Page 16]
+BLOB Protocol                Internet-Draft                 12 July 2001
+
+
+Appendix C. Example Encoding Code
+
+NB: due to deadline pressures this code has not been recently tested,
+and probably contains bugs.  Check http://www.cs.utk.edu/~moore/blob for
+the latest version.
+
+
+struct preblob {
+    int ni_args;          /* number of integer arguments */
+    int i_args[256];      /* integer arguments */
+    int nia_args;         /* number of integer array arguments */
+    int *ia_args[256];    /* bases of integer array arguments */
+    int lia_args[256];    /* num elements in each integer array */
+    int ns_args;          /* number of string arguments */
+    char *s_args[256];    /* bases of string arguments */
+    int ls_args[256];     /* length of each string argument */
+    int nsa_args;         /* number of string array arguments */
+    char **sa_args[256];  /* base of each string array */
+    int nlsa_args[256];   /* number of elements in each string array */
+    int *lsa_args[256];   /* lengths of strings in each string array */
+    char *blob;
+    int blobsize;
+};
+
+
+/* initialize a blob - this is called only once */
+#define blob_init (p) \
+        memset (&(p), 0, sizeof (struct preblob))
+
+
+/* reset the state of a blob without leaking any memory
+   that it has allocated */
+#define blob_reset (p) \
+        do { \
+            char *tblob = (p).blob; \
+            int tblobsize = (p).blobsize; \
+            blob_init (p); \
+            (p).blob = tblob; \
+            (p).blobsize = tblobsize; \
+        } while (0)
+
+
+/* set the number of integer parameters in a blob */
+#define blob_set_nint (p, n) \
+        (p).ni_args = (n);
+
+
+
+
+
+
+Moore                   Expires January 12, 2002               [Page 17]
+BLOB Protocol                Internet-Draft                 12 July 2001
+
+
+/* set the value of the nth integer parameter to x */
+#define blob_set_int (p, n, x) \
+        (p).i_args[n] = (x)
+
+
+/* set the number of string parameters in a blob */
+#define blob_set_nstr (p, n) \
+        (p).ns_args = (n);
+
+
+/* set the number of integer array parameters in a blob */
+#define blob_set_ninta (p, n) \
+        (p).nia_args = (n);
+
+
+/* set the number of string array parameters in a blob */
+#define blob_set_nstra (p, n) \
+        (p).nsa_args = (n);
+
+
+/* set the value of the nth string parameter to 'str'
+   where 'str' is NUL-terminated */
+#define blob_set_str0 (p, n, str) \
+        do { \
+             (p).s_args[n] = (str); \
+             (p).ls_args[n] = strlen(str); \
+        } while (0)
+
+
+/* set the value of the nth string parameter to 'str'
+   where 'str' is 'len' bytes long */
+#define blob_set_strl (p, n, str, len) \
+        do { \
+             (p).s_args[n] = (str); \
+             (p).ls_args[n] = (len); \
+        } while (0)
+
+
+/* set the value of the nth integer array to the
+   in-core integer array starting at 'base' and
+   containing 'nelem' elements */
+#define blob_set_int_array (p, n, base, nelem) \
+        do { \
+             (p).ia_args[n] = (base); \
+             (p).lia_args[n] = (nelem); \
+        } while (0)
+
+
+
+
+
+Moore                   Expires January 12, 2002               [Page 18]
+BLOB Protocol                Internet-Draft                 12 July 2001
+
+
+/* set the value of the nth string array to the
+   in-core string array starting at 'bases'
+   and containing 'nelem' strings, where each
+   string is NUL-terminated */
+#define blob_set_str0_array (p, n, bases, nelem) \
+        do { \
+             (p).sa_args[n] = (bases); \
+             (p).lsa_args[n] = NULL; \
+             (p).nlsa_args[n] = (nelem); \
+        } while (0)
+
+
+/*
+ * set the value of the nth string array to the
+ * in-core string array starting at 'bases'
+ * with the lengths stored in integer array 'lengths'
+ * where each array is 'nelem' long
+ */
+#define blob_set_strl_array (p, n, bases, lengths, nelem) \
+        do { \
+             (p).sa_args[n] = (bases); \
+             (p).lsa_args[n] = (lengths); \
+             (p).nlsa_args[n] = (nelem); \
+        } while (0)
+
+
+/*
+ * encode an int 'x' in big-endian format at ptr 'p'.
+ * this is designed to be portable, there are certainly more
+ * efficient ways to do this on any specific machine
+ *
+ * it should be okay to assume that 'ptr' is aligned on a 4-byte
+ * boundary.
+ */
+#define ENCODE_INT(ptr, x) \
+        do { \
+            *ptr++ = ((x) >> 24) & 0xff; \
+            *ptr++ = ((x) >> 16) & 0xff; \
+            *ptr++ = ((x) >> 8) & 0xff; \
+            *ptr++ = (x) & 0xff; \
+        } while (0)
+
+
+
+
+
+
+
+
+
+
+Moore                   Expires January 12, 2002               [Page 19]
+BLOB Protocol                Internet-Draft                 12 July 2001
+
+
+/*
+ * this routine encodes a blob pointed to by 'p'
+ * and leaves the result at p->blob
+ * with the size in p->blobsize
+ */
+
+int
+blob_encode (struct preblob *p)
+{
+    int i;
+    int size = 0;
+    int ipoolsize = 0;
+    int spoolsize = 0;
+    int nargs;
+    unsigned int argcounts;
+    char *ptr;
+    char *iptr;
+    char *sptr;
+
+    if ((p->ni_args > 255) || (p->nia_args > 255) ||
+        (p->ns_args > 255) || (p->nsa_args > 255))
+        return -1;  /* too many arguments */
+
+    /*
+     * calculate the amount of space needed
+     */
+    nargs = p->ni_args + p->nia_args + p->ns_args + p->nsa_args;
+    argcounts = p->ni_args +
+                (p->nia_args << 8) +
+                (p->ns_args << 16) +
+                (p->nsa_args << 24);
+    size = 16 + (4 * nargs);
+
+    /* size of integer array arguments */
+    for (i = 0; i < p->nia_args; ++i)
+        ipoolsize += p->lia_args[i] * 4;
+
+    /* size of string arguments */
+    for (i = 0; i < p->ns_args; ++i) {
+        if (p->s_args[i] != 0)
+            spoolsize += p->ls_args[i] + 1;
+    }
+
+    /* size of string array arguments */
+    for (i = 0; i < p->nsa_args; ++i) {
+        int j;
+        int *lengths = p->lsa_args[i];
+
+
+
+
+Moore                   Expires January 12, 2002               [Page 20]
+BLOB Protocol                Internet-Draft                 12 July 2001
+
+
+        ipoolsize += p->nlsa_args[i] * 4;
+        for (j = 0; j < p->nlsa_args[i]; ++j) {
+            if (p->sa_args[i][j] != 0) {
+                if (lengths)
+                    spoolsize += lengths[j] + 1;
+                else
+                    spoolsize += strlen (p->sa_args[i][j]) + 1;
+            }
+        }
+    }
+    size = size + ipoolsize + spoolsize;
+
+    /*
+     * make sure there's enough space allocated
+     */
+    if (p->blobsize == 0) {
+        p->blob = (char *) malloc (size);
+        p->blobsize = size;
+    }
+    else {
+        p->blob = (char *) realloc (p->blob, size);
+        p->blobsize = size;
+    }
+
+    /*
+     * now, encode things
+     */
+    ptr = p->blob;
+    iptr = p->blob + 16 + (nargs * 4);
+    sptr = p->blob + 16 + (nargs * 4) + ipoolsize;
+
+    /* header */
+    ENCODE_INT (ptr, size);
+    ENCODE_INT (ptr, 16 + (nargs * 4));
+    ENCODE_INT (ptr, 16 + (nargs * 4) + ipoolsize);
+    ENCODE_INT (ptr, argcounts);
+
+    /* int arguments */
+    for (i = 0; i < p->ni_args; ++i)
+        ENCODE_INT (ptr, p->i_args[i]);
+
+    /* int array arguments */
+    for (i = 0; i < p->nia_args; ++i) {
+        int j;
+
+        ENCODE_INT (ptr, iptr - p->blob);
+        for (j = 0; j < p->lia_args[i]; ++j)
+            ENCODE_INT (iptr, p->ia_args[i][j]);
+
+
+
+Moore                   Expires January 12, 2002               [Page 21]
+BLOB Protocol                Internet-Draft                 12 July 2001
+
+
+    }
+
+    /* string arguments */
+    for (i = 0; i < p->ns_args; ++i) {
+        if (p->s_args[i] != 0) {
+            ENCODE_INT (ptr, sptr - p->blob);
+            memcpy (sptr, p->s_args[i], p->ls_args[i]);
+            sptr[p->ls_args[i]] = '\0';
+            sptr += p->ls_args[i] + 1;
+        }
+        else
+            ENCODE_INT (ptr, 0);
+    }
+
+    /* string array arguments */
+    for (i = 0; i < p->nsa_args; ++i) {
+        int j;
+
+        ENCODE_INT (ptr, iptr - p->blob);
+        for (j = 0; j < p->nlsa_args[i]; ++j) {
+            if (p->sa_args[i][j] != 0) {
+                ENCODE_INT (iptr, sptr - p->blob);
+                if (p->lsa_args[i]) {
+                    memcpy (sptr, p->sa_args[i][j], p->lsa_args[i][j]);
+                    sptr += p->lsa_args[i][j];
+                    *sptr++ = '\0';
+                }
+                else {
+                    char *src = p->sa_args[i][j];
+
+                    while (*sptr++ = *src++);
+                }
+            }
+            else
+                ENCODE_INT (iptr, 0);
+        }
+    }
+}
+
+
+Appendix D: Example Decoding Code
+
+This code will be supplied in a later version of this document.  Check
+http://www.cs.utk.edu/~moore/blob for availability.
+
+
+
+
+
+
+
+Moore                   Expires January 12, 2002               [Page 22]
+
