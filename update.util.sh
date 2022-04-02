@@ -9,7 +9,7 @@ function reset_git_ref() {
 
     [[ -n "$(git remote)" ]] || \
         git remote add origin git@github.com:ysoftwareab/ietf-rfcs-abnf.git
-    if git ls-remote | grep -q "\b${GIT_REF}\b"; then
+    if git ls-remote | cut -d$'\t' -f2 | grep -q -Fx "${GIT_REF}"; then
         git fetch -f --update-head-ok origin ${GIT_REF}:${GIT_REF}
     else
         git checkout -b ${GIT_REF##*/}
