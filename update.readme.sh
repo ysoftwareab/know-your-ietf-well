@@ -8,9 +8,10 @@ function create_readme() {
     [[ -e "$f" ]] || return 0
 
     echo "* [RFC${i}](https://github.com/ysoftwareab/know-your-ietf-well/tree/rfc${i})" >> list.md
+    echo "${i}" > count
 }
 
 rm -rf list.md
-for i in $(seq 1 10000); do
+for i in $(seq $(cat count) 10000); do
     create_readme $i
 done

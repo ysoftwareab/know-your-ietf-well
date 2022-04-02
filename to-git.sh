@@ -89,4 +89,4 @@ function to_git() {
 }
 export -f to_git
 
-parallel -j ${CORES} "to_git {}" ::: $(seq 1 10000)
+parallel -j ${CORES} "to_git {}" ::: $(seq $(cat count) 10000)
