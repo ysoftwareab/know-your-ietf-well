@@ -132,4 +132,4 @@ parallel -j ${CORES} "rfc_to_git {}" ::: $(seq $(git show origin/master:count) 1
 
 # cat list.draft.txt | xargs -L10 parallel -j ${CORES} "draft_to_git {}" :::
 
-# parallel -j ${CORES} "draft_to_git {}" :::
+cat list.draft-active.txt | parallel -j ${CORES} "draft_to_git {}" :::
