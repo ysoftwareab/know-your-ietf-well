@@ -11,6 +11,6 @@ function create_readme() {
     echo "${i}" > count
 }
 
-for i in $(seq $(cat count) 10000); do
+for i in $(seq $(git show origin/master:count) 10000); do
     create_readme $i
 done
