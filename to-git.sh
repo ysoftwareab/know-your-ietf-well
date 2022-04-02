@@ -19,6 +19,10 @@ function to_git() {
     local f="rfcs/rfc${i}.json"
     [[ -e "$f" ]] || return 0
 
+    if git ls-remote | cut -d$'\t' -f2 | grep -q -Fx "refs/heads/rfc${i}"; then
+        return 0
+    fi
+
     >&2 echo "[DO  ] Creating a git history for RFC${i} in ${DIR} ."
 
     # rm -rf ${DIR}
