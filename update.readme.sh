@@ -11,7 +11,6 @@ function create_readme() {
     echo "${i}" > count
 }
 
-rm -rf list.md
 for i in $(seq $(cat count) 10000); do
     create_readme $i
 done
